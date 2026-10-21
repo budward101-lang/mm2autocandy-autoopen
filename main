@@ -1,46 +1,40 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + BACKGROUND BOX OPEN
---  Keyless LocalScript — Delta / Codex / Wave / Solara / AWP / Krnl / Xeno
---  RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Cycle Open Mode
---
---  FIXES:
---   * Candy is attempt-tracked. Max 2 hops per part, then hard blacklist.
---   * Success confirmed 3 independent ways: part gone, prompt disabled,
---     or candy balance went UP. First hit wins, no repeats.
---   * Auto-open hooks the remote layer. Records your first manual open,
---     then replays the remotes in the background. No UI, no flicker.
+--  HARDENED BUILD: staged boot, fatal traceback, self-test,
+--  ancestor name matching. RightShift = UI | F1 Farm | F2 Open
 --=============================================================
 
+local ok, err = xpcall(function()
+
+local STAGE = function(s) print("[MM2] " .. s) end
+STAGE("boot")
+
 local CONFIG = {
-    --========== MOVEMENT ==========
     HopInterval    = 1.0,
     HoverHeight    = 2.5,
     RescanTime     = 0.8,
     VerifyDelay    = 0.30,
     RetryOnMiss    = true,
-    MaxAttempts    = 2,      -- hops per candy BEFORE blacklisting it
-    ClaimCooldown  = 3.0,    -- blacklist duration for a stuck candy
+    MaxAttempts    = 2,
+    ClaimCooldown  = 3.0,
     NearestFirst   = true,
 
-    --========== DETECTION ==========
-    NameFilter     = {"candy", "coin"},
+    -- matches the part name AND up to NameDepth ancestors
+    NameFilter     = {"candy", "sweet", "coin", "treat", "lolli", "gum", "pumpkin"},
+    NameDepth      = 2,
     MaxSize        = 8,
     MaxRange       = 6000,
 
-    --========== TOGGLES ==========
     AutoFarm       = true,
     AutoOpen       = true,
     BoxCost        = 600,
     StepCooldown   = 1.2,
     RequireBalance = true,
+    Verbose        = true,
 
-    --========== OPEN MODE ==========
-    -- "learn"  : record the remotes your first manual open fires, then replay
-    -- "remote" : fire OpenRemote directly (copy it from the spy dump)
-    -- "ui"     : legacy button automation (with a proper button picker)
     OpenMode       = "learn",
-    OpenRemote     = "",     -- e.g. "ReplicatedStorage.Remotes.EventOpenBox"
-    OpenArgs       = {},     -- e.g. {600}
+    OpenRemote     = "",
+    OpenArgs       = {},
 
     Keybinds = { UI = Enum.KeyCode.RightShift, Farm = Enum.KeyCode.F1,
                  Open = Enum.KeyCode.F2, Mode = Enum.KeyCode.F3 },
@@ -56,10 +50,10 @@ local STATE = {
     mode = CONFIG.OpenMode,
     collected = 0, hops = 0, boxes = 0, missed = 0, fresh = 0, spent = 0,
     moving = false, started = os.clock(),
-    candy = nil, candyPath = "?", log = "loading",
+    candy = nil, candyPath = "?", log = "booting",
 }
-
 local claimedUntil, attempts = {}, {}
+STAGE("config ok")
 
 --==================== BASICS ====================
 
@@ -82,13 +76,28 @@ local function nameMatches(name, list)
     return false
 end
 
+local function underCharacter(p)
+    local a = p.Parent
+    while a and a ~= workspace do
+        if a:IsA("Model") and Players:GetPlayerFromCharacter(a) then return true end
+        a = a.Parent
+    end
+    return false
+end
+
 local function isCandy(p)
     if not p:IsA("BasePart") then return false end
     local s = p.Size
     if math.max(s.X, s.Y, s.Z) > CONFIG.MaxSize then return false end
-    if not nameMatches(p.Name, CONFIG.NameFilter) then return false end
-    local m = p:FindFirstAncestorOfClass("Model")
-    if m and Players:GetPlayerFromCharacter(m) then return false end
+
+    local hit, n, depth = false, p, 0
+    while n and depth <= CONFIG.NameDepth do
+        if nameMatches(n.Name, CONFIG.NameFilter) then hit = true break end
+        n = n.Parent
+        depth += 1
+    end
+    if not hit then return false end
+    if underCharacter(p) then return false end
     return true
 end
 
@@ -98,14 +107,9 @@ local function stillThere(p)
     return true
 end
 
--- prompt/clickdetector flipped off = server already gave it to us
 local function promptDead(p)
-    local any = false
     for _, d in ipairs(p:GetChildren()) do
-        if d:IsA("ProximityPrompt") then
-            any = true
-            if d.Enabled == false then return true end
-        end
+        if d:IsA("ProximityPrompt") and d.Enabled == false then return true end
     end
     if p.Parent then
         for _, d in ipairs(p.Parent:GetChildren()) do
@@ -114,6 +118,7 @@ local function promptDead(p)
     end
     return false
 end
+STAGE("basics ok")
 
 --==================== SCAN ====================
 
@@ -126,9 +131,10 @@ local function scanCandies()
         for _, c in ipairs(node:GetChildren()) do
             if c:IsA("BasePart") then
                 if isCandy(c) then out[#out + 1] = c end
-            elseif c:IsA("Model") or c:IsA("Folder") or c:IsA("Accessory") or c:IsA("Tool") then
-                local isChar = c:IsA("Model") and Players:GetPlayerFromCharacter(c)
-                if not isChar and not SKIPNAMES[c.Name] then
+            elseif c:IsA("Model") or c:IsA("Folder")
+                or c:IsA("Accessory") or c:IsA("Tool") then
+                if not (c:IsA("Model") and Players:GetPlayerFromCharacter(c))
+                    and not SKIPNAMES[c.Name] then
                     queue[#queue + 1] = c
                 end
             end
@@ -136,6 +142,7 @@ local function scanCandies()
     end
     return out
 end
+STAGE("scan ok")
 
 local function pruneTables(now)
     for p, t in pairs(claimedUntil) do
@@ -156,10 +163,12 @@ end
 
 --==================== CANDY BALANCE ====================
 
-local candyObj = nil
+local candyObj, lastCandyScan = nil, 0
 
-local function findCandyObj()
+local function findCandyObj(force)
     if candyObj and candyObj.Parent then return candyObj end
+    if not force and os.clock() - lastCandyScan < 2 then return nil end
+    lastCandyScan = os.clock()
     candyObj = nil
     for _, src in ipairs({LP, RS}) do
         for _, v in ipairs(src:GetDescendants()) do
@@ -169,41 +178,41 @@ local function findCandyObj()
             end
         end
     end
-    local pg = pgui()
-    if pg then
-        for _, l in ipairs(pg:GetDescendants()) do
-            if l:IsA("TextLabel") and l.Visible then
-                local n = tonumber((l.Text:gsub("[^%d]", "")))
-                if n then
-                    local anc, hit = l, false
-                    while anc and anc ~= pg do
-                        if anc.Name:lower():find("candy", 1, true) then hit = true break end
-                        anc = anc.Parent
-                    end
-                    if hit then return nil, l.Text, n end
-                end
-            end
-        end
-    end
     return nil
 end
 
 local function getCandyCount()
     local o = findCandyObj()
     if o then return tonumber(o.Value), o:GetFullName() end
-    local _, txt, n = findCandyObj()
-    if n then return n, "label:" .. tostring(txt) end
-    return nil, "not found"
+    local pg = pgui()
+    if pg then
+        for _, l in ipairs(pg:GetDescendants()) do
+            if l:IsA("TextLabel") and l.Visible then
+                local n = tonumber((l.Text:gsub("[^%d]", "")))
+                if n then
+                    local a = l
+                    while a and a ~= pg do
+                        if a.Name:lower():find("candy", 1, true) then
+                            return n, "label:" .. l:GetFullName()
+                        end
+                        a = a.Parent
+                    end
+                end
+            end
+        end
+    end
+    return STATE.candy, "cached"
 end
 
 task.spawn(function()
     while task.wait(1) do
         local c, path = getCandyCount()
-        STATE.candy, STATE.candyPath = c, path
+        if c then STATE.candy, STATE.candyPath = c, path end
     end
 end)
+STAGE("balance ok")
 
---==================== MOVEMENT / INTERACT ====================
+--==================== MOVEMENT ====================
 
 local function teleport(char, hrp, cf)
     if not pcall(function() char:PivotTo(cf) end) then
@@ -243,7 +252,6 @@ local function interact(part)
     return hit
 end
 
--- land above, sink in (fires Touched), then trigger prompts
 local function engage(target, char, hrp)
     teleport(char, hrp, CFrame.new(target.Position + Vector3.new(0, CONFIG.HoverHeight, 0)))
     task.spawn(function()
@@ -252,8 +260,6 @@ local function engage(target, char, hrp)
         interact(target)
     end)
 end
-
---==================== VERIFY ====================
 
 local function resolved(part, balBefore)
     if not stillThere(part) then return true end
@@ -268,13 +274,11 @@ end
 local function scheduleVerify(part, char, hrp, balBefore)
     task.spawn(function()
         task.wait(CONFIG.VerifyDelay)
-
         if resolved(part, balBefore) then
             STATE.collected += 1
             claimedUntil[part] = os.clock() + CONFIG.ClaimCooldown
             return
         end
-
         local tries = attempts[part] or 1
         if CONFIG.RetryOnMiss and stillThere(part) and tries < CONFIG.MaxAttempts then
             attempts[part] = tries + 1
@@ -284,20 +288,18 @@ local function scheduleVerify(part, char, hrp, balBefore)
             interact(part)
             task.wait(CONFIG.VerifyDelay)
             STATE.moving = false
-
             if resolved(part, balBefore) then
                 STATE.collected += 1
                 claimedUntil[part] = os.clock() + CONFIG.ClaimCooldown
                 return
             end
         end
-
-        -- write it off for good (until cooldown expires)
         claimedUntil[part] = os.clock() + CONFIG.ClaimCooldown
         STATE.missed += 1
         STATE.log = "stuck: " .. part.Name
     end)
 end
+STAGE("movement ok")
 
 --==================== FARM LOOP ====================
 
@@ -318,7 +320,6 @@ task.spawn(function()
     local list, lastScan, nextHop = {}, 0, 0
     while task.wait() do
         if not STATE.farm then task.wait(0.05) continue end
-
         local char, _, hrp = getChar()
         if not char then task.wait(0.1) continue end
 
@@ -340,19 +341,465 @@ task.spawn(function()
             if target and validTarget(target, now) then
                 local balBefore = STATE.candy
                 attempts[target] = 1
-                -- soft claim: this part cannot be re-picked inside one interval
                 claimedUntil[target] = now + math.max(CONFIG.HopInterval, 1.05)
                 nextHop = now + CONFIG.HopInterval
                 engage(target, char, hrp)
                 scheduleVerify(target, char, hrp, balBefore)
                 STATE.hops += 1
+                if CONFIG.Verbose then print("[MM2] hop -> " .. target:GetFullName()) end
             else
                 nextHop = now + 0.2
             end
         end
     end
 end)
+STAGE("farm loop ok")
 
---==================== REMOTE SPY + OPEN ====================
+--==================== REMOTE SPY ====================
 
-local SPY = { installed = false, log = {}, rec = false, seq
+local SPY = { installed = false, log = {}, rec = false, seq = {}, armedUntil = 0, selfFire = false }
+
+local function fmtArgs(t)
+    local o = {}
+    for i = 1, t.n do
+        local v = t[i]
+        local ty = type(v)
+        if ty == "string" then o[i] = '"'..v..'"'
+        elseif ty == "number" or ty == "boolean" then o[i] = tostring(v)
+        elseif ty == "table" then o[i] = "{tbl}"
+        elseif ty == "userdata" and typeof(v) == "Instance" then o[i] = v:GetFullName()
+        else o[i] = ty end
+    end
+    return "(" .. table.concat(o, ", ") .. ")"
+end
+
+local function recordRemote(self, args)
+    SPY.log[#SPY.log + 1] = {path = self:GetFullName(), args = args, t = os.clock()}
+    if #SPY.log > 400 then table.remove(SPY.log, 1) end
+    if SPY.rec and not SPY.selfFire and os.clock() < SPY.armedUntil then
+        SPY.seq[#SPY.seq + 1] = {path = self:GetFullName(), args = args}
+    end
+end
+
+local function installSpy()
+    if SPY.installed then return true end
+    if type(hookfunction) ~= "function" then return false end
+    SPY.installed = true
+    local a = pcall(function()
+        local re = Instance.new("RemoteEvent")
+        local origFire = re.FireServer
+        hookfunction(origFire, function(self, ...)
+            if typeof(self) == "Instance" and self:IsA("RemoteEvent") then
+                recordRemote(self, table.pack(...))
+            end
+            return origFire(self, ...)
+        end)
+    end)
+    local b = pcall(function()
+        local rf = Instance.new("RemoteFunction")
+        local origInv = rf.InvokeServer
+        hookfunction(origInv, function(self, ...)
+            if typeof(self) == "Instance" and self:IsA("RemoteFunction") then
+                recordRemote(self, table.pack(...))
+            end
+            return origInv(self, ...)
+        end)
+    end)
+    return a or b
+end
+
+local function resolveFromRoot(path)
+    if not path or path == "" then return nil end
+    local node = game
+    for part in string.gmatch(path, "[^%.]+") do
+        if part ~= "game" then
+            if node == Players and part == "LocalPlayer" then
+                node = LP
+            else
+                node = node and node:FindFirstChild(part)
+            end
+        end
+    end
+    return node
+end
+
+local function fireRemote(r, ...)
+    if not r or not r.Parent then return false end
+    SPY.selfFire = true
+    local ok2 = pcall(function()
+        if r:IsA("RemoteEvent") then r:FireServer(...)
+        elseif r:IsA("RemoteFunction") then r:InvokeServer(...) end
+    end)
+    SPY.selfFire = false
+    return ok2
+end
+
+local function replaySeq()
+    for _, s in ipairs(SPY.seq) do
+        local r = resolveFromRoot(s.path)
+        if r and r.Parent then
+            fireRemote(r, table.unpack(s.args, 1, s.args.n))
+        end
+        task.wait(0.22)
+    end
+end
+STAGE("spy ok")
+
+--==================== UI AUTOMATION ====================
+
+local function chainVisible(o)
+    local pg = pgui()
+    local p = o
+    while p and p ~= pg do
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        p = p.Parent
+    end
+    return true
+end
+
+local function visibleButtons()
+    local out = {}
+    local pg = pgui(); if not pg then return out end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton"))
+            and d.Visible and chainVisible(d.Parent) then
+            out[#out + 1] = d
+        end
+    end
+    return out
+end
+
+local function buttonLabel(b)
+    local t = b.Name
+    if b:IsA("TextButton") then t = t .. " | " .. b.Text end
+    return t
+end
+
+local function fireButton(b)
+    if not b or not b.Parent then return false end
+    pcall(function() b.Active = true end)
+    local function via(sig)
+        if not getconnections then return false end
+        local n = 0
+        pcall(function()
+            for _, c in ipairs(getconnections(sig)) do
+                if c.Enabled ~= false and c.Function then
+                    n += 1
+                    pcall(function() c.Function(b) end)
+                end
+            end
+        end)
+        return n > 0
+    end
+    if via(b.MouseButton1Click) then return true end
+    if via(b.Activated) then return true end
+    if firesignal and pcall(firesignal, b.MouseButton1Click) then return true end
+    return pcall(function() b:Activate() end)
+end
+
+local function resolvePath(path)
+    local node = pgui()
+    if not node or not path or path == "" then return nil end
+    for part in string.gmatch(path, "[^%.]+") do
+        node = node and node:FindFirstChild(part)
+    end
+    return node
+end
+
+local function pathFromPg(o)
+    local parts, n, pg = {}, o, pgui()
+    while n and n ~= pg do
+        table.insert(parts, 1, n.Name)
+        n = n.Parent
+    end
+    return table.concat(parts, ".")
+end
+
+local NEGATIVE = {"close", "exit", "back", "settings", "shop", "inventory", "leaderboard"}
+
+local function candidatePriority(b)
+    local lbl = buttonLabel(b):lower()
+    for _, neg in ipairs(NEGATIVE) do
+        if lbl:find(neg, 1, true) then return nil end
+    end
+    if nameMatches(lbl, {"buy", "purchase", "confirm", "yes", "claim"}) then return 1 end
+    if nameMatches(lbl, {"unbox", "open", "hatch", "spin", "roll", "use"}) then return 2 end
+    if nameMatches(lbl, {"box", "crate", "halloween", "candy", "ember"}) then return 3 end
+    return 4
+end
+
+local function buttonSet()
+    local s = {}
+    for _, b in ipairs(visibleButtons()) do s[b] = true end
+    return s
+end
+
+local function countSet(s)
+    local n = 0
+    for _ in pairs(s) do n += 1 end
+    return n
+end
+
+local BASELINE = {}
+local function recapture()
+    BASELINE = buttonSet()
+    STATE.log = "baseline: " .. countSet(BASELINE)
+end
+
+local function newButtonsSince(base)
+    local out = {}
+    for _, b in ipairs(visibleButtons()) do
+        if not base[b] then out[#out + 1] = b end
+    end
+    return out
+end
+
+local function afterOpenCheck(before)
+    task.spawn(function()
+        task.wait(1.4)
+        local after = getCandyCount()
+        if before and after and after < before then
+            STATE.boxes += 1
+            STATE.spent += (before - after)
+        end
+    end)
+end
+STAGE("ui automation ok")
+
+--==================== OPEN LOOP ====================
+
+task.spawn(function()
+    local lastPress = 0
+    while task.wait(0.15) do
+        if not STATE.open then continue end
+        if os.clock() - lastPress < CONFIG.StepCooldown then continue end
+
+        local bal = getCandyCount()
+        if CONFIG.RequireBalance and not STATE.force and bal and bal < CONFIG.BoxCost then
+            STATE.log = "balance " .. bal .. "/" .. CONFIG.BoxCost
+            continue
+        end
+
+        if STATE.mode == "remote" then
+            local r = resolveFromRoot(CONFIG.OpenRemote)
+            if r then
+                fireRemote(r, table.unpack(CONFIG.OpenArgs))
+                lastPress = os.clock()
+                STATE.log = "fired " .. r.Name
+                afterOpenCheck(bal)
+            else
+                STATE.log = "remote not found"
+                task.wait(0.5)
+            end
+
+        elseif STATE.mode == "learn" then
+            if #SPY.seq == 0 then
+                STATE.log = "press Learn, open a box once"
+                task.wait(0.4)
+            else
+                replaySeq()
+                lastPress = os.clock()
+                STATE.log = "replayed " .. #SPY.seq
+                afterOpenCheck(bal)
+            end
+
+        else
+            local target = CONFIG.PickedButton and resolvePath(CONFIG.PickedButton)
+            if target then
+                fireButton(target)
+                lastPress = os.clock()
+                STATE.log = "picked button"
+                afterOpenCheck(bal)
+            else
+                local fresh = newButtonsSince(BASELINE)
+                STATE.fresh = #fresh
+                if #fresh == 0 then
+                    local op
+                    for _, b in ipairs(visibleButtons()) do
+                        if nameMatches(buttonLabel(b), {"halloween", "event", "crate"}) then
+                            op = b
+                            break
+                        end
+                    end
+                    if op then
+                        fireButton(op); lastPress = os.clock()
+                        STATE.log = "opener: " .. op.Name
+                        task.wait(0.9)
+                    else
+                        STATE.log = "no opener found"; task.wait(0.4)
+                    end
+                else
+                    local best, bestP = nil, 99
+                    for _, b in ipairs(fresh) do
+                        local p = candidatePriority(b)
+                        if p and p < bestP then best, bestP = b, p end
+                    end
+                    if best then
+                        fireButton(best); lastPress = os.clock()
+                        STATE.log = "depth " .. bestP .. ": " .. best.Name
+                        afterOpenCheck(bal)
+                        task.wait(1.0)
+                    else
+                        STATE.log = #fresh .. " fresh, none usable"
+                        task.wait(0.5)
+                    end
+                end
+            end
+        end
+    end
+end)
+STAGE("open loop ok")
+
+--==================== DIAGNOSTICS ====================
+
+local function dumpNearby()
+    local _, _, hrp = getChar()
+    local names, total = {}, 0
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("BasePart") then
+            total += 1
+            local s = d.Size
+            if math.max(s.X, s.Y, s.Z) <= CONFIG.MaxSize then
+                if not hrp or (d.Position - hrp.Position).Magnitude < 400 then
+                    names[d.Name] = (names[d.Name] or 0) + 1
+                end
+            end
+        end
+    end
+    local arr = {}
+    for k, v in pairs(names) do arr[#arr + 1] = {k, v} end
+    table.sort(arr, function(a, b) return a[2] > b[2] end)
+    print("===== SMALL PARTS NEAR YOU (name x count) =====")
+    for i = 1, math.min(#arr, 30) do
+        print(string.format("  %5d x  %s", arr[i][2], arr[i][1]))
+    end
+    print("total workspace parts: " .. total)
+end
+
+local function selfTest()
+    print("=========== MM2 SELF TEST ===========")
+    print("executor   : " .. tostring(identifyexecutor and identifyexecutor() or "unknown"))
+    print("hookfunction: " .. tostring(type(hookfunction)))
+    print("fireprompt : " .. tostring(fireproximityprompt ~= nil))
+    print("getconnections: " .. tostring(getconnections ~= nil))
+    local char = getChar()
+    print("character  : " .. (char and char.Name or "NIL"))
+    local c, path = getCandyCount()
+    print("candy value: " .. tostring(c) .. "  @ " .. tostring(path))
+    local list = scanCandies()
+    print("matched    : " .. #list)
+    for i = 1, math.min(#list, 12) do
+        print("   " .. list[i]:GetFullName())
+    end
+    dumpNearby()
+    print("=====================================")
+end
+
+--==================== UI ====================
+
+local doLearn, doPrintSeq, doClearSeq, doSpyDump, doPick, doRecapture, doClearSkip, doCycleMode, refreshMode
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+
+local gui = new("ScreenGui", {
+    Name = "MM2CandyFarm", ResetOnSpawn = false,
+    IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, LP:WaitForChild("PlayerGui"))
+
+local main = new("Frame", {
+    Name = "Main", Size = UDim2.new(0, 320, 0, 560),
+    Position = UDim2.new(0, 20, 0, 70),
+    BackgroundColor3 = Color3.fromRGB(20, 16, 28),
+    BorderSizePixel = 0, Active = true,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+new("UIStroke", { Color = Color3.fromRGB(255, 140, 40), Thickness = 1.5 }, main)
+
+local header = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Color3.fromRGB(32, 22, 42),
+    Text = "  MM2 CANDY FARM", TextColor3 = Color3.fromRGB(255, 170, 70),
+    Font = Enum.Font.GothamBold, TextSize = 15,
+    TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, header)
+
+local body = new("Frame", {
+    Size = UDim2.new(1, -20, 1, -44), Position = UDim2.new(0, 10, 0, 40),
+    BackgroundTransparency = 1,
+}, main)
+new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+
+local stats = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 106), LayoutOrder = 1,
+    BackgroundColor3 = Color3.fromRGB(28, 22, 36), BorderSizePixel = 0,
+    TextColor3 = Color3.fromRGB(200, 200, 210), Font = Enum.Font.Code,
+    TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Text = "",
+}, body)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, stats)
+new("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 8) }, stats)
+
+local function mkBtn(order, text, color, textColor)
+    local b = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 26), LayoutOrder = order,
+        BackgroundColor3 = color, Text = text,
+        TextColor3 = textColor or Color3.fromRGB(225, 225, 230),
+        Font = Enum.Font.GothamMedium, TextSize = 12, BorderSizePixel = 0,
+    }, body)
+    new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+    return b
+end
+
+local function makeToggle(order, text, getter, setter)
+    local b = mkBtn(order, "", Color3.fromRGB(35, 28, 45))
+    local function refresh()
+        b.Text = text .. ": " .. (getter() and "ON" or "OFF")
+        b.TextColor3 = getter() and Color3.fromRGB(120, 255, 140) or Color3.fromRGB(255, 110, 110)
+    end
+    b.MouseButton1Click:Connect(function() setter(not getter()); refresh() end)
+    refresh()
+end
+
+makeToggle(2, "Candy Autofarm", function() return STATE.farm end, function(v) STATE.farm = v end)
+makeToggle(3, "Auto Open Halloween Box", function() return STATE.open end, function(v) STATE.open = v end)
+makeToggle(4, "Require balance", function() return CONFIG.RequireBalance end, function(v) CONFIG.RequireBalance = v end)
+makeToggle(5, "Force (ignore balance)", function() return STATE.force end, function(v) STATE.force = v end)
+
+local modeBtn = mkBtn(6, "", Color3.fromRGB(50, 40, 70))
+refreshMode = function()
+    modeBtn.Text = "Open mode: " .. STATE.mode:upper() .. "  (F3)"
+    modeBtn.TextColor3 = STATE.mode == "learn" and Color3.fromRGB(140, 210, 255)
+        or STATE.mode == "remote" and Color3.fromRGB(255, 190, 110)
+        or Color3.fromRGB(200, 200, 210)
+end
+modeBtn.MouseButton1Click:Connect(function() doCycleMode() end)
+refreshMode()
+
+mkBtn(7, "SELF TEST (read this first)", Color3.fromRGB(60, 45, 20), Color3.fromRGB(255, 220, 140))
+    .MouseButton1Click:Connect(function() selfTest() end)
+
+local learnBtn = mkBtn(8, "LEARN: record next manual open (15s)",
+    Color3.fromRGB(35, 55, 40), Color3.fromRGB(170, 255, 190))
+learnBtn.MouseButton1Click:Connect(function() doLearn() end)
+
+mkBtn(9, "Print recorded sequence", Color3.fromRGB(40, 45, 60), Color3.fromRGB(200, 215, 255))
+    .MouseButton1Click:Connect(function() doPrintSeq() end)
+
+mkBtn(10, "Clear recorded", Color3.fromRGB(55, 40, 40), Color3.fromRGB(255, 190, 190))
+    .MouseButton1Click:Connect(function() doClearSeq() end)
+
+mkBtn(11, "Spy dump last 25 remotes", Color3.fromRGB(45, 35, 58), Color3.fromRGB(220, 220, 230))
+    .MouseButton1Click:Connect(function() doSpyDump() end)
+
+mkBtn(12, "Pick button (click one in 6s)", Color3.fromRGB(45, 50, 35), Color3.fromRGB(215, 240, 200))
+    .MouseButton1Click:Connect(function() doPick() end)
+
+mkBtn(13, "Recapture baseline", Color3.fromRGB(40, 45, 60), Color3.fromRGB(200, 215, 255))
+    .MouseButton1Click:Connect(function() doRecapture() end)
+
+mkBtn(14, "Clear skip list
