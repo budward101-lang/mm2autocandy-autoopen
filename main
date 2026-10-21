@@ -1,22 +1,31 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  Uploaded as main.lua
+--  Longer grab window + repeated re-interact
 --=============================================================
 
 local CONFIG = {
     --========== MOVEMENT ==========
     HoverHeight   = 2.5,
-    SettleDelay   = 0.18,
-    DwellTime     = 1.2,     -- how long to stand on the candy (raise if laggy)
-    ReInteractAt  = 0.45,
-    RetryDwell    = 0.9,
+    SettleDelay   = 0.22,
+    DwellTime     = 3.0,     -- LONG grab window: stands this long on each candy
+    ReInteractAt  = 0.5,     -- re-fire the grab every 0.5s during the dwell
+    RetryDwell    = 2.0,
     RetryOnMiss   = true,
-    MaxAttempts   = 2,
-    ClaimCooldown = 3.0,
+    MaxAttempts   = 3,
+    ClaimCooldown = 5.0,
     HopInterval   = 1.0,
-    RescanTime    = 0.8,
+    RescanTime    = 1.0,
     NearestFirst  = true,
+
+    --========== ANTI-KICK / HUMANIZER ==========
+    Humanize      = true,
+    JitterPct     = 0.3,
+    SpeedLimit    = 45,
+    RestAfterMin  = 15,
+    RestAfterMax  = 28,
+    RestMin       = 1.5,
+    RestMax       = 4.5,
 
     --========== CANDY DETECTION ==========
     NameFilter    = {"candy", "coin"},
@@ -29,10 +38,10 @@ local CONFIG = {
     RequireBalance = true,
 
     Sequence      = {},
-    SequenceDelay = 0.45,    -- pause after each step
-    StepTimeout   = 3.0,     -- how long to wait for a step's button to appear
-    CycleCooldown = 0.6,
-    CloseBeforeCycle = true, -- press close/back before replaying
+    SequenceDelay = 0.6,
+    StepTimeout   = 3.0,
+    CycleCooldown = 1.0,
+    CloseBeforeCycle = true,
     CloseKeywords = {"close", "exit", "back", "x"},
     CloseNever    = {"backpack", "bag", "shop", "store"},
 
@@ -50,6 +59,13 @@ local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
 local UIS     = game:GetService("UserInputService")
 local LP      = Players.LocalPlayer
+
+--==================== HUMANIZER ====================
+
+local function jit(t)
+    if not CONFIG.Humanize then return t end
+    return t * (1 + (math.random() * 2 - 1) * CONFIG.JitterPct)
+end
 
 local STATE = {
     farm = CONFIG.AutoFarm, open = CONFIG.AutoOpen, force = false,
@@ -146,23 +162,25 @@ local function landAndHold(target, char, hrp, holdFor)
     char:PivotTo(CFrame.new(target.Position + Vector3.new(0, CONFIG.HoverHeight, 0)))
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
-    task.wait(CONFIG.SettleDelay)
+    task.wait(jit(CONFIG.SettleDelay))
 
     if target.Parent then
         char:PivotTo(CFrame.new(target.Position))
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
     end
-    task.wait(CONFIG.SettleDelay)
+    task.wait(jit(CONFIG.SettleDelay))
     interact(target)
 
+    -- keep re-firing the grab for the WHOLE dwell window, not just once
     local t0 = os.clock()
-    local refired = false
+    local nextRefire = CONFIG.ReInteractAt
     while os.clock() - t0 < holdFor do
         if not stillThere(target) then break end
-        if not refired and (os.clock() - t0) >= CONFIG.ReInteractAt then
-            refired = true
+        if (os.clock() - t0) >= nextRefire then
+            nextRefire = nextRefire + CONFIG.ReInteractAt
             interact(target)
+            -- nudge back onto it so touch-based grabs re-trigger too
             if target.Parent then
                 char:PivotTo(CFrame.new(target.Position + Vector3.new(0, 0.6, 0)))
                 task.wait(0.06)
@@ -191,13 +209,16 @@ end
 
 task.spawn(function()
     local list, lastScan, nextHop = {}, 0, 0
+    local hopsSinceRest = 0
+    local restTarget = math.random(CONFIG.RestAfterMin, CONFIG.RestAfterMax)
+
     while task.wait() do
         if not STATE.farm then task.wait(0.05) continue end
         local char, _, hrp = getChar()
         if not char then task.wait(0.1) continue end
 
         local now = os.clock()
-        if now - lastScan > CONFIG.RescanTime then
+        if now - lastScan > jit(CONFIG.RescanTime) then
             lastScan = now
             list = scanCandies()
         end
@@ -210,14 +231,16 @@ task.spawn(function()
             local target = pickNearest(list, hrp)
             if target then
                 local hopStart = os.clock()
+                local dist = (target.Position - hrp.Position).Magnitude
+
                 attempts[target] = (attempts[target] or 0) + 1
                 claimed[target] = hopStart + CONFIG.DwellTime + CONFIG.RetryDwell + 0.5
 
-                landAndHold(target, char, hrp, CONFIG.DwellTime)
+                landAndHold(target, char, hrp, jit(CONFIG.DwellTime))
 
                 if CONFIG.RetryOnMiss and stillThere(target) and not promptDead(target) then
                     STATE.log = "retry: " .. target.Name
-                    landAndHold(target, char, hrp, CONFIG.RetryDwell)
+                    landAndHold(target, char, hrp, jit(CONFIG.RetryDwell))
                 end
 
                 if not stillThere(target) or promptDead(target) then
@@ -229,7 +252,18 @@ task.spawn(function()
 
                 attempts[target] = CONFIG.MaxAttempts
                 STATE.hops += 1
-                nextHop = math.max(os.clock(), hopStart + CONFIG.HopInterval)
+
+                local travel = CONFIG.SpeedLimit > 0 and (dist / CONFIG.SpeedLimit) or 0
+                nextHop = math.max(os.clock(), hopStart + math.max(jit(CONFIG.HopInterval), travel))
+
+                hopsSinceRest += 1
+                if hopsSinceRest >= restTarget then
+                    hopsSinceRest = 0
+                    restTarget = math.random(CONFIG.RestAfterMin, CONFIG.RestAfterMax)
+                    local rest = CONFIG.RestMin + math.random() * (CONFIG.RestMax - CONFIG.RestMin)
+                    STATE.log = string.format("rest %.1fs", rest)
+                    task.wait(rest)
+                end
             else
                 nextHop = now + 0.2
             end
@@ -376,7 +410,6 @@ local function isCloseButton(b)
     return false
 end
 
--- press close ONCE, then stop if nothing changed (was looping and toggling)
 local function closeAll()
     for _ = 1, 3 do
         local before = uiSignature()
@@ -386,14 +419,13 @@ local function closeAll()
         end
         if not found then return end
         fireButton(found)
-        task.wait(0.5)
+        task.wait(jit(0.5))
         if uiSignature() == before then return end
     end
 end
 
 --==================== SEQUENCE ====================
 
--- wait for a step's button to actually exist before pressing it
 local function waitForButton(path, timeout)
     local t0 = os.clock()
     repeat
@@ -418,10 +450,10 @@ local function replaySequence()
             timedOut += 1
             STATE.log = "step " .. i .. " TIMEOUT  " .. path:sub(-20)
         end
-        task.wait(CONFIG.SequenceDelay)
+        task.wait(jit(CONFIG.SequenceDelay))
     end
 
-    task.wait(1.2)
+    task.wait(jit(1.2))
     local after = getCandyCount()
     if before and after and after < before then
         STATE.boxes += 1
@@ -442,7 +474,7 @@ task.spawn(function()
         if not STATE.open then continue end
 
         if #CONFIG.Sequence > 0 then
-            if os.clock() - lastCycle < CONFIG.CycleCooldown then continue end
+            if os.clock() - lastCycle < jit(CONFIG.CycleCooldown) then continue end
             local c = STATE.candy
             if CONFIG.RequireBalance and not STATE.force and c and c < CONFIG.BoxCost then
                 STATE.log = "waiting " .. c .. "/" .. CONFIG.BoxCost
@@ -461,7 +493,7 @@ task.spawn(function()
                 local before = uiSignature()
                 fireButton(b)
                 lastPress = os.clock()
-                task.wait(step.delay)
+                task.wait(jit(step.delay))
                 if uiSignature() ~= before then
                     STATE.log = "pressed [" .. step.label .. "] " .. b.Name
                     progressed = true
@@ -544,9 +576,11 @@ makeToggle(2, "Candy Autofarm", function() return STATE.farm end, function(v) ST
 makeToggle(3, "Auto Open Box", function() return STATE.open end, function(v) STATE.open = v end)
 makeToggle(4, "Close page before each cycle",
     function() return CONFIG.CloseBeforeCycle end, function(v) CONFIG.CloseBeforeCycle = v end)
+makeToggle(5, "Anti-kick (humanize)",
+    function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
 
-local DWELLS = {0.3, 0.6, 0.9, 1.2, 1.8, 2.5}
-local dwellBtn = mkBtn(5, "", Color3.fromRGB(50, 42, 30))
+local DWELLS = {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0}
+local dwellBtn = mkBtn(6, "", Color3.fromRGB(50, 42, 30))
 local function refreshDwell()
     dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
 end
@@ -557,28 +591,46 @@ dwellBtn.MouseButton1Click:Connect(function()
     end
     idx = idx % #DWELLS + 1
     CONFIG.DwellTime = DWELLS[idx]
-    CONFIG.ReInteractAt = math.min(CONFIG.DwellTime * 0.4, 0.5)
+    CONFIG.ReInteractAt = math.min(CONFIG.DwellTime * 0.3, 0.6)
     refreshDwell()
     STATE.log = "dwell " .. CONFIG.DwellTime .. "s"
 end)
 refreshDwell()
 
-local DELAYS = {0.2, 0.35, 0.45, 0.7, 1.0, 1.5}
-local delayBtn = mkBtn(6, "", Color3.fromRGB(50, 42, 30))
+local DELAYS = {0.3, 0.5, 0.8, 1.0, 1.5, 2.0}
+local delayBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
 local function refreshDelay()
-    delayBtn.Text = string.format("Step delay: %.2fs  (click to change)", CONFIG.SequenceDelay)
+    delayBtn.Text = string.format("Hop interval: %.2fs  (click to change)", CONFIG.HopInterval)
 end
 delayBtn.MouseButton1Click:Connect(function()
     local idx = 1
     for i, v in ipairs(DELAYS) do
-        if math.abs(v - CONFIG.SequenceDelay) < 0.01 then idx = i break end
+        if math.abs(v - CONFIG.HopInterval) < 0.01 then idx = i break end
     end
     idx = idx % #DELAYS + 1
-    CONFIG.SequenceDelay = DELAYS[idx]
+    CONFIG.HopInterval = DELAYS[idx]
     refreshDelay()
-    STATE.log = "step delay " .. CONFIG.SequenceDelay .. "s"
+    STATE.log = "hop interval " .. CONFIG.HopInterval .. "s"
 end)
 refreshDelay()
+
+local SPEEDS = {0, 20, 30, 45, 60, 90}
+local speedBtn = mkBtn(8, "", Color3.fromRGB(45, 40, 55))
+local function refreshSpeed()
+    speedBtn.Text = string.format("Speed limit: %s  (click to change)",
+        CONFIG.SpeedLimit == 0 and "OFF" or (CONFIG.SpeedLimit .. " studs/s"))
+end
+speedBtn.MouseButton1Click:Connect(function()
+    local idx = 1
+    for i, v in ipairs(SPEEDS) do
+        if math.abs(v - CONFIG.SpeedLimit) < 0.01 then idx = i break end
+    end
+    idx = idx % #SPEEDS + 1
+    CONFIG.SpeedLimit = SPEEDS[idx]
+    refreshSpeed()
+    STATE.log = "speed limit " .. (CONFIG.SpeedLimit == 0 and "off" or CONFIG.SpeedLimit)
+end)
+refreshSpeed()
 
 --==================== STEP RECORDER ====================
 
@@ -634,10 +686,10 @@ local function addStep()
     end)
 end
 
-mkBtn(7, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+mkBtn(9, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
     .MouseButton1Click:Connect(addStep)
 
-mkBtn(8, "Remove last step", Color3.fromRGB(55, 45, 35))
+mkBtn(10, "Remove last step", Color3.fromRGB(55, 45, 35))
     .MouseButton1Click:Connect(function()
         if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
         local removed = table.remove(CONFIG.Sequence)
