@@ -24,6 +24,15 @@ local CONFIG = {
     BoxCost       = 600,
     StepCooldown  = 1.5,
     RequireBalance = true,
+    UseVirtualClick = true,   -- stage 3 press. disable if it misbehaves
+
+    -- any ScreenGui whose name contains one of these is ignored entirely.
+    -- add your executor's panel name here if the dump shows it.
+    ExcludeGuis = {
+        "MM2CandyFarm",
+        "Delta", "Codex", "Wave", "Solara", "AWP", "Krnl", "Xeno",
+        "ScriptBlox", "Owl", "Hydrogen", "Fluxus", "Arceus", "Vega",
+    },
 
     PinnedButtons = {
         -- "HalloweenIcon",
@@ -47,10 +56,11 @@ local STATE = {
     started = os.clock(), candy = nil, candyPath = "?", log = "starting...",
 }
 
-local claimed = {}      -- [part] = time we gave up on it
-local dead = {}         -- [button] = time we marked it unresponsive
-local failCount = {}    -- [button] = consecutive failed presses
+local claimed = {}
+local dead = {}
+local failCount = {}
 local DEAD_TIME = 10
+local OUR_GUI = nil
 
 --==================== HELPERS ====================
 
@@ -219,12 +229,32 @@ local function chainVisible(o)
     return true
 end
 
-local function visibleButtons()
+local function owningScreenGui(o)
+    local s = o
+    while s and not s:IsA("ScreenGui") do s = s.Parent end
+    return s
+end
+
+-- true if this button belongs to our own panel or a known executor overlay
+local function isForeign(o)
+    if OUR_GUI and o:IsDescendantOf(OUR_GUI) then return true end
+    local sg = owningScreenGui(o)
+    if not sg then return false end
+    local n = sg.Name:lower()
+    for _, x in ipairs(CONFIG.ExcludeGuis) do
+        if n:find(x:lower(), 1, true) then return true end
+    end
+    return false
+end
+
+-- GAME buttons only
+local function gameButtons()
     local out = {}
     local pg = pgui(); if not pg then return out end
     for _, d in ipairs(pg:GetDescendants()) do
         if (d:IsA("TextButton") or d:IsA("ImageButton"))
-            and d.Visible and chainVisible(d.Parent) then
+            and d.Visible and chainVisible(d.Parent)
+            and not isForeign(d) then
             out[#out + 1] = d
         end
     end
@@ -239,7 +269,7 @@ end
 
 local function uiSignature()
     local parts = {}
-    for _, b in ipairs(visibleButtons()) do
+    for _, b in ipairs(gameButtons()) do
         parts[#parts + 1] = b:GetFullName()
     end
     return #parts .. ":" .. table.concat(parts, ",")
@@ -247,16 +277,15 @@ end
 
 --==================== PRESS MECHANISMS ====================
 
--- invoke the FIRST signal that actually has handlers, so we never double-fire
 local function signalStrategy(b)
     if not getconnections then return false end
     for _, sigName in ipairs({"MouseButton1Click", "MouseButton1Down", "Activated"}) do
         local sig = b[sigName]
         if sig then
-            local conns, live
+            local conns
             pcall(function() conns = getconnections(sig) end)
             if conns then
-                live = 0
+                local live = 0
                 for _, c in ipairs(conns) do
                     if c.Enabled ~= false and c.Function then live += 1 end
                 end
@@ -274,8 +303,12 @@ local function signalStrategy(b)
     return false
 end
 
--- a genuine synthetic mouse click at the button's on-screen position
+-- hides our own panel first so the synthetic click can't land on it
 local function virtualClick(b)
+    local wasEnabled = OUR_GUI and OUR_GUI.Enabled
+    if OUR_GUI then OUR_GUI.Enabled = false end
+    task.wait(0.06)
+
     local ok = pcall(function()
         local p, s = b.AbsolutePosition, b.AbsoluteSize
         local x, y = p.X + s.X / 2, p.Y + s.Y / 2
@@ -285,10 +318,12 @@ local function virtualClick(b)
         task.wait(0.05)
         VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
     end)
+
+    task.wait(0.05)
+    if OUR_GUI then OUR_GUI.Enabled = wasEnabled end
     return ok
 end
 
--- press, then confirm the visible UI actually changed. escalates on failure.
 local function pressVerified(b)
     if not b or not b.Parent then return false, "gone" end
     pcall(function() b.Active = true end)
@@ -304,3 +339,91 @@ local function pressVerified(b)
         pcall(firesignal, b.MouseButton1Click)
         task.wait(0.25)
         if uiSignature() ~= base then return true, "firesignal" end
+    end
+
+    if CONFIG.UseVirtualClick then
+        virtualClick(b)
+        task.wait(0.35)
+        if uiSignature() ~= base then return true, "virtualclick" end
+    end
+
+    pcall(function() b:Activate() end)
+    task.wait(0.25)
+    if uiSignature() ~= base then return true, "activate" end
+
+    return false, "no effect"
+end
+
+local function isDead(b)
+    local t = dead[b]
+    return t and (os.clock() - t) < DEAD_TIME
+end
+
+--==================== AUTO OPEN BOX ====================
+
+local function buttonSet()
+    local s = {}
+    for _, b in ipairs(gameButtons()) do s[b] = true end
+    return s
+end
+
+local function countSet(s)
+    local n = 0
+    for _ in pairs(s) do n += 1 end
+    return n
+end
+
+local function newButtonsSince(baseline)
+    local out = {}
+    for _, b in ipairs(gameButtons()) do
+        if not baseline[b] then out[#out + 1] = b end
+    end
+    return out
+end
+
+local NEGATIVE = {"close", "exit"}
+
+local function candidatePriority(b)
+    local lbl = buttonLabel(b):lower()
+    for _, neg in ipairs(NEGATIVE) do
+        if lbl:find(neg, 1, true) then return nil end
+    end
+    if nameMatches(lbl, {"buy", "purchase", "confirm", "yes", "claim"}) then return 1 end
+    if nameMatches(lbl, {"unbox", "open", "hatch", "spin", "roll"}) then return 2 end
+    if nameMatches(lbl, {"case", "box", "crate", "halloween", "candy", "ember"}) then return 3 end
+    if nameMatches(lbl, {"shop", "inventory", "store", "back", "tab"}) then return 4 end
+    return 5
+end
+
+local BASELINE = nil
+local function recapture()
+    BASELINE = buttonSet()
+    dead = {}; failCount = {}
+    STATE.log = "baseline: " .. countSet(BASELINE) .. " game buttons"
+end
+
+local function pickOpener()
+    for _, b in ipairs(gameButtons()) do
+        if BASELINE[b] and nameMatches(buttonLabel(b), {"halloween", "event"}) then
+            return b
+        end
+    end
+    for _, b in ipairs(gameButtons()) do
+        if nameMatches(buttonLabel(b), {"halloween", "event", "crate"}) then return b end
+    end
+end
+
+task.spawn(function()
+    local lastPress = 0
+    local wasOpen = false
+
+    while task.wait(0.2) do
+        if STATE.open and not wasOpen then recapture() end
+        wasOpen = STATE.open
+        if not STATE.open then continue end
+        if os.clock() - lastPress < CONFIG.StepCooldown then continue end
+
+        if CONFIG.RequireBalance and not STATE.force then
+            local c = STATE.candy
+            if c and c < CONFIG.BoxCost then
+                STATE.log = "wait
