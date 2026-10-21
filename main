@@ -1,68 +1,69 @@
 --=============================================================
---  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
---  Keyless LocalScript. Delta / Codex / Wave / Solara / AWP / Krnl / Xeno
---  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force Open
+--  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + BACKGROUND BOX OPEN
+--  Keyless LocalScript — Delta / Codex / Wave / Solara / AWP / Krnl / Xeno
+--  RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Cycle Open Mode
+--
+--  FIXES:
+--   * Candy is attempt-tracked. Max 2 hops per part, then hard blacklist.
+--   * Success confirmed 3 independent ways: part gone, prompt disabled,
+--     or candy balance went UP. First hit wins, no repeats.
+--   * Auto-open hooks the remote layer. Records your first manual open,
+--     then replays the remotes in the background. No UI, no flicker.
 --=============================================================
 
 local CONFIG = {
-    --========== MOVEMENT: 1 hop per second ==========
-    HopInterval   = 1.0,
-    HoverHeight   = 2.5,
-    RescanTime    = 0.8,
-    VerifyDelay   = 0.3,
-    RetryOnMiss   = true,
-    ClaimCooldown = 4.0,
-    NearestFirst  = true,
+    --========== MOVEMENT ==========
+    HopInterval    = 1.0,
+    HoverHeight    = 2.5,
+    RescanTime     = 0.8,
+    VerifyDelay    = 0.30,
+    RetryOnMiss    = true,
+    MaxAttempts    = 2,      -- hops per candy BEFORE blacklisting it
+    ClaimCooldown  = 3.0,    -- blacklist duration for a stuck candy
+    NearestFirst   = true,
 
-    --========== CANDY DETECTION ==========
-    NameFilter    = {"candy", "coin"},
-    MaxSize       = 8,
+    --========== DETECTION ==========
+    NameFilter     = {"candy", "coin"},
+    MaxSize        = 8,
+    MaxRange       = 6000,
 
-    --========== AUTO OPEN ==========
-    AutoFarm      = true,
-    AutoOpen      = true,
-    BoxCost       = 600,
-    StepCooldown  = 1.5,
+    --========== TOGGLES ==========
+    AutoFarm       = true,
+    AutoOpen       = true,
+    BoxCost        = 600,
+    StepCooldown   = 1.2,
     RequireBalance = true,
-    UseVirtualClick = true,   -- stage 3 press. disable if it misbehaves
 
-    -- any ScreenGui whose name contains one of these is ignored entirely.
-    -- add your executor's panel name here if the dump shows it.
-    ExcludeGuis = {
-        "MM2CandyFarm",
-        "Delta", "Codex", "Wave", "Solara", "AWP", "Krnl", "Xeno",
-        "ScriptBlox", "Owl", "Hydrogen", "Fluxus", "Arceus", "Vega",
-    },
-
-    PinnedButtons = {
-        -- "HalloweenIcon",
-        -- "EventFrame.CaseTab",
-    },
+    --========== OPEN MODE ==========
+    -- "learn"  : record the remotes your first manual open fires, then replay
+    -- "remote" : fire OpenRemote directly (copy it from the spy dump)
+    -- "ui"     : legacy button automation (with a proper button picker)
+    OpenMode       = "learn",
+    OpenRemote     = "",     -- e.g. "ReplicatedStorage.Remotes.EventOpenBox"
+    OpenArgs       = {},     -- e.g. {600}
 
     Keybinds = { UI = Enum.KeyCode.RightShift, Farm = Enum.KeyCode.F1,
-                 Open = Enum.KeyCode.F2, Force = Enum.KeyCode.F3 },
+                 Open = Enum.KeyCode.F2, Mode = Enum.KeyCode.F3 },
 }
 
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
 local UIS     = game:GetService("UserInputService")
-local VIM     = game:GetService("VirtualInputManager")
 local LP      = Players.LocalPlayer
 
 local STATE = {
     farm = CONFIG.AutoFarm, open = CONFIG.AutoOpen, force = false,
-    collected = 0, hops = 0, boxes = 0, missed = 0, fresh = 0, dead = 0,
-    moving = false,
-    started = os.clock(), candy = nil, candyPath = "?", log = "starting...",
+    mode = CONFIG.OpenMode,
+    collected = 0, hops = 0, boxes = 0, missed = 0, fresh = 0, spent = 0,
+    moving = false, started = os.clock(),
+    candy = nil, candyPath = "?", log = "loading",
 }
 
-local claimed = {}
-local dead = {}
-local failCount = {}
-local DEAD_TIME = 10
-local OUR_GUI = nil
+local claimedUntil, attempts = {}, {}
 
---==================== HELPERS ====================
+--==================== BASICS ====================
+
+local function pgui() return LP:FindFirstChildOfClass("PlayerGui") end
 
 local function getChar()
     local c = LP.Character
@@ -92,79 +93,213 @@ local function isCandy(p)
 end
 
 local function stillThere(p)
-    if not p or not p.Parent then return false end
-    if not p:IsDescendantOf(workspace) then return false end
+    if not p or not p.Parent or not p:IsDescendantOf(workspace) then return false end
     if p.Transparency >= 1 then return false end
     return true
 end
 
-local function pruneClaimed(now)
-    for p, t in pairs(claimed) do
-        if not p.Parent or (now - t) > CONFIG.ClaimCooldown then claimed[p] = nil end
+-- prompt/clickdetector flipped off = server already gave it to us
+local function promptDead(p)
+    local any = false
+    for _, d in ipairs(p:GetChildren()) do
+        if d:IsA("ProximityPrompt") then
+            any = true
+            if d.Enabled == false then return true end
+        end
+    end
+    if p.Parent then
+        for _, d in ipairs(p.Parent:GetChildren()) do
+            if d:IsA("ProximityPrompt") and d.Enabled == false then return true end
+        end
+    end
+    return false
+end
+
+--==================== SCAN ====================
+
+local SKIPNAMES = {Terrain = true, Camera = true, Debris = true, Lighting = true}
+
+local function scanCandies()
+    local out, queue, qi = {}, {workspace}, 1
+    while qi <= #queue do
+        local node = queue[qi]; qi += 1
+        for _, c in ipairs(node:GetChildren()) do
+            if c:IsA("BasePart") then
+                if isCandy(c) then out[#out + 1] = c end
+            elseif c:IsA("Model") or c:IsA("Folder") or c:IsA("Accessory") or c:IsA("Tool") then
+                local isChar = c:IsA("Model") and Players:GetPlayerFromCharacter(c)
+                if not isChar and not SKIPNAMES[c.Name] then
+                    queue[#queue + 1] = c
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function pruneTables(now)
+    for p, t in pairs(claimedUntil) do
+        if not p.Parent or t < now then claimedUntil[p] = nil end
+    end
+    for p in pairs(attempts) do
+        if not p.Parent then attempts[p] = nil end
     end
 end
 
 local function validTarget(p, now)
     if not stillThere(p) then return false end
     if not isCandy(p) then return false end
-    local c = claimed[p]
-    if c and (now - c) < CONFIG.ClaimCooldown then return false end
+    local c = claimedUntil[p]
+    if c and now < c then return false end
     return true
 end
 
-local function scanCandies()
-    local out = {}
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if isCandy(d) then out[#out + 1] = d end
+--==================== CANDY BALANCE ====================
+
+local candyObj = nil
+
+local function findCandyObj()
+    if candyObj and candyObj.Parent then return candyObj end
+    candyObj = nil
+    for _, src in ipairs({LP, RS}) do
+        for _, v in ipairs(src:GetDescendants()) do
+            if (v:IsA("IntValue") or v:IsA("NumberValue") or v:IsA("StringValue"))
+                and v.Name:lower():find("candy", 1, true) then
+                if tonumber(v.Value) then candyObj = v; return v end
+            end
+        end
     end
-    return out
+    local pg = pgui()
+    if pg then
+        for _, l in ipairs(pg:GetDescendants()) do
+            if l:IsA("TextLabel") and l.Visible then
+                local n = tonumber((l.Text:gsub("[^%d]", "")))
+                if n then
+                    local anc, hit = l, false
+                    while anc and anc ~= pg do
+                        if anc.Name:lower():find("candy", 1, true) then hit = true break end
+                        anc = anc.Parent
+                    end
+                    if hit then return nil, l.Text, n end
+                end
+            end
+        end
+    end
+    return nil
 end
 
---==================== MOVEMENT ====================
+local function getCandyCount()
+    local o = findCandyObj()
+    if o then return tonumber(o.Value), o:GetFullName() end
+    local _, txt, n = findCandyObj()
+    if n then return n, "label:" .. tostring(txt) end
+    return nil, "not found"
+end
+
+task.spawn(function()
+    while task.wait(1) do
+        local c, path = getCandyCount()
+        STATE.candy, STATE.candyPath = c, path
+    end
+end)
+
+--==================== MOVEMENT / INTERACT ====================
+
+local function teleport(char, hrp, cf)
+    if not pcall(function() char:PivotTo(cf) end) then
+        pcall(function() hrp.CFrame = cf end)
+    end
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+end
 
 local function interact(part)
-    for _, d in ipairs(part:GetDescendants()) do
-        if d:IsA("ProximityPrompt") and d.Enabled ~= false then
+    local hit = false
+    local function try(node)
+        if node:IsA("ProximityPrompt") and node.Enabled ~= false then
+            hit = true
             if fireproximityprompt then
-                pcall(fireproximityprompt, d, 0)
+                pcall(fireproximityprompt, node, node.HoldDuration)
             else
-                pcall(function()
-                    d:InputHoldBegin(); task.wait(d.HoldDuration); d:InputHoldEnd()
+                task.spawn(function()
+                    pcall(function()
+                        node:InputHoldBegin(); task.wait(node.HoldDuration); node:InputHoldEnd()
+                    end)
                 end)
             end
-        elseif d:IsA("ClickDetector") then
-            if fireclickdetector then pcall(fireclickdetector, d) end
+        elseif node:IsA("ClickDetector") then
+            hit = true
+            if fireclickdetector then
+                pcall(fireclickdetector, node, node.MaxActivationDistance)
+            end
         end
     end
+    for _, d in ipairs(part:GetChildren()) do try(d) end
+    if not hit and part.Parent then
+        for _, d in ipairs(part.Parent:GetChildren()) do
+            if d ~= part then try(d) end
+        end
+    end
+    return hit
 end
 
-local function hopOnce(target, char, hrp)
-    char:PivotTo(CFrame.new(target.Position + Vector3.new(0, CONFIG.HoverHeight, 0)))
-    hrp.AssemblyLinearVelocity = Vector3.zero
-end
-
-local function scheduleVerify(part, char, hrp)
+-- land above, sink in (fires Touched), then trigger prompts
+local function engage(target, char, hrp)
+    teleport(char, hrp, CFrame.new(target.Position + Vector3.new(0, CONFIG.HoverHeight, 0)))
     task.spawn(function()
-        task.wait(CONFIG.VerifyDelay)
-        if not stillThere(part) then STATE.collected += 1 return end
-
-        if CONFIG.RetryOnMiss and part.Parent then
-            STATE.moving = true
-            char:PivotTo(CFrame.new(part.Position))
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            task.wait(CONFIG.VerifyDelay)
-            STATE.moving = false
-        end
-
-        if stillThere(part) then
-            claimed[part] = os.clock()
-            STATE.missed += 1
-            STATE.log = "skip (taken): " .. part.Name
-        else
-            STATE.collected += 1
-        end
+        task.wait(0.07)
+        if target.Parent then teleport(char, hrp, CFrame.new(target.Position)) end
+        interact(target)
     end)
 end
+
+--==================== VERIFY ====================
+
+local function resolved(part, balBefore)
+    if not stillThere(part) then return true end
+    if promptDead(part) then return true end
+    if balBefore then
+        local now = getCandyCount()
+        if now and now > balBefore then return true end
+    end
+    return false
+end
+
+local function scheduleVerify(part, char, hrp, balBefore)
+    task.spawn(function()
+        task.wait(CONFIG.VerifyDelay)
+
+        if resolved(part, balBefore) then
+            STATE.collected += 1
+            claimedUntil[part] = os.clock() + CONFIG.ClaimCooldown
+            return
+        end
+
+        local tries = attempts[part] or 1
+        if CONFIG.RetryOnMiss and stillThere(part) and tries < CONFIG.MaxAttempts then
+            attempts[part] = tries + 1
+            STATE.moving = true
+            teleport(char, hrp, CFrame.new(part.Position))
+            task.wait(CONFIG.VerifyDelay)
+            interact(part)
+            task.wait(CONFIG.VerifyDelay)
+            STATE.moving = false
+
+            if resolved(part, balBefore) then
+                STATE.collected += 1
+                claimedUntil[part] = os.clock() + CONFIG.ClaimCooldown
+                return
+            end
+        end
+
+        -- write it off for good (until cooldown expires)
+        claimedUntil[part] = os.clock() + CONFIG.ClaimCooldown
+        STATE.missed += 1
+        STATE.log = "stuck: " .. part.Name
+    end)
+end
+
+--==================== FARM LOOP ====================
 
 local function pickTarget(list, hrp, now)
     local best, bestD = nil, math.huge
@@ -173,7 +308,7 @@ local function pickTarget(list, hrp, now)
         if validTarget(p, now) then
             if not CONFIG.NearestFirst then return p end
             local d = (p.Position - hrp.Position).Magnitude
-            if d < bestD then best, bestD = p, d end
+            if d < bestD and d <= CONFIG.MaxRange then best, bestD = p, d end
         end
     end
     return best
@@ -192,7 +327,7 @@ task.spawn(function()
             lastScan = now
             list = scanCandies()
         end
-        pruneClaimed(now)
+        pruneTables(now)
 
         local valid = {}
         for i = 1, #list do
@@ -203,227 +338,21 @@ task.spawn(function()
         if now >= nextHop and not STATE.moving then
             local target = pickTarget(list, hrp, now)
             if target and validTarget(target, now) then
+                local balBefore = STATE.candy
+                attempts[target] = 1
+                -- soft claim: this part cannot be re-picked inside one interval
+                claimedUntil[target] = now + math.max(CONFIG.HopInterval, 1.05)
                 nextHop = now + CONFIG.HopInterval
-                hopOnce(target, char, hrp)
-                interact(target)
-                scheduleVerify(target, char, hrp)
+                engage(target, char, hrp)
+                scheduleVerify(target, char, hrp, balBefore)
                 STATE.hops += 1
             else
-                nextHop = now + 0.25
+                nextHop = now + 0.2
             end
         end
     end
 end)
 
---==================== GUI READING ====================
+--==================== REMOTE SPY + OPEN ====================
 
-local function pgui() return LP:FindFirstChildOfClass("PlayerGui") end
-
-local function chainVisible(o)
-    local pg = pgui()
-    local p = o
-    while p and p ~= pg do
-        if p:IsA("GuiObject") and not p.Visible then return false end
-        p = p.Parent
-    end
-    return true
-end
-
-local function owningScreenGui(o)
-    local s = o
-    while s and not s:IsA("ScreenGui") do s = s.Parent end
-    return s
-end
-
--- true if this button belongs to our own panel or a known executor overlay
-local function isForeign(o)
-    if OUR_GUI and o:IsDescendantOf(OUR_GUI) then return true end
-    local sg = owningScreenGui(o)
-    if not sg then return false end
-    local n = sg.Name:lower()
-    for _, x in ipairs(CONFIG.ExcludeGuis) do
-        if n:find(x:lower(), 1, true) then return true end
-    end
-    return false
-end
-
--- GAME buttons only
-local function gameButtons()
-    local out = {}
-    local pg = pgui(); if not pg then return out end
-    for _, d in ipairs(pg:GetDescendants()) do
-        if (d:IsA("TextButton") or d:IsA("ImageButton"))
-            and d.Visible and chainVisible(d.Parent)
-            and not isForeign(d) then
-            out[#out + 1] = d
-        end
-    end
-    return out
-end
-
-local function buttonLabel(b)
-    local t = b.Name
-    if b:IsA("TextButton") then t = t .. " | " .. b.Text end
-    return t
-end
-
-local function uiSignature()
-    local parts = {}
-    for _, b in ipairs(gameButtons()) do
-        parts[#parts + 1] = b:GetFullName()
-    end
-    return #parts .. ":" .. table.concat(parts, ",")
-end
-
---==================== PRESS MECHANISMS ====================
-
-local function signalStrategy(b)
-    if not getconnections then return false end
-    for _, sigName in ipairs({"MouseButton1Click", "MouseButton1Down", "Activated"}) do
-        local sig = b[sigName]
-        if sig then
-            local conns
-            pcall(function() conns = getconnections(sig) end)
-            if conns then
-                local live = 0
-                for _, c in ipairs(conns) do
-                    if c.Enabled ~= false and c.Function then live += 1 end
-                end
-                if live > 0 then
-                    for _, c in ipairs(conns) do
-                        if c.Enabled ~= false and c.Function then
-                            pcall(function() c.Function(b) end)
-                        end
-                    end
-                    return true
-                end
-            end
-        end
-    end
-    return false
-end
-
--- hides our own panel first so the synthetic click can't land on it
-local function virtualClick(b)
-    local wasEnabled = OUR_GUI and OUR_GUI.Enabled
-    if OUR_GUI then OUR_GUI.Enabled = false end
-    task.wait(0.06)
-
-    local ok = pcall(function()
-        local p, s = b.AbsolutePosition, b.AbsoluteSize
-        local x, y = p.X + s.X / 2, p.Y + s.Y / 2
-        VIM:SendMouseMoveEvent(x, y, false)
-        task.wait(0.03)
-        VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
-        task.wait(0.05)
-        VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
-    end)
-
-    task.wait(0.05)
-    if OUR_GUI then OUR_GUI.Enabled = wasEnabled end
-    return ok
-end
-
-local function pressVerified(b)
-    if not b or not b.Parent then return false, "gone" end
-    pcall(function() b.Active = true end)
-
-    local base = uiSignature()
-
-    if signalStrategy(b) then
-        task.wait(0.3)
-        if uiSignature() ~= base then return true, "signal" end
-    end
-
-    if firesignal then
-        pcall(firesignal, b.MouseButton1Click)
-        task.wait(0.25)
-        if uiSignature() ~= base then return true, "firesignal" end
-    end
-
-    if CONFIG.UseVirtualClick then
-        virtualClick(b)
-        task.wait(0.35)
-        if uiSignature() ~= base then return true, "virtualclick" end
-    end
-
-    pcall(function() b:Activate() end)
-    task.wait(0.25)
-    if uiSignature() ~= base then return true, "activate" end
-
-    return false, "no effect"
-end
-
-local function isDead(b)
-    local t = dead[b]
-    return t and (os.clock() - t) < DEAD_TIME
-end
-
---==================== AUTO OPEN BOX ====================
-
-local function buttonSet()
-    local s = {}
-    for _, b in ipairs(gameButtons()) do s[b] = true end
-    return s
-end
-
-local function countSet(s)
-    local n = 0
-    for _ in pairs(s) do n += 1 end
-    return n
-end
-
-local function newButtonsSince(baseline)
-    local out = {}
-    for _, b in ipairs(gameButtons()) do
-        if not baseline[b] then out[#out + 1] = b end
-    end
-    return out
-end
-
-local NEGATIVE = {"close", "exit"}
-
-local function candidatePriority(b)
-    local lbl = buttonLabel(b):lower()
-    for _, neg in ipairs(NEGATIVE) do
-        if lbl:find(neg, 1, true) then return nil end
-    end
-    if nameMatches(lbl, {"buy", "purchase", "confirm", "yes", "claim"}) then return 1 end
-    if nameMatches(lbl, {"unbox", "open", "hatch", "spin", "roll"}) then return 2 end
-    if nameMatches(lbl, {"case", "box", "crate", "halloween", "candy", "ember"}) then return 3 end
-    if nameMatches(lbl, {"shop", "inventory", "store", "back", "tab"}) then return 4 end
-    return 5
-end
-
-local BASELINE = nil
-local function recapture()
-    BASELINE = buttonSet()
-    dead = {}; failCount = {}
-    STATE.log = "baseline: " .. countSet(BASELINE) .. " game buttons"
-end
-
-local function pickOpener()
-    for _, b in ipairs(gameButtons()) do
-        if BASELINE[b] and nameMatches(buttonLabel(b), {"halloween", "event"}) then
-            return b
-        end
-    end
-    for _, b in ipairs(gameButtons()) do
-        if nameMatches(buttonLabel(b), {"halloween", "event", "crate"}) then return b end
-    end
-end
-
-task.spawn(function()
-    local lastPress = 0
-    local wasOpen = false
-
-    while task.wait(0.2) do
-        if STATE.open and not wasOpen then recapture() end
-        wasOpen = STATE.open
-        if not STATE.open then continue end
-        if os.clock() - lastPress < CONFIG.StepCooldown then continue end
-
-        if CONFIG.RequireBalance and not STATE.force then
-            local c = STATE.candy
-            if c and c < CONFIG.BoxCost then
-                STATE.log = "wait
+local SPY = { installed = false, log = {}, rec = false, seq
