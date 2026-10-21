@@ -1,7 +1,7 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  NOCLIP GLIDE — walks through walls at TweenSpeed studs/sec
+--  NOCLIP GLIDE (unanchored so Touched actually fires)
 --=============================================================
 
 local CONFIG = {
@@ -14,7 +14,7 @@ local CONFIG = {
     RetryOnMiss   = true,
     MaxAttempts   = 3,
     ClaimCooldown = 5.0,
-    HopInterval   = 0.25,    -- small pause after each grab
+    HopInterval   = 0.25,
     RescanTime    = 1.0,
     NearestFirst  = true,
 
@@ -143,17 +143,13 @@ local function scanCandies()
     return out
 end
 
---==================== NOCLIP ====================
+--==================== NOCLIP (no anchor!) ====================
 
 local function applyNoclip(char)
     if not char then return end
     for _, p in ipairs(char:GetDescendants()) do
-        if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
-            p.CanCollide = false
-        end
+        if p:IsA("BasePart") then p.CanCollide = false end
     end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if hrp then hrp.Anchored = true end
 end
 
 local function clearNoclip(char)
@@ -163,11 +159,9 @@ local function clearNoclip(char)
             p.CanCollide = true
         end
     end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if hrp then hrp.Anchored = false end
 end
 
---==================== MOVEMENT (glide, no teleport) ====================
+--==================== MOVEMENT ====================
 
 local function interact(part)
     for _, d in ipairs(part:GetDescendants()) do
@@ -181,7 +175,22 @@ local function interact(part)
     end
 end
 
--- smoothly slide the character to a world position at CONFIG.TweenSpeed
+-- poke the candy's own Touched handlers so collection can't be missed
+local function forceTouch(target, char)
+    if not getconnections or not target.Parent then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local body = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+    if not hrp then return end
+    pcall(function()
+        for _, c in ipairs(getconnections(target.Touched)) do
+            if c.Function then
+                pcall(c.Function, hrp)
+                if body then pcall(c.Function, body) end
+            end
+        end
+    end)
+end
+
 local function glideTo(pos, char, hrp)
     if not char.Parent or not hrp.Parent then return end
 
@@ -190,7 +199,6 @@ local function glideTo(pos, char, hrp)
     local dist = delta.Magnitude
     if dist < 0.1 then return end
 
-    -- face the direction of travel (horizontal only)
     local flat = Vector3.new(delta.X, 0, delta.Z)
     local rot
     if flat.Magnitude > 1 then
@@ -216,26 +224,41 @@ end
 
 local function goGrab(target, char, hrp, holdFor)
     glideTo(target.Position, char, hrp)
-    task.wait(jit(CONFIG.SettleDelay))
-    if not stillThere(target) then return end
-    interact(target)
 
-    -- keep re-firing the grab for the WHOLE dwell window
+    -- hold position ourselves: with no collision the character would fall
+    local rot  = hrp.CFrame - hrp.CFrame.Position
+    local base = target.Position
+
     local t0 = os.clock()
     local nextRefire = CONFIG.ReInteractAt
+    local firstDone = false
+
     while os.clock() - t0 < holdFor do
         if not stillThere(target) then break end
-        if (os.clock() - t0) >= nextRefire then
+
+        -- gentle bob so touch overlap keeps re-triggering
+        local bob = math.sin((os.clock() - t0) * 6) * 0.4
+        hrp.CFrame = CFrame.new(base + Vector3.new(0, bob, 0)) * rot
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+
+        if not firstDone then
+            firstDone = true
+            interact(target)
+            forceTouch(target, char)
+        elseif (os.clock() - t0) >= nextRefire then
             nextRefire = nextRefire + CONFIG.ReInteractAt
             interact(target)
-            if target.Parent then
-                glideTo(target.Position + Vector3.new(0, 0.5, 0), char, hrp)
-                glideTo(target.Position, char, hrp)
-            end
+            forceTouch(target, char)
         end
+
         task.wait(0.04)
     end
-    if stillThere(target) then interact(target) end
+
+    if stillThere(target) then
+        interact(target)
+        forceTouch(target, char)
+    end
 end
 
 --==================== FARM LOOP ====================
@@ -259,7 +282,6 @@ task.spawn(function()
     while task.wait() do
         local char, _, hrp = getChar()
 
-        -- noclip + anchor only while farming (so you can still walk when it's off)
         if STATE.farm and char then
             if char ~= noclipChar then
                 applyNoclip(char)
