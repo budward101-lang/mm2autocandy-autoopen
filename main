@@ -1,27 +1,26 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  Longer grab window + repeated re-interact
+--  NOCLIP GLIDE — walks through walls at TweenSpeed studs/sec
 --=============================================================
 
 local CONFIG = {
     --========== MOVEMENT ==========
-    HoverHeight   = 2.5,
-    SettleDelay   = 0.22,
-    DwellTime     = 3.0,     -- LONG grab window: stands this long on each candy
-    ReInteractAt  = 0.5,     -- re-fire the grab every 0.5s during the dwell
+    TweenSpeed    = 18,      -- studs/sec glide speed (through walls)
+    SettleDelay   = 0.15,
+    DwellTime     = 3.0,     -- long grab window on each candy
+    ReInteractAt  = 0.5,     -- re-fire grab every 0.5s during dwell
     RetryDwell    = 2.0,
     RetryOnMiss   = true,
     MaxAttempts   = 3,
     ClaimCooldown = 5.0,
-    HopInterval   = 1.0,
+    HopInterval   = 0.25,    -- small pause after each grab
     RescanTime    = 1.0,
     NearestFirst  = true,
 
     --========== ANTI-KICK / HUMANIZER ==========
     Humanize      = true,
     JitterPct     = 0.3,
-    SpeedLimit    = 45,
     RestAfterMin  = 15,
     RestAfterMax  = 28,
     RestMin       = 1.5,
@@ -144,7 +143,31 @@ local function scanCandies()
     return out
 end
 
---==================== MOVEMENT ====================
+--==================== NOCLIP ====================
+
+local function applyNoclip(char)
+    if not char then return end
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+            p.CanCollide = false
+        end
+    end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then hrp.Anchored = true end
+end
+
+local function clearNoclip(char)
+    if not char then return end
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+            p.CanCollide = true
+        end
+    end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then hrp.Anchored = false end
+end
+
+--==================== MOVEMENT (glide, no teleport) ====================
 
 local function interact(part)
     for _, d in ipairs(part:GetDescendants()) do
@@ -158,21 +181,46 @@ local function interact(part)
     end
 end
 
-local function landAndHold(target, char, hrp, holdFor)
-    char:PivotTo(CFrame.new(target.Position + Vector3.new(0, CONFIG.HoverHeight, 0)))
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
-    task.wait(jit(CONFIG.SettleDelay))
+-- smoothly slide the character to a world position at CONFIG.TweenSpeed
+local function glideTo(pos, char, hrp)
+    if not char.Parent or not hrp.Parent then return end
 
-    if target.Parent then
-        char:PivotTo(CFrame.new(target.Position))
+    local startPos = hrp.Position
+    local delta = pos - startPos
+    local dist = delta.Magnitude
+    if dist < 0.1 then return end
+
+    -- face the direction of travel (horizontal only)
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    local rot
+    if flat.Magnitude > 1 then
+        rot = CFrame.lookAt(Vector3.zero, flat.Unit)
+    else
+        rot = hrp.CFrame - hrp.CFrame.Position
+    end
+
+    local duration = dist / math.max(CONFIG.TweenSpeed, 1)
+    local t0 = os.clock()
+
+    while true do
+        if not char.Parent or not hrp.Parent then return end
+        local a = (os.clock() - t0) / duration
+        if a > 1 then a = 1 end
+        hrp.CFrame = CFrame.new(startPos:Lerp(pos, a)) * rot
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
+        if a >= 1 then break end
+        task.wait()
     end
+end
+
+local function goGrab(target, char, hrp, holdFor)
+    glideTo(target.Position, char, hrp)
     task.wait(jit(CONFIG.SettleDelay))
+    if not stillThere(target) then return end
     interact(target)
 
-    -- keep re-firing the grab for the WHOLE dwell window, not just once
+    -- keep re-firing the grab for the WHOLE dwell window
     local t0 = os.clock()
     local nextRefire = CONFIG.ReInteractAt
     while os.clock() - t0 < holdFor do
@@ -180,14 +228,9 @@ local function landAndHold(target, char, hrp, holdFor)
         if (os.clock() - t0) >= nextRefire then
             nextRefire = nextRefire + CONFIG.ReInteractAt
             interact(target)
-            -- nudge back onto it so touch-based grabs re-trigger too
             if target.Parent then
-                char:PivotTo(CFrame.new(target.Position + Vector3.new(0, 0.6, 0)))
-                task.wait(0.06)
-                if target.Parent then
-                    char:PivotTo(CFrame.new(target.Position))
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                end
+                glideTo(target.Position + Vector3.new(0, 0.5, 0), char, hrp)
+                glideTo(target.Position, char, hrp)
             end
         end
         task.wait(0.04)
@@ -211,10 +254,23 @@ task.spawn(function()
     local list, lastScan, nextHop = {}, 0, 0
     local hopsSinceRest = 0
     local restTarget = math.random(CONFIG.RestAfterMin, CONFIG.RestAfterMax)
+    local noclipChar = nil
 
     while task.wait() do
-        if not STATE.farm then task.wait(0.05) continue end
         local char, _, hrp = getChar()
+
+        -- noclip + anchor only while farming (so you can still walk when it's off)
+        if STATE.farm and char then
+            if char ~= noclipChar then
+                applyNoclip(char)
+                noclipChar = char
+            end
+        elseif not STATE.farm and noclipChar then
+            clearNoclip(noclipChar)
+            noclipChar = nil
+        end
+
+        if not STATE.farm then task.wait(0.05) continue end
         if not char then task.wait(0.1) continue end
 
         local now = os.clock()
@@ -231,16 +287,14 @@ task.spawn(function()
             local target = pickNearest(list, hrp)
             if target then
                 local hopStart = os.clock()
-                local dist = (target.Position - hrp.Position).Magnitude
-
                 attempts[target] = (attempts[target] or 0) + 1
-                claimed[target] = hopStart + CONFIG.DwellTime + CONFIG.RetryDwell + 0.5
+                claimed[target] = hopStart + CONFIG.DwellTime + CONFIG.RetryDwell + 1.0
 
-                landAndHold(target, char, hrp, jit(CONFIG.DwellTime))
+                goGrab(target, char, hrp, jit(CONFIG.DwellTime))
 
                 if CONFIG.RetryOnMiss and stillThere(target) and not promptDead(target) then
                     STATE.log = "retry: " .. target.Name
-                    landAndHold(target, char, hrp, jit(CONFIG.RetryDwell))
+                    goGrab(target, char, hrp, jit(CONFIG.RetryDwell))
                 end
 
                 if not stillThere(target) or promptDead(target) then
@@ -252,9 +306,7 @@ task.spawn(function()
 
                 attempts[target] = CONFIG.MaxAttempts
                 STATE.hops += 1
-
-                local travel = CONFIG.SpeedLimit > 0 and (dist / CONFIG.SpeedLimit) or 0
-                nextHop = math.max(os.clock(), hopStart + math.max(jit(CONFIG.HopInterval), travel))
+                nextHop = os.clock() + jit(CONFIG.HopInterval)
 
                 hopsSinceRest += 1
                 if hopsSinceRest >= restTarget then
@@ -597,38 +649,20 @@ dwellBtn.MouseButton1Click:Connect(function()
 end)
 refreshDwell()
 
-local DELAYS = {0.3, 0.5, 0.8, 1.0, 1.5, 2.0}
-local delayBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
-local function refreshDelay()
-    delayBtn.Text = string.format("Hop interval: %.2fs  (click to change)", CONFIG.HopInterval)
-end
-delayBtn.MouseButton1Click:Connect(function()
-    local idx = 1
-    for i, v in ipairs(DELAYS) do
-        if math.abs(v - CONFIG.HopInterval) < 0.01 then idx = i break end
-    end
-    idx = idx % #DELAYS + 1
-    CONFIG.HopInterval = DELAYS[idx]
-    refreshDelay()
-    STATE.log = "hop interval " .. CONFIG.HopInterval .. "s"
-end)
-refreshDelay()
-
-local SPEEDS = {0, 20, 30, 45, 60, 90}
-local speedBtn = mkBtn(8, "", Color3.fromRGB(45, 40, 55))
+local SPEEDS = {6, 10, 14, 18, 24, 30, 40, 55}
+local speedBtn = mkBtn(7, "", Color3.fromRGB(45, 40, 55))
 local function refreshSpeed()
-    speedBtn.Text = string.format("Speed limit: %s  (click to change)",
-        CONFIG.SpeedLimit == 0 and "OFF" or (CONFIG.SpeedLimit .. " studs/s"))
+    speedBtn.Text = string.format("Glide speed: %d studs/s  (click to change)", CONFIG.TweenSpeed)
 end
 speedBtn.MouseButton1Click:Connect(function()
     local idx = 1
     for i, v in ipairs(SPEEDS) do
-        if math.abs(v - CONFIG.SpeedLimit) < 0.01 then idx = i break end
+        if v == CONFIG.TweenSpeed then idx = i break end
     end
     idx = idx % #SPEEDS + 1
-    CONFIG.SpeedLimit = SPEEDS[idx]
+    CONFIG.TweenSpeed = SPEEDS[idx]
     refreshSpeed()
-    STATE.log = "speed limit " .. (CONFIG.SpeedLimit == 0 and "off" or CONFIG.SpeedLimit)
+    STATE.log = "glide speed " .. CONFIG.TweenSpeed
 end)
 refreshSpeed()
 
@@ -686,10 +720,10 @@ local function addStep()
     end)
 end
 
-mkBtn(9, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+mkBtn(8, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
     .MouseButton1Click:Connect(addStep)
 
-mkBtn(10, "Remove last step", Color3.fromRGB(55, 45, 35))
+mkBtn(9, "Remove last step", Color3.fromRGB(55, 45, 35))
     .MouseButton1Click:Connect(function()
         if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
         local removed = table.remove(CONFIG.Sequence)
@@ -723,11 +757,12 @@ task.spawn(function()
     while task.wait(0.3) do
         local run = os.clock() - STATE.started
         stats.Text = string.format(
-            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d\nsteps   : %d   stand: %.1fs\nbalance : %s\nlog     : %s",
+            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d\nsteps   : %d   stand: %.1fs\nspeed   : %d  balance: %s\nlog     : %s",
             STATE.collected, STATE.skipped, STATE.hops,
             STATE.hops / math.max(run, 0.001),
             math.floor(run / 60), math.floor(run % 60),
             STATE.boxes, #CONFIG.Sequence, CONFIG.DwellTime,
+            CONFIG.TweenSpeed,
             STATE.candy and tostring(STATE.candy) or "unknown",
             (STATE.log or ""):sub(1, 32))
     end
