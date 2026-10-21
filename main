@@ -1,41 +1,53 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keyless LocalScript. Delta / Codex / Wave / Solara / AWP / Krnl / Xeno
---  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open Box
+--  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force Open
 --=============================================================
 
 local CONFIG = {
-    FarmSpeed    = 0.05,   -- seconds between candy pickups (0.05 fast, 0.15 safe)
-    HoverHeight  = 0.0,    -- studs above the candy to land on
-    RescanTime   = 0.35,   -- how often to rescan workspace for candy
-    NameFilter   = {"candy", "coin"},  -- candies replaced coins, so both match
-    MaxSize      = 8,      -- ignore parts larger than this (map decorations)
+    --========== MOVEMENT: 1 hop per second ==========
+    HopInterval  = 1.0,    -- seconds between teleports. 1.0 = one hop per second
+    HoverHeight  = 3,      -- drop onto the candy instead of inside it
+    RescanTime   = 1.0,    -- rescan workspace for candy
+
+    --========== CANDY DETECTION ==========
+    NameFilter   = {"candy", "coin"},
+    MaxSize      = 8,
+
+    --========== AUTO OPEN ==========
     AutoFarm     = true,
     AutoOpen     = true,
-    BoxCost      = 600,    -- 2026 Halloween Box price in candies
-    StepCooldown = 0.9,    -- min seconds between GUI presses
-    BoxSteps = {
-        -- checked top to bottom, first match wins
-        { name = "Open Box",          kw = {"open", "unbox", "hatch"}, delay = 1.0 },
-        { name = "Buy Box",           kw = {"buy", "purchase"},        delay = 0.8 },
-        { name = "Event / Box Panel", kw = {"halloween", "event", "box", "crate"}, delay = 0.8 },
+    BoxCost      = 600,
+    StepCooldown = 1.5,
+    RequireBalance = true,   -- don't open unless you can afford a box
+
+    -- checked top to bottom, first button that causes a visible UI change wins
+    AutoOpenSteps = {
+        { label = "open/unbox", any = {"unbox", "open box", "hatch", "open"}, delay = 1.2 },
+        { label = "buy",        any = {"buy", "purchase", "600"},             delay = 1.0 },
+        { label = "panel",      any = {"halloween", "event", "crate", "box"}, delay = 1.0 },
     },
-    Keybinds = { UI = Enum.KeyCode.RightShift, Farm = Enum.KeyCode.F1, Open = Enum.KeyCode.F2 },
+
+    -- optional: exact button names, tried in order BEFORE keyword search.
+    -- leave empty until the dump tells you what the real names are.
+    PinnedButtons = {
+        -- "HalloweenIcon",
+        -- "BoxFrame.BuyButton",
+    },
+
+    Keybinds = { UI = Enum.KeyCode.RightShift, Farm = Enum.KeyCode.F1,
+                 Open = Enum.KeyCode.F2, Force = Enum.KeyCode.F3 },
 }
 
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
 local UIS     = game:GetService("UserInputService")
-local Tween   = game:GetService("TweenService")
 local LP      = Players.LocalPlayer
 
 local STATE = {
-    farm = CONFIG.AutoFarm,
-    open = CONFIG.AutoOpen,
-    collected = 0,
-    boxes = 0,
-    started = os.clock(),
-    candy = nil,
+    farm = CONFIG.AutoFarm, open = CONFIG.AutoOpen, force = false,
+    collected = 0, hops = 0, boxes = 0,
+    started = os.clock(), candy = nil, candyPath = "?", log = "starting...",
 }
 
 --==================== HELPERS ====================
@@ -75,11 +87,11 @@ local function scanCandies()
     return out
 end
 
-local function grab(part, hrp)
-    hrp.CFrame = part.CFrame + Vector3.new(0, CONFIG.HoverHeight, 0)
-    hrp.AssemblyLinearVelocity = Vector3.zero
+--==================== MOVEMENT: exactly one PivotTo per hop ====================
+
+local function interact(part)
     for _, d in ipairs(part:GetDescendants()) do
-        if d:IsA("ProximityPrompt") then
+        if d:IsA("ProximityPrompt") and d.Enabled ~= false then
             if fireproximityprompt then
                 pcall(fireproximityprompt, d, 0)
             else
@@ -93,37 +105,41 @@ local function grab(part, hrp)
     end
 end
 
---==================== CANDY FARM LOOP ====================
+local function hopOnce(target, char, hrp)
+    char:PivotTo(CFrame.new(target.Position + Vector3.new(0, CONFIG.HoverHeight, 0)))
+    hrp.AssemblyLinearVelocity = Vector3.zero
+end
+
+--==================== FARM LOOP: 1 hop per second ====================
 
 task.spawn(function()
-    local list, lastScan = {}, 0
+    local list, lastScan, nextHop = {}, 0, 0
     while task.wait() do
-        if STATE.farm then
-            local _, _, hrp = getChar()
-            if hrp then
-                local now = os.clock()
-                if now - lastScan > CONFIG.RescanTime then
-                    lastScan = now
-                    list = scanCandies()
-                end
-                for i = #list, 1, -1 do
-                    if not list[i] or not list[i].Parent then table.remove(list, i) end
-                end
+        if not STATE.farm then task.wait(0.05) continue end
 
-                local target = list[1]
-                if target then
-                    grab(target, hrp)
-                    task.wait(CONFIG.FarmSpeed)
-                    if not target.Parent then STATE.collected += 1 end
-                    table.remove(list, 1)
-                else
-                    task.wait(0.1)
-                end
-            else
-                task.wait(0.2)
+        local char, _, hrp = getChar()
+        if not char then task.wait(0.1) continue end
+
+        local now = os.clock()
+        if now - lastScan > CONFIG.RescanTime then
+            lastScan = now
+            list = scanCandies()
+        end
+        for i = #list, 1, -1 do
+            if not list[i] or not list[i].Parent then table.remove(list, i) end
+        end
+
+        -- the gate: nothing happens until the next hop is due
+        if now >= nextHop then
+            nextHop = now + CONFIG.HopInterval
+            local target = list[1]
+            if target then
+                hopOnce(target, char, hrp)
+                interact(target)
+                table.remove(list, 1)
+                STATE.collected += 1
+                STATE.hops += 1
             end
-        else
-            task.wait(0.1)
         end
     end
 end)
@@ -160,30 +176,64 @@ local function buttonLabel(b)
     return t
 end
 
-local function findButton(kw)
+local function findButtons(anyKw)
+    local out = {}
     for _, b in ipairs(visibleButtons()) do
-        if nameMatches(buttonLabel(b), kw) then return b end
+        if nameMatches(buttonLabel(b), anyKw) then out[#out + 1] = b end
     end
+    return out
 end
 
-local function press(b)
-    if not b then return false end
+-- cheap fingerprint of the visible UI, used to detect that a press did something
+local function uiSignature()
+    local parts = {}
+    for _, b in ipairs(visibleButtons()) do
+        parts[#parts + 1] = b:GetFullName()
+    end
+    return #parts .. ":" .. table.concat(parts, ",")
+end
+
+-- fires a button through every mechanism available, in order of reliability
+local function fireButton(b)
+    if not b or not b.Parent then return false end
     pcall(function() b.Active = true end)
-    local ok = pcall(function()
-        if firesignal then firesignal(b.MouseButton1Click) else b:Activate() end
-    end)
-    if not ok then pcall(function() b:Activate() end) end
-    return true
+
+    local function viaConnections(signal)
+        if not getconnections then return false end
+        local n = 0
+        pcall(function()
+            for _, c in ipairs(getconnections(signal)) do
+                if c.Enabled ~= false and c.Function then
+                    n = n + 1
+                    pcall(function() c.Function(b) end)
+                end
+            end
+        end)
+        return n > 0
+    end
+
+    if viaConnections(b.MouseButton1Click) then return true end
+    if viaConnections(b.Activated) then return true end
+    if firesignal and pcall(firesignal, b.MouseButton1Click) then return true end
+    return pcall(function() b:Activate() end)
 end
 
--- candy balance: value object first, then the event GUI counter
+local function resolvePath(path)
+    local node = pgui()
+    for part in string.gmatch(path, "[^%.]+") do
+        node = node and node:FindFirstChild(part)
+    end
+    return node
+end
+
+-- returns count AND the path it came from, so you can see if it's misreading
 local function getCandyCount()
     for _, src in ipairs({LP, RS}) do
         for _, v in ipairs(src:GetDescendants()) do
             if (v:IsA("IntValue") or v:IsA("NumberValue") or v:IsA("StringValue"))
                 and v.Name:lower():find("candy", 1, true) then
                 local n = tonumber(v.Value)
-                if n then return n end
+                if n then return n, v:GetFullName() end
             end
         end
     end
@@ -198,40 +248,82 @@ local function getCandyCount()
                         if anc.Name:lower():find("candy", 1, true) then hit = true break end
                         anc = anc.Parent
                     end
-                    if hit then return n end
+                    if hit then return n, l:GetFullName() end
                 end
             end
         end
     end
-    return nil
+    return nil, "not found"
 end
 
 task.spawn(function()
-    while task.wait(1) do STATE.candy = getCandyCount() end
+    while task.wait(1) do
+        STATE.candy, STATE.candyPath = getCandyCount()
+    end
 end)
 
---==================== AUTO OPEN BOX LOOP ====================
+--==================== AUTO OPEN BOX ====================
+
+local function tryPinned()
+    for _, path in ipairs(CONFIG.PinnedButtons) do
+        local b = resolvePath(path)
+        if b and b.Visible and chainVisible(b.Parent) then
+            fireButton(b)
+            return b
+        end
+    end
+end
 
 task.spawn(function()
-    local lastStep = 0
-    while task.wait(0.2) do
-        if STATE.open and (os.clock() - lastStep) > CONFIG.StepCooldown then
+    local lastPress = 0
+    while task.wait(0.15) do
+        if not STATE.open then continue end
+        if os.clock() - lastPress < CONFIG.StepCooldown then continue end
+
+        -- balance gate, skippable with F3
+        if CONFIG.RequireBalance and not STATE.force then
             local c = STATE.candy
-            local afford = (c == nil) or (c >= CONFIG.BoxCost)
-            if afford then
-                for _, step in ipairs(CONFIG.BoxSteps) do
-                    local b = findButton(step.kw)
-                    if b then
-                        press(b)
-                        if step.name == "Open Box" then STATE.boxes += 1 end
-                        lastStep = os.clock()
-                        task.wait(step.delay)
-                        STATE.candy = getCandyCount()
-                        break
-                    end
-                end
+            if c and c < CONFIG.BoxCost then
+                STATE.log = "waiting: " .. c .. "/" .. CONFIG.BoxCost .. " candies"
+                continue
             end
         end
+
+        -- 1. pinned exact names, if configured
+        local pinned = tryPinned()
+        if pinned then
+            lastPress = os.clock()
+            STATE.log = "pinned press: " .. pinned.Name
+            task.wait(CONFIG.StepCooldown)
+            STATE.candy = getCandyCount()
+            continue
+        end
+
+        -- 2. keyword search, first button that changes the UI wins
+        local progressed = false
+        for _, step in ipairs(CONFIG.AutoOpenSteps) do
+            for _, b in ipairs(findButtons(step.any)) do
+                local before = uiSignature()
+                fireButton(b)
+                lastPress = os.clock()
+                task.wait(step.delay)
+
+                if uiSignature() ~= before then
+                    STATE.log = "pressed [" .. step.label .. "] " .. b.Name
+                    if step.label == "open/unbox" then STATE.boxes += 1 end
+                    progressed = true
+                    break
+                else
+                    STATE.log = "no change: " .. b.Name
+                end
+            end
+            if progressed then break end
+        end
+
+        if not progressed then
+            STATE.log = "no matching button found"
+        end
+        STATE.candy = getCandyCount()
     end
 end)
 
@@ -250,7 +342,7 @@ local gui = new("ScreenGui", {
 }, LP:WaitForChild("PlayerGui"))
 
 local main = new("Frame", {
-    Name = "Main", Size = UDim2.new(0, 300, 0, 350),
+    Name = "Main", Size = UDim2.new(0, 310, 0, 400),
     Position = UDim2.new(0, 20, 0, 80),
     BackgroundColor3 = Color3.fromRGB(20, 16, 28),
     BorderSizePixel = 0, Active = true,
@@ -272,9 +364,19 @@ local body = new("Frame", {
 }, main)
 new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, body)
 
+local stats = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 74), LayoutOrder = 1,
+    BackgroundColor3 = Color3.fromRGB(28, 22, 36), BorderSizePixel = 0,
+    TextColor3 = Color3.fromRGB(200, 200, 210), Font = Enum.Font.Code,
+    TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Text = "",
+}, body)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, stats)
+new("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 8) }, stats)
+
 local function makeToggle(order, text, getter, setter)
     local b = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 32), LayoutOrder = order,
+        Size = UDim2.new(1, 0, 0, 30), LayoutOrder = order,
         BackgroundColor3 = Color3.fromRGB(35, 28, 45),
         TextColor3 = Color3.fromRGB(235, 235, 235),
         Font = Enum.Font.GothamMedium, TextSize = 14,
@@ -287,35 +389,26 @@ local function makeToggle(order, text, getter, setter)
     end
     b.MouseButton1Click:Connect(function() setter(not getter()); refresh() end)
     refresh()
-    return refresh
 end
-
-local stats = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 62), LayoutOrder = 1,
-    BackgroundColor3 = Color3.fromRGB(28, 22, 36), BorderSizePixel = 0,
-    TextColor3 = Color3.fromRGB(200, 200, 210), Font = Enum.Font.Code,
-    TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top, Text = "",
-}, body)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, stats)
-new("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 8) }, stats)
 
 makeToggle(2, "Candy Autofarm", function() return STATE.farm end,
     function(v) STATE.farm = v end)
 makeToggle(3, "Auto Open Halloween Box", function() return STATE.open end,
     function(v) STATE.open = v end)
+makeToggle(4, "Force Open (ignore balance)", function() return STATE.force end,
+    function(v) STATE.force = v end)
 
 local dbg = new("TextButton", {
-    Size = UDim2.new(1, 0, 0, 30), LayoutOrder = 4,
-    BackgroundColor3 = Color3.fromRGB(45, 35, 58), Text = "Debug: print all GUI buttons",
+    Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 5,
+    BackgroundColor3 = Color3.fromRGB(45, 35, 58), Text = "Dump all visible GUI buttons",
     TextColor3 = Color3.fromRGB(220, 220, 230), Font = Enum.Font.GothamMedium,
     TextSize = 13, BorderSizePixel = 0,
 }, body)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, dbg)
 
 local hide = new("TextButton", {
-    Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 5,
-    BackgroundColor3 = Color3.fromRGB(60, 30, 30), Text = "Hide (RightShift to reopen)",
+    Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 6,
+    BackgroundColor3 = Color3.fromRGB(60, 30, 30), Text = "Hide (RightShift)",
     TextColor3 = Color3.fromRGB(255, 200, 200), Font = Enum.Font.GothamMedium,
     TextSize = 13, BorderSizePixel = 0,
 }, body)
@@ -323,12 +416,12 @@ new("UICorner", { CornerRadius = UDim.new(0, 6) }, hide)
 
 dbg.MouseButton1Click:Connect(function()
     print("===== VISIBLE GUI BUTTONS =====")
+    local pg = pgui()
     for _, b in ipairs(visibleButtons()) do
-        print(b:GetFullName(), "=>", buttonLabel(b))
+        print(b:GetFullName():gsub(pg:GetFullName() .. "%.", ""), "=>", buttonLabel(b))
     end
 end)
 
--- drag
 do
     local dragging, startPos, startInput
     header.InputBegan:Connect(function(i)
@@ -353,20 +446,21 @@ end
 
 hide.MouseButton1Click:Connect(function() main.Visible = false end)
 
--- stat ticker
 task.spawn(function()
     while task.wait(0.3) do
         local run = os.clock() - STATE.started
-        local rate = STATE.collected / math.max(run / 3600, 0.0001)
+        local hps = STATE.hops / math.max(run, 0.001)
         stats.Text = string.format(
-            "candy picked : %d\nrun time     : %02d:%02d\npickups/hour : %.0f\nboxes opened : %d\nbalance      : %s",
-            STATE.collected, math.floor(run / 60), math.floor(run % 60),
-            rate, STATE.boxes,
-            STATE.candy and tostring(STATE.candy) or "unknown")
+            "candy picked : %d\nhops         : %d  (%.2f/sec)\nrun time     : %02d:%02d\nboxes opened : %d\nbalance      : %s\nsrc          : %s\nlog          : %s",
+            STATE.collected, STATE.hops, hps,
+            math.floor(run / 60), math.floor(run % 60),
+            STATE.boxes,
+            STATE.candy and tostring(STATE.candy) or "unknown",
+            (STATE.candyPath or "?"):sub(-38),
+            (STATE.log or ""):sub(1, 38))
     end
 end)
 
--- keybinds
 UIS.InputBegan:Connect(function(i, gp)
     if gp then return end
     if i.KeyCode == CONFIG.Keybinds.UI then
@@ -375,7 +469,9 @@ UIS.InputBegan:Connect(function(i, gp)
         STATE.farm = not STATE.farm
     elseif i.KeyCode == CONFIG.Keybinds.Open then
         STATE.open = not STATE.open
+    elseif i.KeyCode == CONFIG.Keybinds.Force then
+        STATE.force = not STATE.force
     end
 end)
 
-print("[MM2 Candy Farm] loaded — RightShift UI | F1 farm | F2 auto-open")
+print("[MM2 Candy Farm] loaded — 1 hop/sec | RightShift UI | F1 farm | F2 open | F3 force")
