@@ -542,12 +542,11 @@ end
 
 makeToggle(2, "Candy Autofarm", function() return STATE.farm end, function(v) STATE.farm = v end)
 makeToggle(3, "Auto Open Box", function() return STATE.open end, function(v) STATE.open = v end)
-makeToggle(4, "Force (ignore balance)", function() return STATE.force end, function(v) STATE.force = v end)
-makeToggle(5, "Close page before each cycle",
+makeToggle(4, "Close page before each cycle",
     function() return CONFIG.CloseBeforeCycle end, function(v) CONFIG.CloseBeforeCycle = v end)
 
 local DWELLS = {0.3, 0.6, 0.9, 1.2, 1.8, 2.5}
-local dwellBtn = mkBtn(6, "", Color3.fromRGB(50, 42, 30))
+local dwellBtn = mkBtn(5, "", Color3.fromRGB(50, 42, 30))
 local function refreshDwell()
     dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
 end
@@ -565,7 +564,7 @@ end)
 refreshDwell()
 
 local DELAYS = {0.2, 0.35, 0.45, 0.7, 1.0, 1.5}
-local delayBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
+local delayBtn = mkBtn(6, "", Color3.fromRGB(50, 42, 30))
 local function refreshDelay()
     delayBtn.Text = string.format("Step delay: %.2fs  (click to change)", CONFIG.SequenceDelay)
 end
@@ -635,53 +634,16 @@ local function addStep()
     end)
 end
 
-mkBtn(8, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+mkBtn(7, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
     .MouseButton1Click:Connect(addStep)
 
-mkBtn(9, "Remove last step", Color3.fromRGB(55, 45, 35))
+mkBtn(8, "Remove last step", Color3.fromRGB(55, 45, 35))
     .MouseButton1Click:Connect(function()
         if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
         local removed = table.remove(CONFIG.Sequence)
         STATE.log = "removed: " .. removed:sub(-22)
         printSteps()
     end)
-
-mkBtn(10, "Print steps", Color3.fromRGB(40, 45, 60))
-    .MouseButton1Click:Connect(function()
-        printSteps()
-        STATE.log = #CONFIG.Sequence .. " steps printed"
-    end)
-
-mkBtn(11, "Clear steps", Color3.fromRGB(55, 40, 40))
-    .MouseButton1Click:Connect(function()
-        CONFIG.Sequence = {}
-        STATE.log = "steps cleared"
-    end)
-
-mkBtn(12, "Test sequence once", Color3.fromRGB(50, 45, 70))
-    .MouseButton1Click:Connect(function()
-        if #CONFIG.Sequence == 0 then STATE.log = "no steps yet"; return end
-        task.spawn(replaySequence)
-    end)
-
-mkBtn(13, "Dump visible GUI buttons", Color3.fromRGB(45, 35, 58))
-    .MouseButton1Click:Connect(function()
-        local pg = pgui()
-        print("===== VISIBLE GUI BUTTONS =====")
-        for _, b in ipairs(visibleButtons()) do
-            print(b:GetFullName():gsub(pg:GetFullName() .. "%.", ""), "=>", buttonLabel(b))
-        end
-        STATE.log = "dump printed"
-    end)
-
-mkBtn(14, "Reset skip list", Color3.fromRGB(45, 50, 35))
-    .MouseButton1Click:Connect(function()
-        attempts, claimed = {}, {}
-        STATE.log = "skip list reset"
-    end)
-
-mkBtn(15, "Hide (RightShift)", Color3.fromRGB(60, 30, 30))
-    .MouseButton1Click:Connect(function() main.Visible = false end)
 
 do
     local dragging, startPos, startInput
