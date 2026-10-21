@@ -6,13 +6,13 @@
 
 local CONFIG = {
     --========== MOVEMENT: 1 hop per second ==========
-    HopInterval   = 1.0,    -- seconds between teleports. 1.0 = one hop per second
-    HoverHeight   = 2.5,    -- drop onto the candy instead of inside it
-    RescanTime    = 0.8,    -- rescan workspace for candy
-    VerifyDelay   = 0.3,    -- wait after landing, then check if it vanished
-    RetryOnMiss   = true,   -- one exact re-drop before giving up on a candy
-    ClaimCooldown = 4.0,    -- seconds to ignore a candy that didn't disappear
-    NearestFirst  = true,   -- target the closest candy instead of list order
+    HopInterval   = 1.0,
+    HoverHeight   = 2.5,
+    RescanTime    = 0.8,
+    VerifyDelay   = 0.3,
+    RetryOnMiss   = true,
+    ClaimCooldown = 4.0,
+    NearestFirst  = true,
 
     --========== CANDY DETECTION ==========
     NameFilter    = {"candy", "coin"},
@@ -27,7 +27,7 @@ local CONFIG = {
 
     PinnedButtons = {
         -- "HalloweenIcon",
-        -- "EventFrame.BoxBuyButton",
+        -- "EventFrame.CaseTab",
     },
 
     Keybinds = { UI = Enum.KeyCode.RightShift, Farm = Enum.KeyCode.F1,
@@ -37,16 +37,20 @@ local CONFIG = {
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
 local UIS     = game:GetService("UserInputService")
+local VIM     = game:GetService("VirtualInputManager")
 local LP      = Players.LocalPlayer
 
 local STATE = {
     farm = CONFIG.AutoFarm, open = CONFIG.AutoOpen, force = false,
-    collected = 0, hops = 0, boxes = 0, missed = 0, fresh = 0,
+    collected = 0, hops = 0, boxes = 0, missed = 0, fresh = 0, dead = 0,
     moving = false,
     started = os.clock(), candy = nil, candyPath = "?", log = "starting...",
 }
 
-local claimed = {}   -- [part] = os.clock() when we gave up on it
+local claimed = {}      -- [part] = time we gave up on it
+local dead = {}         -- [button] = time we marked it unresponsive
+local failCount = {}    -- [button] = consecutive failed presses
+local DEAD_TIME = 10
 
 --==================== HELPERS ====================
 
@@ -77,7 +81,6 @@ local function isCandy(p)
     return true
 end
 
--- is the part still a live, visible pickup?
 local function stillThere(p)
     if not p or not p.Parent then return false end
     if not p:IsDescendantOf(workspace) then return false end
@@ -87,13 +90,10 @@ end
 
 local function pruneClaimed(now)
     for p, t in pairs(claimed) do
-        if not p.Parent or (now - t) > CONFIG.ClaimCooldown then
-            claimed[p] = nil
-        end
+        if not p.Parent or (now - t) > CONFIG.ClaimCooldown then claimed[p] = nil end
     end
 end
 
--- full validity gate, run immediately before every hop
 local function validTarget(p, now)
     if not stillThere(p) then return false end
     if not isCandy(p) then return false end
@@ -133,17 +133,11 @@ local function hopOnce(target, char, hrp)
     hrp.AssemblyLinearVelocity = Vector3.zero
 end
 
--- after landing, confirm the candy actually disappeared
 local function scheduleVerify(part, char, hrp)
     task.spawn(function()
         task.wait(CONFIG.VerifyDelay)
+        if not stillThere(part) then STATE.collected += 1 return end
 
-        if not stillThere(part) then
-            STATE.collected += 1
-            return
-        end
-
-        -- still standing: one exact re-drop before writing it off
         if CONFIG.RetryOnMiss and part.Parent then
             STATE.moving = true
             char:PivotTo(CFrame.new(part.Position))
@@ -161,8 +155,6 @@ local function scheduleVerify(part, char, hrp)
         end
     end)
 end
-
---==================== FARM LOOP ====================
 
 local function pickTarget(list, hrp, now)
     local best, bestD = nil, math.huge
@@ -192,7 +184,6 @@ task.spawn(function()
         end
         pruneClaimed(now)
 
-        -- drop dead and claimed entries
         local valid = {}
         for i = 1, #list do
             if validTarget(list[i], now) then valid[#valid + 1] = list[i] end
@@ -201,8 +192,6 @@ task.spawn(function()
 
         if now >= nextHop and not STATE.moving then
             local target = pickTarget(list, hrp, now)
-
-            -- re-check right before committing
             if target and validTarget(target, now) then
                 nextHop = now + CONFIG.HopInterval
                 hopOnce(target, char, hrp)
@@ -248,224 +237,70 @@ local function buttonLabel(b)
     return t
 end
 
-local function nameMatchAny(lbl, kw)
-    return nameMatches(lbl, kw)
+local function uiSignature()
+    local parts = {}
+    for _, b in ipairs(visibleButtons()) do
+        parts[#parts + 1] = b:GetFullName()
+    end
+    return #parts .. ":" .. table.concat(parts, ",")
 end
 
-local function fireButton(b)
-    if not b or not b.Parent then return false end
+--==================== PRESS MECHANISMS ====================
+
+-- invoke the FIRST signal that actually has handlers, so we never double-fire
+local function signalStrategy(b)
+    if not getconnections then return false end
+    for _, sigName in ipairs({"MouseButton1Click", "MouseButton1Down", "Activated"}) do
+        local sig = b[sigName]
+        if sig then
+            local conns, live
+            pcall(function() conns = getconnections(sig) end)
+            if conns then
+                live = 0
+                for _, c in ipairs(conns) do
+                    if c.Enabled ~= false and c.Function then live += 1 end
+                end
+                if live > 0 then
+                    for _, c in ipairs(conns) do
+                        if c.Enabled ~= false and c.Function then
+                            pcall(function() c.Function(b) end)
+                        end
+                    end
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- a genuine synthetic mouse click at the button's on-screen position
+local function virtualClick(b)
+    local ok = pcall(function()
+        local p, s = b.AbsolutePosition, b.AbsoluteSize
+        local x, y = p.X + s.X / 2, p.Y + s.Y / 2
+        VIM:SendMouseMoveEvent(x, y, false)
+        task.wait(0.03)
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        task.wait(0.05)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
+    end)
+    return ok
+end
+
+-- press, then confirm the visible UI actually changed. escalates on failure.
+local function pressVerified(b)
+    if not b or not b.Parent then return false, "gone" end
     pcall(function() b.Active = true end)
 
-    local function viaConnections(signal)
-        if not getconnections then return false end
-        local n = 0
-        pcall(function()
-            for _, c in ipairs(getconnections(signal)) do
-                if c.Enabled ~= false and c.Function then
-                    n = n + 1
-                    pcall(function() c.Function(b) end)
-                end
-            end
-        end)
-        return n > 0
+    local base = uiSignature()
+
+    if signalStrategy(b) then
+        task.wait(0.3)
+        if uiSignature() ~= base then return true, "signal" end
     end
 
-    if viaConnections(b.MouseButton1Click) then return true end
-    if viaConnections(b.Activated) then return true end
-    if firesignal and pcall(firesignal, b.MouseButton1Click) then return true end
-    return pcall(function() b:Activate() end)
-end
-
-local function resolvePath(path)
-    local node = pgui()
-    for part in string.gmatch(path, "[^%.]+") do
-        node = node and node:FindFirstChild(part)
-    end
-    return node
-end
-
-local function getCandyCount()
-    for _, src in ipairs({LP, RS}) do
-        for _, v in ipairs(src:GetDescendants()) do
-            if (v:IsA("IntValue") or v:IsA("NumberValue") or v:IsA("StringValue"))
-                and v.Name:lower():find("candy", 1, true) then
-                local n = tonumber(v.Value)
-                if n then return n, v:GetFullName() end
-            end
-        end
-    end
-    local pg = pgui()
-    if pg then
-        for _, l in ipairs(pg:GetDescendants()) do
-            if l:IsA("TextLabel") and l.Visible then
-                local n = tonumber((l.Text:gsub("[^%d]", "")))
-                if n then
-                    local anc, hit = l, false
-                    while anc and anc ~= pg do
-                        if anc.Name:lower():find("candy", 1, true) then hit = true break end
-                        anc = anc.Parent
-                    end
-                    if hit then return n, l:GetFullName() end
-                end
-            end
-        end
-    end
-    return nil, "not found"
-end
-
-task.spawn(function()
-    while task.wait(1) do
-        STATE.candy, STATE.candyPath = getCandyCount()
-    end
-end)
-
---==================== AUTO OPEN BOX ====================
-
-local function buttonSet()
-    local s = {}
-    for _, b in ipairs(visibleButtons()) do s[b] = true end
-    return s
-end
-
-local function countSet(s)
-    local n = 0
-    for _ in pairs(s) do n += 1 end
-    return n
-end
-
-local function newButtonsSince(baseline)
-    local out = {}
-    for _, b in ipairs(visibleButtons()) do
-        if not baseline[b] then out[#out + 1] = b end
-    end
-    return out
-end
-
-local NEGATIVE = {"close", "exit", "back", "settings", "shop", "inventory", "leaderboard"}
-
-local function candidatePriority(b)
-    local lbl = buttonLabel(b):lower()
-    for _, neg in ipairs(NEGATIVE) do
-        if lbl:find(neg, 1, true) then return nil end
-    end
-    if nameMatchAny(lbl, {"buy", "purchase", "confirm", "yes", "claim"}) then return 1 end
-    if nameMatchAny(lbl, {"unbox", "open", "hatch", "spin", "roll", "use"}) then return 2 end
-    if nameMatchAny(lbl, {"box", "crate", "halloween", "candy", "ember"}) then return 3 end
-    return 4
-end
-
-local BASELINE = buttonSet()
-
-local function recapture()
-    BASELINE = buttonSet()
-    STATE.log = "baseline: " .. countSet(BASELINE) .. " buttons"
-end
-
-local function pickOpener()
-    for _, b in ipairs(visibleButtons()) do
-        if BASELINE[b] and nameMatchAny(buttonLabel(b), {"halloween", "event"}) then
-            return b
-        end
-    end
-    for _, b in ipairs(visibleButtons()) do
-        if nameMatchAny(buttonLabel(b), {"halloween", "event", "crate"}) then return b end
-    end
-end
-
-task.spawn(function()
-    local lastPress = 0
-    while task.wait(0.2) do
-        if not STATE.open then continue end
-        if os.clock() - lastPress < CONFIG.StepCooldown then continue end
-
-        if CONFIG.RequireBalance and not STATE.force then
-            local c = STATE.candy
-            if c and c < CONFIG.BoxCost then
-                STATE.log = "waiting " .. c .. "/" .. CONFIG.BoxCost
-                continue
-            end
-        end
-
-        local fresh = newButtonsSince(BASELINE)
-        STATE.fresh = #fresh
-
-        if #fresh == 0 then
-            local op = pickOpener()
-            if op then
-                fireButton(op)
-                lastPress = os.clock()
-                STATE.log = "opener: " .. op.Name
-                task.wait(0.9)
-                STATE.candy = getCandyCount()
-            else
-                STATE.log = "no opener found"
-                task.wait(0.4)
-            end
-            continue
-        end
-
-        local best, bestP = nil, 99
-        for _, b in ipairs(fresh) do
-            local p = candidatePriority(b)
-            if p and p < bestP then best, bestP = b, p end
-        end
-
-        if best then
-            fireButton(best)
-            lastPress = os.clock()
-            STATE.log = "depth " .. bestP .. ": " .. best.Name
-            task.wait(1.0)
-            STATE.candy = getCandyCount()
-        else
-            STATE.log = "menu open, " .. #fresh .. " fresh, none usable"
-            task.wait(0.5)
-        end
-    end
-end)
-
---==================== UI ====================
-
-local function new(class, props, parent)
-    local o = Instance.new(class)
-    for k, v in pairs(props) do o[k] = v end
-    o.Parent = parent
-    return o
-end
-
-local gui = new("ScreenGui", {
-    Name = "MM2CandyFarm", ResetOnSpawn = false,
-    IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-}, LP:WaitForChild("PlayerGui"))
-
-local main = new("Frame", {
-    Name = "Main", Size = UDim2.new(0, 315, 0, 440),
-    Position = UDim2.new(0, 20, 0, 70),
-    BackgroundColor3 = Color3.fromRGB(20, 16, 28),
-    BorderSizePixel = 0, Active = true,
-}, gui)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
-new("UIStroke", { Color = Color3.fromRGB(255, 140, 40), Thickness = 1.5 }, main)
-
-local header = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Color3.fromRGB(32, 22, 42),
-    Text = "  MM2 CANDY FARM", TextColor3 = Color3.fromRGB(255, 170, 70),
-    Font = Enum.Font.GothamBold, TextSize = 15, TextXAlignment = Enum.TextXAlignment.Left,
-    BorderSizePixel = 0,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, header)
-
-local body = new("Frame", {
-    Size = UDim2.new(1, -20, 1, -44), Position = UDim2.new(0, 10, 0, 40),
-    BackgroundTransparency = 1,
-}, main)
-new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, body)
-
-local stats = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 90), LayoutOrder = 1,
-    BackgroundColor3 = Color3.fromRGB(28, 22, 36), BorderSizePixel = 0,
-    TextColor3 = Color3.fromRGB(200, 200, 210), Font = Enum.Font.Code,
-    TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top, Text = "",
-}, body)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, stats)
-new("
+    if firesignal then
+        pcall(firesignal, b.MouseButton1Click)
+        task.wait(0.25)
+        if uiSignature() ~= base then return true, "firesignal" end
