@@ -1,15 +1,22 @@
 --=============================================================
---  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
---  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  v3: nav via SHOP button (image 2), not the Radio/Modes/EVENT
---      tab row (image 1). Tab row = fallback only.
---  v4: shop pin, press-time capture, reward popup dismissal.
---  v5: SHOP -> Halloween Box '26 tile (image 3) -> Unbox. Box tile
---      pin + deep label matching (image tiles caption in child labels).
+--  MM2 • HALLOWEEN 2026 — CANDY AUTOFARM + AUTO OPEN BOX
+--  v5.1-debug: xpcall wrapped, staged prints, error box, button dump
+--  Nav = SHOP (image 2) -> Halloween Box tile (image 3) -> Unbox
+--  Bottom tab row (image 1) = fallback only
 --=============================================================
 
+local VERSION = "v5.1-debug"
+print("[MM2] " .. VERSION .. " starting")
+print(string.format("[MM2] executor: getconnections=%s firesignal=%s fireproximityprompt=%s fireclickdetector=%s",
+    tostring(getconnections ~= nil), tostring(firesignal ~= nil),
+    tostring(fireproximityprompt ~= nil), tostring(fireclickdetector ~= nil)))
+
+local function BOOT()
+
+local stage = 0
+local function mark(n) stage += 1; print(string.format("[MM2] step %02d ok - %s", stage, n)) end
+
 local CONFIG = {
-    --========== MOVEMENT ==========
     TweenSpeed    = 20,
     SettleDelay   = 0.15,
     DwellTime     = 3.0,
@@ -25,7 +32,6 @@ local CONFIG = {
     TickRate      = 0.1,
     NearestFirst  = true,
 
-    --========== ANTI-KICK / HUMANIZER ==========
     Humanize      = true,
     JitterPct     = 0.3,
     RestAfterMin  = 15,
@@ -33,32 +39,28 @@ local CONFIG = {
     RestMin       = 1.5,
     RestMax       = 4.5,
 
-    --========== CANDY DETECTION ==========
     NameFilter    = {"candy", "coin"},
     MaxSize       = 8,
 
-    --========== AUTO OPEN ==========
     AutoFarm      = true,
     AutoOpen      = true,
     BoxCost       = 600,
     RequireBalance = true,
     CycleCooldown = 3.0,
 
-    --========== WALLET BALANCE ==========
     WalletKeywords  = {"wallet", "candy", "sweet", "balance", "currency",
                        "total", "amount", "owned", "count"},
     BalanceCheckMin = 6,
     BalanceCheckMax = 12,
 
-    --========== BOX OPEN FLOW ==========
     OpenMode      = "builtin",
-    UseShopButton = true,          -- v3: SHOP bag button is the way in
-    TabFallback   = true,          -- only if the SHOP path finds no unbox button
+    UseShopButton = true,
+    TabFallback   = true,
     ShopKeywords  = {"shop", "store", "buy"},
     BoxTileKeywords = {"halloween box", "halloween", "mystery box", "mystery", "box"},
     EventKeywords = {"halloween", "event"},
-    BoxTabIndex   = 4,             -- 4th bottom icon (fallback path only)
-    RowYThreshold = 0.70,          -- bottom 30% of screen = the tab bar
+    BoxTabIndex   = 4,
+    RowYThreshold = 0.70,
     UnboxKeywords = {"unbox", "open box", "hatch", "open"},
     BuyKeywords   = {"buy", "purchase", "confirm", "600"},
     RewardKeywords = {"ok", "claim", "collect", "continue", "next",
@@ -75,6 +77,7 @@ local CONFIG = {
     Keybinds = { UI = Enum.KeyCode.RightShift, Farm = Enum.KeyCode.F1,
                  Open = Enum.KeyCode.F2, Force = Enum.KeyCode.F3 },
 }
+mark("config")
 
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
@@ -99,13 +102,9 @@ local STATE = {
     onBoxPage = false,
 }
 local attempts, claimed = {}, {}
-print("[MM2] boot")
 
---==================== FORWARD DECLS ====================
 local candySrc, readCandy, findCandySource, probeBalance
-local uiLock = false      -- true while any UI navigation is running
-
---==================== HELPERS ====================
+local uiLock = false
 
 local function pgui() return LP:FindFirstChildOfClass("PlayerGui") end
 
@@ -155,8 +154,6 @@ local function prune(now)
     end
 end
 
---==================== CACHED CANDY TRACKING ====================
-
 local candyList, candySet = {}, {}
 
 local function rebuildCandyList()
@@ -187,8 +184,6 @@ local function validTarget(p, now)
     return true
 end
 
---==================== NOCLIP ====================
-
 local function applyNoclip(char)
     if not char then return end
     for _, p in ipairs(char:GetDescendants()) do
@@ -205,14 +200,10 @@ local function clearNoclip(char)
     end
 end
 
---==================== MOVEMENT ====================
-
 local function interact(part)
     for _, d in ipairs(part:GetDescendants()) do
         if d:IsA("ProximityPrompt") and d.Enabled ~= false then
-            if fireproximityprompt then
-                pcall(fireproximityprompt, d, d.HoldDuration)
-            end
+            if fireproximityprompt then pcall(fireproximityprompt, d, d.HoldDuration) end
         elseif d:IsA("ClickDetector") then
             if fireclickdetector then pcall(fireclickdetector, d) end
         end
@@ -262,7 +253,6 @@ end
 
 local function goGrab(target, char, hrp, holdFor)
     glideTo(target.Position, char, hrp)
-
     local rot  = hrp.CFrame - hrp.CFrame.Position
     local base = target.Position
     local t0 = os.clock()
@@ -288,8 +278,6 @@ local function goGrab(target, char, hrp, holdFor)
     if stillThere(target) then interact(target); forceTouch(target, char) end
 end
 
---==================== FARM LOOP ====================
-
 local function pickNearest(now, hrp)
     local best, bestD
     for i = 1, #candyList do
@@ -301,6 +289,7 @@ local function pickNearest(now, hrp)
     end
     return best
 end
+mark("helpers")
 
 task.spawn(function()
     local lastScan, lastValidate, lastPrune, nextHop = 0, 0, 0, 0
@@ -377,9 +366,7 @@ task.spawn(function()
         end
     end
 end)
-print("[MM2] farm loop ok")
-
---==================== UI HELPERS ====================
+mark("farm loop")
 
 local function isOwnGui(o)
     local p = o
@@ -406,8 +393,7 @@ local function visibleButtons()
     for _, d in ipairs(pg:GetDescendants()) do
         if (d:IsA("TextButton") or d:IsA("ImageButton"))
             and d.Visible and d.AbsoluteSize.X > 0 and d.AbsoluteSize.Y > 0
-            and not isOwnGui(d)
-            and chainVisible(d.Parent) then
+            and not isOwnGui(d) and chainVisible(d.Parent) then
             out[#out + 1] = d
         end
     end
@@ -420,7 +406,6 @@ local function buttonLabel(b)
     return t
 end
 
--- v5: image tiles keep their caption in a child label, not in Text
 local function labelDeep(b)
     local parts = { buttonLabel(b) }
     local n = 1
@@ -469,8 +454,6 @@ local function fireButton(b)
     return pcall(function() b:Activate() end)
 end
 
--- v4: capture the GuiButton under the cursor at PRESS time.
--- (Reading 50ms after the click can land on whatever the click just opened.)
 local function pickTopButtonAt(mx, my)
     local pg = pgui(); if not pg then return nil end
     local fallback
@@ -478,9 +461,7 @@ local function pickTopButtonAt(mx, my)
         for _, o in ipairs(pg:GetGuiObjectsAtPosition(mx, y)) do
             if o:IsA("GuiButton") and o.Visible and chainVisible(o.Parent) then
                 if not fallback then fallback = o end
-                if getconnections and #getconnections(o.MouseButton1Click) > 0 then
-                    return o
-                end
+                if getconnections and #getconnections(o.MouseButton1Click) > 0 then return o end
             end
         end
     end
@@ -504,8 +485,7 @@ local function pathFromPg(o)
     end
     return table.concat(parts, ".")
 end
-
---==================== BOTTOM TAB ROW ====================
+mark("ui helpers")
 
 local function viewportY()
     local cam = workspace.CurrentCamera
@@ -521,7 +501,6 @@ local function inBottomRow(b)
     return b.AbsolutePosition.Y >= viewportY() * CONFIG.RowYThreshold
 end
 
--- the tab bar only: bottom strip, ordered left to right
 local function bottomRow(list)
     local out = {}
     for _, b in ipairs(list) do
@@ -540,7 +519,6 @@ local function findIn(list, keywords)
     return nil
 end
 
--- v5: same but reads child labels too (image tiles / image HUD buttons)
 local function findInDeep(list, keywords)
     for _, kw in ipairs(keywords) do
         for _, b in ipairs(list) do
@@ -558,7 +536,6 @@ local function nonTabButtons()
     return out
 end
 
--- an unbox/open button lives in the page body, NOT in the tab bar
 local function findUnbox()
     for _, kw in ipairs(CONFIG.UnboxKeywords) do
         for _, b in ipairs(nonTabButtons()) do
@@ -577,8 +554,6 @@ local function waitForUnbox(timeout)
     until os.clock() - t0 > timeout
     return nil
 end
-
---==================== CLOSE / BACK ====================
 
 local function isCloseButton(b)
     local l = buttonLabel(b):lower()
@@ -607,11 +582,10 @@ local function closeAll()
         if sigOf(visibleButtons()) == before then return end
     end
 end
-
---==================== BOX OPEN FLOW ====================
+mark("nav helpers")
 
 local boxTabIdx, boxTabName, eventRef = nil, nil, nil
-local shopSrc, boxTileSrc = nil, nil     -- v4/v5 pins
+local shopSrc, boxTileSrc = nil, nil
 
 local function clickFirst(keywords, preferBody)
     local b
@@ -631,7 +605,6 @@ local function clickEvent()
     return b
 end
 
--- v4: locate the SHOP bag button. pinned -> Name -> label -> right-hand HUD shape.
 local function findShop()
     local s = shopSrc
     if s and s.Parent and s.Visible and chainVisible(s.Parent) then return s end
@@ -640,17 +613,14 @@ local function findShop()
     for _, b in ipairs(vis) do
         if b.Name:lower():find("shop", 1, true) then return b end
     end
-
     local byLabel = findInDeep(vis, CONFIG.ShopKeywords)
     if byLabel then return byLabel end
 
-    -- last resort: a squarish button on the right-hand HUD, not in the tab bar
     local vx = viewportX()
     for _, b in ipairs(vis) do
         local sz, pos = b.AbsoluteSize, b.AbsolutePosition
         if not inBottomRow(b) and pos.X > vx * 0.68
-            and sz.X > 34 and sz.X < 150
-            and math.abs(sz.X - sz.Y) < 40 then
+            and sz.X > 34 and sz.X < 150 and math.abs(sz.X - sz.Y) < 40 then
             print("[MM2] shop guess: " .. b.Name)
             return b
         end
@@ -664,14 +634,12 @@ local function clickShop()
     return b
 end
 
--- v5: the Halloween Box '26 tile on the shop page
 local function findBoxTile()
     local s = boxTileSrc
     if s and s.Parent and s.Visible and chainVisible(s.Parent) then return s end
     return findInDeep(nonTabButtons(), CONFIG.BoxTileKeywords)
 end
 
--- v4: box-opened popup sitting over the page -> clear it before next unbox
 local function dismissReward()
     if findUnbox() then return false end
     for _, kw in ipairs(CONFIG.RewardKeywords) do
@@ -706,10 +674,7 @@ local function reachBoxPage(beforeSet)
     local unbox = findUnbox()
     if unbox then return unbox end
 
-    -- v3/v5: SHOP (image 2) -> Halloween Box '26 tile (image 3) -> unbox.
-    -- The Radio / Modes / EVENT row (image 1) is not touched here.
     if CONFIG.UseShopButton then
-        -- sometimes the shop drops you straight onto a box page
         unbox = waitForUnbox(1.2)
         if unbox then STATE.log = "box page via SHOP"; return unbox end
 
@@ -729,7 +694,6 @@ local function reachBoxPage(beforeSet)
         STATE.log = "SHOP path failed - trying tab row"
     end
 
-    -- 1) reuse the tab we learned last time (index AND name must match)
     if boxTabIdx then
         local row = bottomRow(visibleButtons())
         local cand = row[boxTabIdx]
@@ -740,22 +704,13 @@ local function reachBoxPage(beforeSet)
         boxTabIdx, boxTabName = nil, nil
     end
 
-    -- 2) discovery pass - only runs until a tab is learned
     local fresh = {}
     for _, b in ipairs(visibleButtons()) do
         if not beforeSet[b] then fresh[#fresh + 1] = b end
     end
 
     local row = bottomRow(fresh)
-    if #row < CONFIG.BoxTabIndex then
-        row = bottomRow(visibleButtons())
-    end
-
-    print("[MM2] bottom tab row (" .. #row .. "):")
-    for i, b in ipairs(row) do
-        print(string.format("  %d) x=%4d  %-24s | %s",
-            i, math.floor(b.AbsolutePosition.X), b.Name, buttonLabel(b)))
-    end
+    if #row < CONFIG.BoxTabIndex then row = bottomRow(visibleButtons()) end
 
     local order = {}
     if row[CONFIG.BoxTabIndex] then order[#order + 1] = row[CONFIG.BoxTabIndex] end
@@ -770,7 +725,6 @@ local function reachBoxPage(beforeSet)
             for i, b in ipairs(row) do
                 if b == cand then boxTabIdx, boxTabName = i, cand.Name break end
             end
-            print("[MM2] box page reached via: " .. cand.Name)
             return unbox
         end
     end
@@ -788,8 +742,6 @@ local function unboxAndBuy(unbox)
         task.wait(jit(1.2))
         return true
     end
-
-    -- v5: some boxes charge straight off the unbox button - no confirm step
     task.wait(jit(1.0))
     local after = readCandy()
     if before and after and after < before then
@@ -803,7 +755,6 @@ end
 local function runBoxCycle()
     uiLock = true
 
-    -- fast path: page already open -> no close, no nav, no tile clicks
     if STATE.onBoxPage then
         local unbox = findUnbox()
         if not unbox and dismissReward() then unbox = waitForUnbox(1.0) end
@@ -821,8 +772,6 @@ local function runBoxCycle()
     task.wait(jit(0.3))
 
     local before = buttonSet()
-
-    -- v3: SHOP first, EVENT tab only as fallback
     local ev
     if CONFIG.UseShopButton then ev = clickShop() end
     if not ev and (CONFIG.TabFallback or not CONFIG.UseShopButton) then ev = clickEvent() end
@@ -838,7 +787,6 @@ local function runBoxCycle()
         return false
     end
 
-    -- the account total is on this page: grab it while it's open
     candySrc = findCandySource()
     local bal = readCandy()
     if bal then
@@ -855,8 +803,7 @@ local function runBoxCycle()
     uiLock = false
     return true
 end
-
---==================== RECORDED SEQUENCE (optional) ====================
+mark("open flow")
 
 local function waitForButton(path, timeout)
     local t0 = os.clock()
@@ -872,7 +819,6 @@ local function replaySequence()
     local before = STATE.candy
     local sigBefore = sigOf(visibleButtons())
     local timedOut = 0
-
     for i, path in ipairs(CONFIG.Sequence) do
         local b = waitForButton(path, CONFIG.StepTimeout)
         if b then
@@ -884,7 +830,6 @@ local function replaySequence()
         end
         task.wait(jit(CONFIG.SequenceDelay))
     end
-
     task.wait(jit(1.2))
     local after = readCandy()
     if before and after and after < before then
@@ -898,8 +843,6 @@ local function replaySequence()
     end
     if after then STATE.candy = after end
 end
-
---==================== AUTO OPEN LOOP ====================
 
 task.spawn(function()
     local lastCycle = 0
@@ -926,9 +869,7 @@ task.spawn(function()
         lastCycle = os.clock()
     end
 end)
-print("[MM2] open loop ok")
-
---==================== WALLET BALANCE (read off the box page) ====================
+mark("open loop")
 
 local function walletPath(o)
     local parts, n, pg, depth = {}, o, pgui(), 0
@@ -981,7 +922,6 @@ findCandySource = function()
         local s = scoreWallet(o)
         if s > bestScore then best, bestScore = o, s end
     end
-
     local pg = pgui()
     if pg then
         for _, o in ipairs(pg:GetDescendants()) do
@@ -990,7 +930,6 @@ findCandySource = function()
             end
         end
     end
-
     for _, root in ipairs({LP:FindFirstChild("leaderstats"), LP, RS}) do
         if root then
             for _, o in ipairs(root:GetDescendants()) do
@@ -1003,7 +942,6 @@ findCandySource = function()
     return best
 end
 
--- opens the box page (view only, no cost), reads the total, closes again
 probeBalance = function()
     if uiLock then return end
     uiLock = true
@@ -1044,8 +982,7 @@ task.spawn(function()
         if os.clock() - STATE.lastCheck >= gap then probeBalance() end
     end
 end)
-
---==================== UI ====================
+mark("wallet")
 
 local function new(class, props, parent)
     local o = Instance.new(class)
@@ -1057,6 +994,7 @@ end
 local gui = new("ScreenGui", {
     Name = OWN_GUI_NAME, ResetOnSpawn = false, IgnoreGuiInset = true,
 }, LP:WaitForChild("PlayerGui"))
+mark("gui created")
 
 local main = new("Frame", {
     Size = UDim2.new(0, 310, 0, 700), Position = UDim2.new(0, 20, 0, 50),
@@ -1112,16 +1050,12 @@ end
 
 makeToggle(2, "Candy Autofarm", function() return STATE.farm end, function(v) STATE.farm = v end)
 makeToggle(3, "Auto Open Box", function() return STATE.open end, function(v) STATE.open = v end)
-makeToggle(4, "Anti-kick (humanize)",
-    function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
+makeToggle(4, "Anti-kick (humanize)", function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
 
--- v3: nav mode — SHOP bag button vs bottom tab row
 local navBtn = mkBtn(5, "", Color3.fromRGB(40, 50, 65))
 local function refreshNav()
-    navBtn.Text = "Nav: " .. (CONFIG.UseShopButton and "SHOP button" or "bottom tabs")
-        .. "  (click to change)"
-    navBtn.TextColor3 = CONFIG.UseShopButton
-        and Color3.fromRGB(140, 220, 255) or Color3.fromRGB(255, 190, 120)
+    navBtn.Text = "Nav: " .. (CONFIG.UseShopButton and "SHOP button" or "bottom tabs") .. "  (click to change)"
+    navBtn.TextColor3 = CONFIG.UseShopButton and Color3.fromRGB(140, 220, 255) or Color3.fromRGB(255, 190, 120)
 end
 navBtn.MouseButton1Click:Connect(function()
     CONFIG.UseShopButton = not CONFIG.UseShopButton
@@ -1131,7 +1065,6 @@ navBtn.MouseButton1Click:Connect(function()
 end)
 refreshNav()
 
--- v4: pin the SHOP button by clicking it
 local pinningShop = false
 local function pickShop()
     if pinningShop then return end
@@ -1139,5 +1072,276 @@ local function pickShop()
     local conn
     local function cleanup() pinningShop = false; if conn then conn:Disconnect() end end
     task.delay(8, function() if pinningShop then cleanup(); STATE.log = "shop pick timed out" end end)
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not pinningShop or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        local m = UIS:GetMouseLocation()
+        local b = pickTopButtonAt(m.X, m.Y)
+        cleanup()
+        if not b then STATE.log = "no button there"; return end
+        shopSrc = b
+        STATE.log = "shop pinned: " .. b.Name
+        print("[MM2] shop pinned: " .. b:GetFullName())
+    end)
+end
 
-    conn
+mkBtn(6, "PIN SHOP BUTTON  (click the SHOP bag)", Color3.fromRGB(35, 60, 80), 30)
+    .MouseButton1Click:Connect(pickShop)
+
+local pinningTile = false
+local function pickBoxTile()
+    if pinningTile then return end
+    pinningTile = true
+    local conn
+    local function cleanup() pinningTile = false; if conn then conn:Disconnect() end end
+    task.delay(8, function() if pinningTile then cleanup(); STATE.log = "tile pick timed out" end end)
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not pinningTile or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        local m = UIS:GetMouseLocation()
+        local b = pickTopButtonAt(m.X, m.Y)
+        cleanup()
+        if not b then STATE.log = "no button there"; return end
+        boxTileSrc = b
+        STATE.log = "tile pinned: " .. b.Name
+        print("[MM2] tile pinned: " .. b:GetFullName())
+    end)
+end
+
+mkBtn(7, "PIN BOX TILE  (click the Halloween Box)", Color3.fromRGB(35, 60, 80), 30)
+    .MouseButton1Click:Connect(pickBoxTile)
+
+mkBtn(8, "Check balance now", Color3.fromRGB(40, 60, 45))
+    .MouseButton1Click:Connect(function() probeBalance() end)
+
+local pinning = false
+local function pickWallet()
+    if pinning then return end
+    pinning = true
+    local conn
+    local function cleanup() pinning = false; if conn then conn:Disconnect() end end
+    task.delay(8, function() if pinning then cleanup(); STATE.log = "wallet pick timed out" end end)
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not pinning or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        local m = UIS:GetMouseLocation()
+        cleanup()
+        local pg = pgui()
+        local found
+        for _, y in ipairs({m.Y, m.Y - 36}) do
+            for _, o in ipairs(pg:GetGuiObjectsAtPosition(m.X, y)) do
+                if (o:IsA("TextLabel") or o:IsA("TextButton"))
+                    and o.Visible and chainVisible(o.Parent)
+                    and #(o.Text:gsub("[^%d]", "")) > 0 then found = o; break end
+            end
+            if found then break end
+        end
+        if not found then STATE.log = "no number label there"; return end
+        candySrc = found
+        STATE.candy = readCandy()
+        STATE.checkedOnce = true
+        STATE.walletName = found.Name
+        STATE.lastCheck = os.clock()
+        STATE.log = "wallet pinned: " .. found.Name
+    end)
+end
+
+mkBtn(9, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
+    .MouseButton1Click:Connect(pickWallet)
+
+local TABS = {1, 2, 3, 4, 5, 6, 7, 8}
+local tabBtn = mkBtn(10, "", Color3.fromRGB(50, 42, 30))
+local function refreshTab()
+    tabBtn.Text = string.format("Fallback tab #%d  (click to change)", CONFIG.BoxTabIndex)
+end
+tabBtn.MouseButton1Click:Connect(function()
+    local idx = 1
+    for i, v in ipairs(TABS) do
+        if v == CONFIG.BoxTabIndex then idx = i break end
+    end
+    idx = idx % #TABS + 1
+    CONFIG.BoxTabIndex = TABS[idx]
+    boxTabIdx, boxTabName = nil, nil
+    refreshTab()
+    STATE.log = "fallback tab #" .. CONFIG.BoxTabIndex
+end)
+refreshTab()
+
+local fbBtn = mkBtn(11, "", Color3.fromRGB(50, 42, 30))
+local function refreshFallback()
+    fbBtn.Text = "Tab-row fallback: " .. (CONFIG.TabFallback and "ON" or "OFF") .. "  (click to change)"
+    fbBtn.TextColor3 = CONFIG.TabFallback and Color3.fromRGB(255, 190, 120) or Color3.fromRGB(160, 200, 255)
+end
+fbBtn.MouseButton1Click:Connect(function()
+    CONFIG.TabFallback = not CONFIG.TabFallback
+    refreshFallback()
+    STATE.log = "tab fallback: " .. (CONFIG.TabFallback and "ON" or "OFF")
+end)
+refreshFallback()
+
+local modeBtn = mkBtn(12, "", Color3.fromRGB(45, 40, 55))
+local function refreshMode()
+    modeBtn.Text = "Open flow: " .. (CONFIG.OpenMode == "builtin" and "built-in" or "recorded") .. "  (click to change)"
+end
+modeBtn.MouseButton1Click:Connect(function()
+    CONFIG.OpenMode = CONFIG.OpenMode == "builtin" and "recorded" or "builtin"
+    refreshMode()
+    STATE.log = "open flow: " .. CONFIG.OpenMode
+end)
+refreshMode()
+
+local DWELLS = {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0}
+local dwellBtn = mkBtn(13, "", Color3.fromRGB(50, 42, 30))
+local function refreshDwell()
+    dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
+end
+dwellBtn.MouseButton1Click:Connect(function()
+    local idx = 1
+    for i, v in ipairs(DWELLS) do
+        if math.abs(v - CONFIG.DwellTime) < 0.01 then idx = i break end
+    end
+    idx = idx % #DWELLS + 1
+    CONFIG.DwellTime = DWELLS[idx]
+    CONFIG.ReInteractAt = math.min(CONFIG.DwellTime * 0.3, 0.6)
+    refreshDwell()
+    STATE.log = "dwell " .. CONFIG.DwellTime .. "s"
+end)
+refreshDwell()
+
+local picking = false
+
+local function printSteps()
+    print("===== RECORDED STEPS (" .. #CONFIG.Sequence .. ") =====")
+    for i, p in ipairs(CONFIG.Sequence) do print("  " .. i .. ") " .. p) end
+end
+
+local function addStep()
+    if picking then return end
+    picking = true
+    local conn
+    local function cleanup() picking = false; if conn then conn:Disconnect() end end
+    task.delay(8, function() if picking then cleanup(); STATE.log = "pick timed out" end end)
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not picking or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        local m = UIS:GetMouseLocation()
+        local b = pickTopButtonAt(m.X, m.Y)
+        cleanup()
+        if not b then STATE.log = "no button there"; return end
+        CONFIG.Sequence[#CONFIG.Sequence + 1] = pathFromPg(b)
+        STATE.log = "step " .. #CONFIG.Sequence .. ": " .. b.Name
+        printSteps()
+    end)
+end
+
+mkBtn(14, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+    .MouseButton1Click:Connect(addStep)
+
+mkBtn(15, "Remove last step", Color3.fromRGB(55, 45, 35))
+    .MouseButton1Click:Connect(function()
+        if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
+        local removed = table.remove(CONFIG.Sequence)
+        STATE.log = "removed: " .. removed:sub(-22)
+        printSteps()
+    end)
+
+do
+    local dragging, startPos, startInput
+    header.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; startInput = i.Position; startPos = main.Position
+        end
+    end)
+    header.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+            or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - startInput
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+mark("buttons")
+
+task.spawn(function()
+    local lastText = ""
+    while task.wait(0.5) do
+        local run = os.clock() - STATE.started
+        local since = STATE.lastCheck > 0
+            and string.format("%dm%02ds", math.floor((os.clock() - STATE.lastCheck) / 60),
+                math.floor((os.clock() - STATE.lastCheck) % 60)) or "never"
+        local txt = string.format(
+            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   steps: %d\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
+            STATE.collected, STATE.skipped, STATE.hops,
+            STATE.hops / math.max(run, 0.001),
+            math.floor(run / 60), math.floor(run % 60),
+            STATE.boxes, #CONFIG.Sequence,
+            STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost, since,
+            (STATE.walletName or "?"):sub(1, 28),
+            (STATE.log or ""):sub(1, 30))
+        if txt ~= lastText then lastText = txt; stats.Text = txt end
+    end
+end)
+
+UIS.InputBegan:Connect(function(i, gp)
+    if gp then return end
+    if i.KeyCode == CONFIG.Keybinds.UI then main.Visible = not main.Visible
+    elseif i.KeyCode == CONFIG.Keybinds.Farm then STATE.farm = not STATE.farm
+    elseif i.KeyCode == CONFIG.Keybinds.Open then STATE.open = not STATE.open
+    elseif i.KeyCode == CONFIG.Keybinds.Force then STATE.force = not STATE.force end
+end)
+
+-- debug: dump what the nav actually sees, 3s after load
+task.spawn(function()
+    task.wait(3)
+    local vis = visibleButtons()
+    print("[MM2] DUMP visible buttons: " .. #vis)
+    for _, b in ipairs(vis) do
+        print(string.format("   %-28s pos=(%d,%d) size=(%d,%d) label=%s",
+            b.Name, math.floor(b.AbsolutePosition.X), math.floor(b.AbsolutePosition.Y),
+            math.floor(b.AbsoluteSize.X), math.floor(b.AbsoluteSize.Y),
+            labelDeep(b):sub(1, 40)))
+    end
+    local row = bottomRow(vis)
+    print("[MM2] DUMP bottom row: " .. #row)
+    for i, b in ipairs(row) do print(string.format("   %d) %s", i, b.Name)) end
+end)
+mark("input + dump")
+
+end -- BOOT
+
+local ok, err = xpcall(BOOT, function(e) return tostring(e) .. "\n" .. debug.traceback("", 2) end)
+
+if not ok then
+    print("[MM2] FATAL: " .. tostring(err))
+    pcall(function()
+        local pg = game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not pg then return end
+        local sg = Instance.new("ScreenGui")
+        sg.Name = "MM2CandyFarm_ERR"; sg.ResetOnSpawn = false; sg.Parent = pg
+        local f = Instance.new("Frame")
+        f.Size = UDim2.new(0, 470, 0, 240)
+        f.Position = UDim2.new(0.5, -235, 0, 80)
+        f.BackgroundColor3 = Color3.fromRGB(70, 14, 14)
+        f.BorderSizePixel = 0; f.Parent = sg
+        local t = Instance.new("TextLabel")
+        t.Size = UDim2.new(1, -20, 1, -20); t.Position = UDim2.new(0, 10, 0, 10)
+        t.BackgroundTransparency = 1; t.TextColor3 = Color3.fromRGB(255, 210, 210)
+        t.Font = Enum.Font.Code; t.TextSize = 12; t.TextWrapped = true
+        t.TextXAlignment = Enum.TextXAlignment.Left
+        t.TextYAlignment = Enum.TextYAlignment.Top
+        t.Text = "[MM2] " .. VERSION .. " script error:\n\n" .. tostring(err)
+        t.Parent = f
+    end)
+end
+
+print("[MM2] === LOAD COMPLETE " .. VERSION .. " ===")
