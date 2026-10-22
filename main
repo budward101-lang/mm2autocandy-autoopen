@@ -1,12 +1,12 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  OPTIMIZED + slow balance check + explicit box-page navigation
+--  Fixed 20 studs/s + bottom-tab-row navigation (box = 4th icon)
 --=============================================================
 
 local CONFIG = {
     --========== MOVEMENT ==========
-    TweenSpeed    = 18,
+    TweenSpeed    = 20,
     SettleDelay   = 0.15,
     DwellTime     = 3.0,
     ReInteractAt  = 0.5,
@@ -39,15 +39,14 @@ local CONFIG = {
     BoxCost       = 600,
     RequireBalance = true,
     CycleCooldown = 3.0,
-
-    -- balance only checked every 5-10 minutes
     BalanceCheckMin = 300,
     BalanceCheckMax = 600,
 
     --========== BOX OPEN FLOW ==========
-    OpenMode      = "builtin",              -- "builtin" or "recorded"
-    EventKeywords = {"halloween", "event"}, -- opens the event page
-    BoxTabIndex   = 4,                      -- 4th button on the event page = box page
+    OpenMode      = "builtin",
+    EventKeywords = {"halloween", "event"},
+    BoxTabIndex   = 4,       -- 4th icon in the bottom bar = box
+    RowYThreshold = 0.70,    -- bottom 30% of screen = the tab bar
     UnboxKeywords = {"unbox", "open box", "hatch", "open"},
     BuyKeywords   = {"buy", "purchase", "confirm", "600"},
 
@@ -55,7 +54,6 @@ local CONFIG = {
     CloseKeywords = {"close", "exit", "back", "x"},
     CloseNever    = {"backpack", "bag", "shop", "store"},
 
-    -- optional recorded override
     Sequence      = {},
     SequenceDelay = 0.6,
     StepTimeout   = 3.0,
@@ -68,6 +66,8 @@ local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
 local UIS     = game:GetService("UserInputService")
 local LP      = Players.LocalPlayer
+
+local OWN_GUI_NAME = "MM2CandyFarm"
 
 local LOWFILTER = {}
 for i, f in ipairs(CONFIG.NameFilter) do LOWFILTER[i] = f:lower() end
@@ -420,6 +420,15 @@ end)
 
 --==================== UI HELPERS ====================
 
+local function isOwnGui(o)
+    local p = o
+    while p do
+        if p:IsA("ScreenGui") then return p.Name == OWN_GUI_NAME end
+        p = p.Parent
+    end
+    return false
+end
+
 local function chainVisible(o)
     local pg = pgui()
     local p = o
@@ -436,6 +445,7 @@ local function visibleButtons()
     for _, d in ipairs(pg:GetDescendants()) do
         if (d:IsA("TextButton") or d:IsA("ImageButton"))
             and d.Visible and d.AbsoluteSize.X > 0 and d.AbsoluteSize.Y > 0
+            and not isOwnGui(d)
             and chainVisible(d.Parent) then
             out[#out + 1] = d
         end
@@ -480,21 +490,8 @@ local function fireButton(b)
     if via(b.MouseButton1Click) then return true end
     if via(b.Activated) then return true end
     if firesignal and pcall(firesignal, b.MouseButton1Click) then return true end
+    if via(b.MouseButton1Down) then return true end
     return pcall(function() b:Activate() end)
-end
-
--- click the first visible button matching a keyword, in keyword priority order
-local function clickFirst(keywords)
-    local vis = visibleButtons()
-    for _, kw in ipairs(keywords) do
-        for _, b in ipairs(vis) do
-            if buttonLabel(b):lower():find(kw, 1, true) then
-                fireButton(b)
-                return b
-            end
-        end
-    end
-    return nil
 end
 
 local function resolvePath(path)
@@ -513,6 +510,59 @@ local function pathFromPg(o)
         n = n.Parent
     end
     return table.concat(parts, ".")
+end
+
+--==================== BOTTOM TAB ROW ====================
+
+local function viewportY()
+    local cam = workspace.CurrentCamera
+    return cam and cam.ViewportSize.Y or 1080
+end
+
+local function inBottomRow(b)
+    return b.AbsolutePosition.Y >= viewportY() * CONFIG.RowYThreshold
+end
+
+-- the tab bar only: bottom strip, ordered left to right
+local function bottomRow(list)
+    local out = {}
+    for _, b in ipairs(list) do
+        if inBottomRow(b) then out[#out + 1] = b end
+    end
+    table.sort(out, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
+    return out
+end
+
+local function findIn(list, keywords)
+    for _, kw in ipairs(keywords) do
+        for _, b in ipairs(list) do
+            if buttonLabel(b):lower():find(kw, 1, true) then return b end
+        end
+    end
+    return nil
+end
+
+-- an unbox/open button lives in the page body, NOT in the tab bar
+local function findUnbox()
+    local vis = visibleButtons()
+    for _, kw in ipairs(CONFIG.UnboxKeywords) do
+        for _, b in ipairs(vis) do
+            if not inBottomRow(b) and buttonLabel(b):lower():find(kw, 1, true) then
+                return b
+            end
+        end
+    end
+    return nil
+end
+
+local function waitForUnbox(timeout)
+    local t0 = os.clock()
+    repeat
+        local b = findUnbox()
+        if b then return b end
+        task.wait(0.15)
+    until os.clock() - t0 > timeout
+    return nil
 end
 
 --==================== CLOSE / BACK ====================
@@ -546,61 +596,81 @@ end
 
 --==================== BOX OPEN FLOW ====================
 
--- buttons that appeared after a click, ordered top-to-bottom / left-to-right
-local function newButtonsSince(prevSet)
-    local out = {}
+local function clickFirst(keywords)
+    local b = findIn(visibleButtons(), keywords)
+    if b then fireButton(b) end
+    return b
+end
+
+local function reachBoxPage(beforeSet)
+    if findUnbox() then return findUnbox() end
+
+    -- candidates = new buttons in the bottom bar; fall back to the whole bar
+    local fresh = {}
     for _, b in ipairs(visibleButtons()) do
-        if not prevSet[b] then out[#out + 1] = b end
+        if not beforeSet[b] then fresh[#fresh + 1] = b end
     end
-    table.sort(out, function(a, b)
-        local pa, pb = a.AbsolutePosition, b.AbsolutePosition
-        if math.abs(pa.Y - pb.Y) > 24 then return pa.Y < pb.Y end
-        return pa.X < pb.X
-    end)
-    return out
+
+    local row = bottomRow(fresh)
+    if #row < CONFIG.BoxTabIndex then
+        row = bottomRow(visibleButtons())
+    end
+
+    print("[MM2] bottom tab row (" .. #row .. "):")
+    for i, b in ipairs(row) do
+        print(string.format("  %d) x=%4d  %-24s | %s",
+            i, math.floor(b.AbsolutePosition.X), b.Name, buttonLabel(b)))
+    end
+
+    -- configured index first, then the rest of the row
+    local order = {}
+    if row[CONFIG.BoxTabIndex] then order[#order + 1] = row[CONFIG.BoxTabIndex] end
+    for i, b in ipairs(row) do
+        if i ~= CONFIG.BoxTabIndex then order[#order + 1] = b end
+    end
+
+    for _, cand in ipairs(order) do
+        if not cand.Parent then continue end
+        fireButton(cand)
+        local unbox = waitForUnbox(1.6)
+        if unbox then
+            STATE.log = "box tab #" .. CONFIG.BoxTabIndex .. ": " .. cand.Name
+            print("[MM2] box page reached via: " .. cand.Name)
+            return unbox
+        end
+    end
+    return nil
 end
 
 local function runBoxCycle()
     if CONFIG.CloseBeforeCycle then closeAll() end
     task.wait(jit(0.3))
 
-    -- 1) open the event page
     local before = buttonSet()
     local ev = clickFirst(CONFIG.EventKeywords)
     if not ev then STATE.log = "no event button"; return false end
-    STATE.log = "event page: " .. ev.Name
-    task.wait(jit(1.0))
+    STATE.log = "event: " .. ev.Name
+    task.wait(jit(1.1))
 
-    -- 2) the Nth button on that page is the box page tab
-    local fresh = newButtonsSince(before)
-    local tab = fresh[CONFIG.BoxTabIndex]
-    if tab then
-        fireButton(tab)
-        STATE.log = "box tab #" .. CONFIG.BoxTabIndex .. ": " .. tab.Name
-        task.wait(jit(0.9))
-    else
-        STATE.log = "no box tab #" .. CONFIG.BoxTabIndex .. " (" .. #fresh .. " found)"
+    local unbox = reachBoxPage(before)
+    if not unbox then
+        STATE.log = "box page not reached"
+        return false
     end
 
-    -- 3) unbox
-    local unbox = clickFirst(CONFIG.UnboxKeywords)
-    if unbox then
-        STATE.log = "unbox: " .. unbox.Name
-        task.wait(jit(1.0))
-    end
+    fireButton(unbox)
+    STATE.log = "unbox: " .. unbox.Name
+    task.wait(jit(1.3))
 
-    -- 4) buy / confirm
     local buy = clickFirst(CONFIG.BuyKeywords)
     if buy then
         STATE.log = "buy: " .. buy.Name
         task.wait(jit(1.2))
-        STATE.boxes += 1
-        if STATE.candy then
-            STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost)
-        end
-        return true
     end
-    return false
+
+    STATE.boxes += 1
+    if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
+    return true
 end
 
 --==================== RECORDED SEQUENCE (optional) ====================
@@ -654,7 +724,6 @@ task.spawn(function()
         if not STATE.open then continue end
         if os.clock() - lastCycle < jit(CONFIG.CycleCooldown) then continue end
 
-        -- hard gate: only open once the (slow-polled) balance covers the box
         if CONFIG.RequireBalance and not STATE.force then
             if not STATE.checkedOnce then continue end
             local c = STATE.candy
@@ -685,11 +754,11 @@ local function new(class, props, parent)
 end
 
 local gui = new("ScreenGui", {
-    Name = "MM2CandyFarm", ResetOnSpawn = false, IgnoreGuiInset = true,
+    Name = OWN_GUI_NAME, ResetOnSpawn = false, IgnoreGuiInset = true,
 }, LP:WaitForChild("PlayerGui"))
 
 local main = new("Frame", {
-    Size = UDim2.new(0, 305, 0, 660), Position = UDim2.new(0, 20, 0, 50),
+    Size = UDim2.new(0, 305, 0, 610), Position = UDim2.new(0, 20, 0, 55),
     BackgroundColor3 = Color3.fromRGB(20, 16, 28), BorderSizePixel = 0, Active = true,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
@@ -746,14 +815,12 @@ makeToggle(4, "Anti-kick (humanize)",
     function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
 
 mkBtn(5, "Check balance now", Color3.fromRGB(40, 60, 45))
-    .MouseButton1Click:Connect(function()
-        doBalanceCheck()
-    end)
+    .MouseButton1Click:Connect(function() doBalanceCheck() end)
 
-local TABS = {2, 3, 4, 5, 6, 7, 8}
+local TABS = {1, 2, 3, 4, 5, 6, 7, 8}
 local tabBtn = mkBtn(6, "", Color3.fromRGB(50, 42, 30))
 local function refreshTab()
-    tabBtn.Text = string.format("Box tab on event page: #%d  (click to change)", CONFIG.BoxTabIndex)
+    tabBtn.Text = string.format("Bottom tab #%d  (click to change)", CONFIG.BoxTabIndex)
 end
 tabBtn.MouseButton1Click:Connect(function()
     local idx = 1
@@ -763,7 +830,7 @@ tabBtn.MouseButton1Click:Connect(function()
     idx = idx % #TABS + 1
     CONFIG.BoxTabIndex = TABS[idx]
     refreshTab()
-    STATE.log = "box tab #" .. CONFIG.BoxTabIndex
+    STATE.log = "bottom tab #" .. CONFIG.BoxTabIndex
 end)
 refreshTab()
 
@@ -796,23 +863,6 @@ dwellBtn.MouseButton1Click:Connect(function()
     STATE.log = "dwell " .. CONFIG.DwellTime .. "s"
 end)
 refreshDwell()
-
-local SPEEDS = {6, 10, 14, 18, 24, 30, 40, 55}
-local speedBtn = mkBtn(9, "", Color3.fromRGB(45, 40, 55))
-local function refreshSpeed()
-    speedBtn.Text = string.format("Glide speed: %d studs/s  (click to change)", CONFIG.TweenSpeed)
-end
-speedBtn.MouseButton1Click:Connect(function()
-    local idx = 1
-    for i, v in ipairs(SPEEDS) do
-        if v == CONFIG.TweenSpeed then idx = i break end
-    end
-    idx = idx % #SPEEDS + 1
-    CONFIG.TweenSpeed = SPEEDS[idx]
-    refreshSpeed()
-    STATE.log = "glide speed " .. CONFIG.TweenSpeed
-end)
-refreshSpeed()
 
 --==================== STEP RECORDER ====================
 
@@ -869,10 +919,10 @@ local function addStep()
     end)
 end
 
-mkBtn(10, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+mkBtn(9, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
     .MouseButton1Click:Connect(addStep)
 
-mkBtn(11, "Remove last step", Color3.fromRGB(55, 45, 35))
+mkBtn(10, "Remove last step", Color3.fromRGB(55, 45, 35))
     .MouseButton1Click:Connect(function()
         if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
         local removed = table.remove(CONFIG.Sequence)
