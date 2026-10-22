@@ -1,7 +1,8 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  Open flow: click EVENT tab -> click 4th event icon (chest) -> read/unbox
+--  Open flow: EVENT tab -> Nth preview tile -> unbox
+--  Balance is read from the event/box page (account wallet).
 --=============================================================
 
 local CONFIG = {
@@ -43,14 +44,14 @@ local CONFIG = {
     --========== WALLET BALANCE ==========
     WalletKeywords  = {"wallet", "candy", "sweet", "balance", "currency",
                        "total", "amount", "owned", "count"},
-    BalanceCheckMin = 6,
-    BalanceCheckMax = 12,
+    BalanceCheckMin = 10,
+    BalanceCheckMax = 10,
 
     --========== BOX OPEN FLOW ==========
     OpenMode      = "builtin",
-    EventTabKeywords  = {"event"},   -- bottom tab that opens the event page
-    EventPreviewIndex = 4,           -- 4th icon on the event page = the chest
-    UnboxKeywords = {"unbox", "open box", "hatch", "open"},
+    EventTabKeywords  = {"event"},   -- bottom tab that opens the event preview
+    EventPreviewIndex = 4,           -- 4th tile in the event preview = the box
+    UnboxKeywords = {"unbox", "open box", "hatch", "open", "600"},
     BuyKeywords   = {"buy", "purchase", "confirm", "600"},
 
     CloseBeforeCycle = true,
@@ -414,6 +415,12 @@ local function sigOf(list)
     return table.concat(parts, ",")
 end
 
+local function buttonSet()
+    local s = {}
+    for _, b in ipairs(visibleButtons()) do s[b] = true end
+    return s
+end
+
 local function fireButton(b)
     if not b or not b.Parent then return false end
     pcall(function() b.Active = true end)
@@ -455,7 +462,7 @@ local function pathFromPg(o)
     return table.concat(parts, ".")
 end
 
---==================== TAB / ICON FINDING ====================
+--==================== BOTTOM TAB ROW ====================
 
 local function viewportY()
     local cam = workspace.CurrentCamera
@@ -463,7 +470,16 @@ local function viewportY()
 end
 
 local function inBottomRow(b)
-    return b.AbsolutePosition.Y >= viewportY() * 0.80
+    return b.AbsolutePosition.Y >= viewportY() * 0.70
+end
+
+local function bottomRow(list)
+    local out = {}
+    for _, b in ipairs(list) do
+        if inBottomRow(b) then out[#out + 1] = b end
+    end
+    table.sort(out, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
+    return out
 end
 
 local function findIn(list, keywords)
@@ -473,58 +489,6 @@ local function findIn(list, keywords)
         end
     end
     return nil
-end
-
--- the EVENT tab: prefer a bottom-bar button whose label says "event"
-local function findEventTab()
-    local vis = visibleButtons()
-    for _, kw in ipairs(CONFIG.EventTabKeywords) do
-        for _, b in ipairs(vis) do
-            if inBottomRow(b) and buttonLabel(b):lower():find(kw, 1, true) then return b end
-        end
-    end
-    return findIn(vis, CONFIG.EventTabKeywords)
-end
-
--- the row of event icons (5+ equal buttons in a row, lower half, above the tab strip)
-local function eventIcons()
-    local byParent = {}
-    for _, b in ipairs(visibleButtons()) do
-        local p = b.Parent
-        if p then
-            local g = byParent[p]
-            if not g then g = {}; byParent[p] = g end
-            g[#g + 1] = b
-        end
-    end
-
-    local vh = viewportY()
-    local best, bestN = nil, 0
-    for _, list in pairs(byParent) do
-        if #list >= CONFIG.EventPreviewIndex then
-            local row = {}
-            local refY, refH, refW = list[1].AbsolutePosition.Y,
-                list[1].AbsoluteSize.Y, list[1].AbsoluteSize.X
-            for _, b in ipairs(list) do
-                if math.abs(b.AbsolutePosition.Y - refY) < 24
-                    and math.abs(b.AbsoluteSize.Y - refH) < 24
-                    and math.abs(b.AbsoluteSize.X - refW) < 24 then
-                    row[#row + 1] = b
-                end
-            end
-            if #row >= CONFIG.EventPreviewIndex then
-                local avgY = 0
-                for _, b in ipairs(row) do avgY += b.AbsolutePosition.Y end
-                avgY /= #row
-                if avgY > vh * 0.40 and avgY < vh * 0.92 and #row > bestN then
-                    best, bestN = row, #row
-                end
-            end
-        end
-    end
-    if not best then return {} end
-    table.sort(best, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
-    return best
 end
 
 -- an unbox/open button lives in the page body, NOT in the tab bar
@@ -564,16 +528,19 @@ local function isCloseButton(b)
     return false
 end
 
--- single, gentle close pass
 local function closeAll()
-    for _, b in ipairs(visibleButtons()) do
-        if isCloseButton(b) then
-            fireButton(b)
-            task.wait(jit(0.5))
-            return true
+    for _ = 1, 3 do
+        local vis = visibleButtons()
+        local before = sigOf(vis)
+        local found
+        for _, b in ipairs(vis) do
+            if isCloseButton(b) then found = b break end
         end
+        if not found then return end
+        fireButton(found)
+        task.wait(jit(0.5))
+        if sigOf(visibleButtons()) == before then return end
     end
-    return false
 end
 
 --==================== BOX OPEN FLOW ====================
@@ -584,24 +551,73 @@ local function clickFirst(keywords)
     return b
 end
 
--- the whole balance/unbox path: EVENT tab -> 4th event icon (chest)
-local function openEventChest()
-    local ev = findEventTab()
-    if not ev then return nil, "no EVENT button" end
-    fireButton(ev)
-    STATE.log = "event tab: " .. ev.Name
-    task.wait(jit(1.0))
-
-    local icons = eventIcons()
-    if #icons < CONFIG.EventPreviewIndex then
-        return nil, "event icons not found (" .. #icons .. ")"
+-- find the horizontal row of event-preview tiles (5+ equal tiles in a row, lower half of screen)
+local function findPreviewTiles()
+    local byParent = {}
+    for _, b in ipairs(visibleButtons()) do
+        local p = b.Parent
+        if p then
+            local g = byParent[p]
+            if not g then g = {}; byParent[p] = g end
+            g[#g + 1] = b
+        end
     end
 
-    local icon = icons[CONFIG.EventPreviewIndex]
-    fireButton(icon)
-    STATE.log = "chest icon #" .. CONFIG.EventPreviewIndex .. ": " .. icon.Name
-    task.wait(jit(1.0))
-    return icon
+    local vh = viewportY()
+    local best, bestN = nil, 0
+    for _, list in pairs(byParent) do
+        if #list >= 5 then
+            local row = {}
+            local refY, refH, refW = list[1].AbsolutePosition.Y,
+                list[1].AbsoluteSize.Y, list[1].AbsoluteSize.X
+            for _, b in ipairs(list) do
+                if math.abs(b.AbsolutePosition.Y - refY) < 24
+                    and math.abs(b.AbsoluteSize.Y - refH) < 24
+                    and math.abs(b.AbsoluteSize.X - refW) < 24 then
+                    row[#row + 1] = b
+                end
+            end
+            if #row >= 5 then
+                local avgY = 0
+                for _, b in ipairs(row) do avgY += b.AbsolutePosition.Y end
+                avgY /= #row
+                if avgY > vh * 0.5 and #row > bestN then
+                    best, bestN = row, #row
+                end
+            end
+        end
+    end
+    if not best then return {} end
+    table.sort(best, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
+    return best
+end
+
+-- open the EVENT tab -> click the Nth preview tile -> return the unbox button if one appears
+local function reachBoxPage()
+    -- 1) open the event preview
+    local tiles = findPreviewTiles()
+    if #tiles < CONFIG.EventPreviewIndex then
+        local ev = findIn(visibleButtons(), CONFIG.EventTabKeywords)
+        if not ev then return nil, "no EVENT tab" end
+        fireButton(ev)
+        STATE.log = "event tab: " .. ev.Name
+        local t0 = os.clock()
+        repeat
+            task.wait(0.15)
+            tiles = findPreviewTiles()
+        until #tiles >= CONFIG.EventPreviewIndex or os.clock() - t0 > 3
+    end
+
+    if #tiles < CONFIG.EventPreviewIndex then
+        return nil, "event preview not found (" .. #tiles .. " tiles)"
+    end
+
+    -- 2) click the configured tile (the box)
+    local tile = tiles[CONFIG.EventPreviewIndex]
+    fireButton(tile)
+    STATE.log = "preview tile #" .. CONFIG.EventPreviewIndex .. ": " .. tile.Name
+
+    return waitForUnbox(2.0) or true
 end
 
 local function runBoxCycle()
@@ -609,8 +625,13 @@ local function runBoxCycle()
     if CONFIG.CloseBeforeCycle then closeAll() end
     task.wait(jit(0.3))
 
-    local icon, err = openEventChest()
-    if not icon then STATE.log = err; uiLock = false; return false end
+    local unbox, err = reachBoxPage()
+    if not unbox then
+        STATE.log = err or "box page not reached"
+        uiLock = false
+        return false
+    end
+    task.wait(jit(1.0))
 
     -- the account total is on this page: grab it while it's open
     candySrc = findCandySource()
@@ -621,8 +642,7 @@ local function runBoxCycle()
         STATE.lastCheck = os.clock()
     end
 
-    local unbox = waitForUnbox(2.0)
-    if unbox then
+    if unbox ~= true then
         fireButton(unbox)
         STATE.log = "unbox: " .. unbox.Name
         task.wait(jit(1.3))
@@ -712,7 +732,7 @@ task.spawn(function()
 end)
 print("[MM2] open loop ok")
 
---==================== WALLET BALANCE (read off the event/chest page) ====================
+--==================== WALLET BALANCE (read off the event/box page) ====================
 
 local function walletPath(o)
     local parts, n, pg, depth = {}, o, pgui(), 0
@@ -787,13 +807,15 @@ findCandySource = function()
     return best
 end
 
--- exactly: click EVENT -> click 4th event icon (chest) -> read the total
+-- opens the event preview (view only, no cost), reads the total, closes again
 probeBalance = function()
     if uiLock then return end
     uiLock = true
 
-    openEventChest()
-    task.wait(jit(0.6))
+    local opened = false
+    if not findUnbox() then
+        opened = reachBoxPage() ~= nil
+    end
 
     candySrc = findCandySource()
     local v = readCandy()
@@ -803,6 +825,7 @@ probeBalance = function()
     STATE.lastCheck = os.clock()
     STATE.log = "wallet: " .. (STATE.candy and tostring(STATE.candy) or "?") .. "/" .. CONFIG.BoxCost
 
+    if opened and CONFIG.CloseBeforeCycle then closeAll() end
     uiLock = false
 end
 
@@ -844,4 +867,256 @@ local header = new("TextLabel", {
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, header)
 
 local body = new("Frame", {
-    Size = UDim2.new(1, -20, 1, -
+    Size = UDim2.new(1, -20, 1, -42), Position = UDim2.new(0, 10, 0, 38),
+    BackgroundTransparency = 1,
+}, main)
+new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+
+local stats = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 104), LayoutOrder = 1,
+    BackgroundColor3 = Color3.fromRGB(28, 22, 36), BorderSizePixel = 0,
+    TextColor3 = Color3.fromRGB(200, 200, 210), Font = Enum.Font.Code,
+    TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Text = "",
+}, body)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, stats)
+new("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 8) }, stats)
+
+local function mkBtn(order, text, color, h)
+    local b = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, h or 26), LayoutOrder = order,
+        BackgroundColor3 = color, Text = text,
+        TextColor3 = Color3.fromRGB(230, 230, 235),
+        Font = Enum.Font.GothamMedium, TextSize = 12, BorderSizePixel = 0,
+    }, body)
+    new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+    return b
+end
+
+local function makeToggle(order, text, getter, setter)
+    local b = mkBtn(order, "", Color3.fromRGB(35, 28, 45))
+    local function refresh()
+        b.Text = text .. ": " .. (getter() and "ON" or "OFF")
+        b.TextColor3 = getter() and Color3.fromRGB(120, 255, 140) or Color3.fromRGB(255, 110, 110)
+    end
+    b.MouseButton1Click:Connect(function() setter(not getter()); refresh() end)
+    refresh()
+end
+
+makeToggle(2, "Candy Autofarm", function() return STATE.farm end, function(v) STATE.farm = v end)
+makeToggle(3, "Auto Open Box", function() return STATE.open end, function(v) STATE.open = v end)
+makeToggle(4, "Anti-kick (humanize)",
+    function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
+
+mkBtn(5, "Check balance now", Color3.fromRGB(40, 60, 45))
+    .MouseButton1Click:Connect(function() probeBalance() end)
+
+-- pin the wallet element by clicking it (fallback if auto-detect grabs the wrong thing)
+local pinning = false
+local function pickWallet()
+    if pinning then return end
+    pinning = true
+    local conn
+    local function cleanup() pinning = false; if conn then conn:Disconnect() end end
+    task.delay(8, function() if pinning then cleanup(); STATE.log = "wallet pick timed out" end end)
+
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not pinning or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        cleanup()
+        task.wait(0.05)
+        local pg = pgui()
+        local m = UIS:GetMouseLocation()
+        local found
+        for _, y in ipairs({m.Y, m.Y - 36}) do
+            for _, o in ipairs(pg:GetGuiObjectsAtPosition(m.X, y)) do
+                if (o:IsA("TextLabel") or o:IsA("TextButton"))
+                    and o.Visible and chainVisible(o.Parent)
+                    and #(o.Text:gsub("[^%d]", "")) > 0 then
+                    found = o; break
+                end
+            end
+            if found then break end
+        end
+        if not found then STATE.log = "no number label there"; return end
+        candySrc = found
+        STATE.candy = readCandy()
+        STATE.checkedOnce = true
+        STATE.walletName = found.Name
+        STATE.lastCheck = os.clock()
+        STATE.log = "wallet pinned: " .. found.Name
+    end)
+end
+
+mkBtn(6, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
+    .MouseButton1Click:Connect(pickWallet)
+
+local PREV = {1, 2, 3, 4, 5, 6, 7, 8}
+local tabBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
+local function refreshTab()
+    tabBtn.Text = string.format("Event preview tile #%d  (click to change)", CONFIG.EventPreviewIndex)
+end
+tabBtn.MouseButton1Click:Connect(function()
+    local idx = 1
+    for i, v in ipairs(PREV) do
+        if v == CONFIG.EventPreviewIndex then idx = i break end
+    end
+    idx = idx % #PREV + 1
+    CONFIG.EventPreviewIndex = PREV[idx]
+    refreshTab()
+    STATE.log = "preview tile #" .. CONFIG.EventPreviewIndex
+end)
+refreshTab()
+
+local modeBtn = mkBtn(8, "", Color3.fromRGB(45, 40, 55))
+local function refreshMode()
+    modeBtn.Text = "Open flow: " .. (CONFIG.OpenMode == "builtin" and "built-in" or "recorded")
+        .. "  (click to change)"
+end
+modeBtn.MouseButton1Click:Connect(function()
+    CONFIG.OpenMode = CONFIG.OpenMode == "builtin" and "recorded" or "builtin"
+    refreshMode()
+    STATE.log = "open flow: " .. CONFIG.OpenMode
+end)
+refreshMode()
+
+local DWELLS = {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0}
+local dwellBtn = mkBtn(9, "", Color3.fromRGB(50, 42, 30))
+local function refreshDwell()
+    dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
+end
+dwellBtn.MouseButton1Click:Connect(function()
+    local idx = 1
+    for i, v in ipairs(DWELLS) do
+        if math.abs(v - CONFIG.DwellTime) < 0.01 then idx = i break end
+    end
+    idx = idx % #DWELLS + 1
+    CONFIG.DwellTime = DWELLS[idx]
+    CONFIG.ReInteractAt = math.min(CONFIG.DwellTime * 0.3, 0.6)
+    refreshDwell()
+    STATE.log = "dwell " .. CONFIG.DwellTime .. "s"
+end)
+refreshDwell()
+
+--==================== STEP RECORDER ====================
+
+local picking = false
+
+local function pickTopButton()
+    local pg = pgui()
+    local m = UIS:GetMouseLocation()
+    local fallback
+    for _, y in ipairs({m.Y, m.Y - 36}) do
+        for _, o in ipairs(pg:GetGuiObjectsAtPosition(m.X, y)) do
+            if o:IsA("GuiButton") and o.Visible and chainVisible(o.Parent) then
+                if not fallback then fallback = o end
+                if getconnections and #getconnections(o.MouseButton1Click) > 0 then
+                    return o
+                end
+            end
+        end
+    end
+    return fallback
+end
+
+local function printSteps()
+    print("===== RECORDED STEPS (" .. #CONFIG.Sequence .. ") =====")
+    for i, p in ipairs(CONFIG.Sequence) do print("  " .. i .. ") " .. p) end
+    print("    Sequence = {")
+    for _, p in ipairs(CONFIG.Sequence) do print('        "' .. p .. '",') end
+    print("    },")
+end
+
+local function addStep()
+    if picking then return end
+    picking = true
+    local conn
+    local function cleanup()
+        picking = false
+        if conn then conn:Disconnect() end
+    end
+    task.delay(8, function()
+        if picking then cleanup(); STATE.log = "pick timed out" end
+    end)
+
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not picking or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        cleanup()
+        task.wait(0.05)
+        local b = pickTopButton()
+        if not b then STATE.log = "no button there"; return end
+        CONFIG.Sequence[#CONFIG.Sequence + 1] = pathFromPg(b)
+        STATE.log = "step " .. #CONFIG.Sequence .. ": " .. b.Name
+        printSteps()
+    end)
+end
+
+mkBtn(10, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+    .MouseButton1Click:Connect(addStep)
+
+mkBtn(11, "Remove last step", Color3.fromRGB(55, 45, 35))
+    .MouseButton1Click:Connect(function()
+        if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
+        local removed = table.remove(CONFIG.Sequence)
+        STATE.log = "removed: " .. removed:sub(-22)
+        printSteps()
+    end)
+
+do
+    local dragging, startPos, startInput
+    header.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; startInput = i.Position; startPos = main.Position
+        end
+    end)
+    header.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+            or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - startInput
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+task.spawn(function()
+    local lastText = ""
+    while task.wait(0.5) do
+        local run = os.clock() - STATE.started
+        local since = STATE.lastCheck > 0
+            and string.format("%dm%02ds", math.floor((os.clock() - STATE.lastCheck) / 60),
+                math.floor((os.clock() - STATE.lastCheck) % 60))
+            or "never"
+        local txt = string.format(
+            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   tile #%d\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
+            STATE.collected, STATE.skipped, STATE.hops,
+            STATE.hops / math.max(run, 0.001),
+            math.floor(run / 60), math.floor(run % 60),
+            STATE.boxes, CONFIG.EventPreviewIndex,
+            STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost, since,
+            (STATE.walletName or "?"):sub(1, 28),
+            (STATE.log or ""):sub(1, 30))
+        if txt ~= lastText then
+            lastText = txt
+            stats.Text = txt
+        end
+    end
+end)
+
+UIS.InputBegan:Connect(function(i, gp)
+    if gp then return end
+    if i.KeyCode == CONFIG.Keybinds.UI then main.Visible = not main.Visible
+    elseif i.KeyCode == CONFIG.Keybinds.Farm then STATE.farm = not STATE.farm
+    elseif i.KeyCode == CONFIG.Keybinds.Open then STATE.open = not STATE.open
+    elseif i.KeyCode == CONFIG.Keybinds.Force then STATE.force = not STATE.force end
+end)
+
+print("[MM2 Candy Farm] loaded — RightShift UI | F1 farm | F2 open | F3 force")
