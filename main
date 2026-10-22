@@ -1,383 +1,58 @@
 --=============================================================
---  MM2 • HALLOWEEN 2026 — CANDY AUTOFARM + AUTO OPEN BOX
---  v5.2: buy gate - only Unbox/Confirm when live balance >= BoxCost
---  Nav = SHOP (image 2) -> Halloween Box tile (image 3) -> Unbox
---  Bottom tab row (image 1) = fallback only
+--  MM2 • HALLOWEEN 2026 — CANDY FARM + AUTO OPEN BOX
+--  v9: sticky box-page state (no loopback), 3-pass box-tile finder,
+--  tab-row clicking OFF by default, tight close matching.
+--  RightShift UI | F1 farm | F2 open | F3 force
 --=============================================================
 
-local VERSION = "v5.2"
-print("[MM2] " .. VERSION .. " starting")
-print(string.format("[MM2] executor: getconnections=%s firesignal=%s fireproximityprompt=%s fireclickdetector=%s",
-    tostring(getconnections ~= nil), tostring(firesignal ~= nil),
-    tostring(fireproximityprompt ~= nil), tostring(fireclickdetector ~= nil)))
-
-local function BOOT()
-
-local stage = 0
-local function mark(n) stage += 1; print(string.format("[MM2] step %02d ok - %s", stage, n)) end
-
-local CONFIG = {
-    TweenSpeed    = 20,
-    SettleDelay   = 0.15,
-    DwellTime     = 3.0,
-    ReInteractAt  = 0.5,
-    RetryDwell    = 2.0,
-    RetryOnMiss   = true,
-    MaxAttempts   = 3,
-    ClaimCooldown = 5.0,
-    HopInterval   = 0.25,
-    RescanTime    = 3.0,
-    ValidateTime  = 0.25,
-    PruneTime     = 0.5,
-    TickRate      = 0.1,
-    NearestFirst  = true,
-
-    Humanize      = true,
-    JitterPct     = 0.3,
-    RestAfterMin  = 15,
-    RestAfterMax  = 28,
-    RestMin       = 1.5,
-    RestMax       = 4.5,
-
-    NameFilter    = {"candy", "coin"},
-    MaxSize       = 8,
-
-    AutoFarm      = true,
-    AutoOpen      = true,
-    BoxCost       = 600,
-    RequireBalance = true,         -- v5.2: the buy gate (needs balance >= BoxCost)
-    CycleCooldown = 3.0,
-
-    WalletKeywords  = {"wallet", "candy", "sweet", "balance", "currency",
-                       "total", "amount", "owned", "count"},
-    BalanceCheckMin = 6,
-    BalanceCheckMax = 12,
-
-    OpenMode      = "builtin",
-    UseShopButton = true,
-    TabFallback   = true,
-    ShopKeywords  = {"shop", "store", "buy"},
-    BoxTileKeywords = {"halloween box", "halloween", "mystery box", "mystery", "box"},
-    EventKeywords = {"halloween", "event"},
-    BoxTabIndex   = 4,
-    RowYThreshold = 0.70,
-    UnboxKeywords = {"unbox", "open box", "hatch", "open"},
-    BuyKeywords   = {"buy", "purchase", "confirm", "600"},
-    RewardKeywords = {"ok", "claim", "collect", "continue", "next",
-                      "great", "nice", "yes", "awesome"},
-
-    CloseBeforeCycle = true,
-    CloseKeywords = {"close", "exit", "back", "x"},
-    CloseNever    = {"backpack", "bag", "shop", "store"},
-
-    Sequence      = {},
-    SequenceDelay = 0.6,
-    StepTimeout   = 3.0,
-
-    Keybinds = { UI = Enum.KeyCode.RightShift, Farm = Enum.KeyCode.F1,
-                 Open = Enum.KeyCode.F2, Force = Enum.KeyCode.F3 },
-}
-mark("config")
+print("[MM2] v9 booting")
 
 local Players = game:GetService("Players")
-local RS      = game:GetService("ReplicatedStorage")
 local UIS     = game:GetService("UserInputService")
 local LP      = Players.LocalPlayer
+local PG      = LP:WaitForChild("PlayerGui")
+print("[MM2] services ok")
 
-local OWN_GUI_NAME = "MM2CandyFarm"
-
-local LOWFILTER = {}
-for i, f in ipairs(CONFIG.NameFilter) do LOWFILTER[i] = f:lower() end
-
-local function jit(t)
-    if not CONFIG.Humanize then return t end
-    return t * (1 + (math.random() * 2 - 1) * CONFIG.JitterPct)
-end
-
-local STATE = {
-    farm = CONFIG.AutoFarm, open = CONFIG.AutoOpen, force = false,
-    collected = 0, hops = 0, boxes = 0, skipped = 0,
-    started = os.clock(), candy = nil, checkedOnce = false,
-    lastCheck = 0, log = "starting...", walletName = "?",
-    onBoxPage = false, waiting = false,
+local CFG = {
+    Speed = 20, Dwell = 3.0, Retry = 2.0, MaxTry = 3, Tick = 0.1, Rescan = 3.0,
+    Cost = 600, Gate = true, BuyIfUnknown = false,
+    TabFallback = false,            -- v9: off. Radio/Modes/Event stay untouched.
+    ShopBand = 0.15, ShopMin = 60, ShopIndex = 2,
+    ShopKW  = {"shop", "store"},
+    TileKW  = {"halloween", "mystery", "box", "26"},
+    UnboxKW = {"unbox", "open box", "hatch", "open"},
+    BuyKW   = {"buy", "purchase", "confirm", "600"},
+    CloseKW = {"close", "exit", "back", "x"},
+    CloseNo = {"backpack", "bag", "shop", "store", "inventory", "spectate"},
+    PopupKW = {"ok", "claim", "collect", "continue", "next", "nice", "great"},
+    BottomY = 0.70,
 }
-local attempts, claimed = {}, {}
+local S = {
+    farm = true, open = true, force = false,
+    onBox = false, waiting = false, candy = nil, miss = 0,
+    boxes = 0, picked = 0, log = "boot", walletName = "?",
+    shopName = "NONE", shopHow = "-", tileName = "-", tileHow = "-", busy = false,
+}
+print("[MM2] config ok")
 
-local candySrc, readCandy, findCandySource, probeBalance
-local uiLock = false
+local OWN = "MM2FarmV9"
 
-local function pgui() return LP:FindFirstChildOfClass("PlayerGui") end
-
-local function getChar()
-    local c = LP.Character
-    if not c or not c.Parent then return nil end
-    local h = c:FindFirstChildOfClass("Humanoid")
-    local r = c:FindFirstChild("HumanoidRootPart")
-    if not h or not r or h.Health <= 0 then return nil end
-    return c, h, r
+local function pgui()
+    local p = LP:FindFirstChildOfClass("PlayerGui")
+    if p then return p end
+    return PG
 end
 
-local function isCandy(p)
-    if not p:IsA("BasePart") then return false end
-    local n = p.Name:lower()
-    local ok = false
-    for i = 1, #LOWFILTER do
-        if n:find(LOWFILTER[i], 1, true) then ok = true break end
-    end
-    if not ok then return false end
-    local s = p.Size
-    if math.max(s.X, s.Y, s.Z) > CONFIG.MaxSize then return false end
-    local m = p:FindFirstAncestorOfClass("Model")
-    if m and Players:GetPlayerFromCharacter(m) then return false end
-    return true
-end
-
-local function stillThere(p)
-    if not p or not p.Parent then return false end
-    if p.Transparency >= 1 then return false end
-    return p:IsDescendantOf(workspace)
-end
-
-local function promptDead(p)
-    for _, d in ipairs(p:GetChildren()) do
-        if d:IsA("ProximityPrompt") and d.Enabled == false then return true end
-    end
-    return false
-end
-
-local function prune(now)
-    for p, t in pairs(claimed) do
-        if not p.Parent or t < now then claimed[p] = nil end
-    end
-    for p in pairs(attempts) do
-        if not p.Parent then attempts[p] = nil end
-    end
-end
-
-local candyList, candySet = {}, {}
-
-local function rebuildCandyList()
-    local out, set = {}, {}
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if isCandy(d) then out[#out + 1] = d; set[d] = true end
-    end
-    candyList, candySet = out, set
-end
-
-workspace.DescendantAdded:Connect(function(d)
-    if not STATE.farm or candySet[d] then return end
-    if d:IsA("BasePart") and isCandy(d) then
-        candySet[d] = true
-        candyList[#candyList + 1] = d
-    end
-end)
-
-workspace.DescendantRemoving:Connect(function(d)
-    if candySet[d] then candySet[d] = nil end
-end)
-
-local function validTarget(p, now)
-    if not stillThere(p) then return false end
-    local c = claimed[p]
-    if c and now < c then return false end
-    if (attempts[p] or 0) >= CONFIG.MaxAttempts then return false end
-    return true
-end
-
-local function applyNoclip(char)
-    if not char then return end
-    for _, p in ipairs(char:GetDescendants()) do
-        if p:IsA("BasePart") then p.CanCollide = false end
-    end
-end
-
-local function clearNoclip(char)
-    if not char then return end
-    for _, p in ipairs(char:GetDescendants()) do
-        if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
-            p.CanCollide = true
-        end
-    end
-end
-
-local function interact(part)
-    for _, d in ipairs(part:GetDescendants()) do
-        if d:IsA("ProximityPrompt") and d.Enabled ~= false then
-            if fireproximityprompt then pcall(fireproximityprompt, d, d.HoldDuration) end
-        elseif d:IsA("ClickDetector") then
-            if fireclickdetector then pcall(fireclickdetector, d) end
-        end
-    end
-end
-
-local function forceTouch(target, char)
-    if not getconnections or not target.Parent then return end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    local body = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
-    if not hrp then return end
-    pcall(function()
-        for _, c in ipairs(getconnections(target.Touched)) do
-            if c.Function then
-                pcall(c.Function, hrp)
-                if body then pcall(c.Function, body) end
-            end
-        end
-    end)
-end
-
-local function glideTo(pos, char, hrp)
-    if not char.Parent or not hrp.Parent then return end
-    local startPos = hrp.Position
-    local delta = pos - startPos
-    local dist = delta.Magnitude
-    if dist < 0.1 then return end
-
-    local flat = Vector3.new(delta.X, 0, delta.Z)
-    local rot = flat.Magnitude > 1
-        and CFrame.lookAt(Vector3.zero, flat.Unit)
-        or (hrp.CFrame - hrp.CFrame.Position)
-
-    local duration = dist / math.max(CONFIG.TweenSpeed, 1)
-    local t0 = os.clock()
-    while true do
-        if not char.Parent or not hrp.Parent then return end
-        local a = (os.clock() - t0) / duration
-        if a > 1 then a = 1 end
-        hrp.CFrame = CFrame.new(startPos:Lerp(pos, a)) * rot
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-        if a >= 1 then break end
-        task.wait()
-    end
-end
-
-local function goGrab(target, char, hrp, holdFor)
-    glideTo(target.Position, char, hrp)
-    local rot  = hrp.CFrame - hrp.CFrame.Position
-    local base = target.Position
-    local t0 = os.clock()
-    local nextRefire = CONFIG.ReInteractAt
-    local firstDone = false
-
-    while os.clock() - t0 < holdFor do
-        if not stillThere(target) then break end
-        local bob = math.sin((os.clock() - t0) * 6) * 0.4
-        hrp.CFrame = CFrame.new(base + Vector3.new(0, bob, 0)) * rot
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-
-        if not firstDone then
-            firstDone = true
-            interact(target); forceTouch(target, char)
-        elseif (os.clock() - t0) >= nextRefire then
-            nextRefire = nextRefire + CONFIG.ReInteractAt
-            interact(target); forceTouch(target, char)
-        end
-        task.wait(0.04)
-    end
-    if stillThere(target) then interact(target); forceTouch(target, char) end
-end
-
-local function pickNearest(now, hrp)
-    local best, bestD
-    for i = 1, #candyList do
-        local p = candyList[i]
-        if validTarget(p, now) then
-            local d = (p.Position - hrp.Position).Magnitude
-            if not bestD or d < bestD then best, bestD = p, d end
-        end
-    end
-    return best
-end
-mark("helpers")
-
-task.spawn(function()
-    local lastScan, lastValidate, lastPrune, nextHop = 0, 0, 0, 0
-    local hopsSinceRest = 0
-    local restTarget = math.random(CONFIG.RestAfterMin, CONFIG.RestAfterMax)
-    local noclipChar = nil
-
-    while task.wait(CONFIG.TickRate) do
-        local char, _, hrp = getChar()
-
-        if STATE.farm and char then
-            if char ~= noclipChar then applyNoclip(char); noclipChar = char end
-        elseif not STATE.farm and noclipChar then
-            clearNoclip(noclipChar); noclipChar = nil
-        end
-
-        if not STATE.farm or not char then continue end
-
-        local now = os.clock()
-        if now - lastScan > CONFIG.RescanTime then
-            lastScan = now
-            rebuildCandyList()
-        end
-        if now - lastPrune > CONFIG.PruneTime then
-            lastPrune = now
-            prune(now)
-        end
-        if now - lastValidate > CONFIG.ValidateTime then
-            lastValidate = now
-            for i = #candyList, 1, -1 do
-                if not stillThere(candyList[i]) then
-                    candySet[candyList[i]] = nil
-                    table.remove(candyList, i)
-                end
-            end
-        end
-
-        if now >= nextHop then
-            local target = pickNearest(now, hrp)
-            if target then
-                local hopStart = os.clock()
-                attempts[target] = (attempts[target] or 0) + 1
-                claimed[target] = hopStart + CONFIG.DwellTime + CONFIG.RetryDwell + 1.0
-
-                goGrab(target, char, hrp, jit(CONFIG.DwellTime))
-
-                if CONFIG.RetryOnMiss and stillThere(target) and not promptDead(target) then
-                    STATE.log = "retry: " .. target.Name
-                    goGrab(target, char, hrp, jit(CONFIG.RetryDwell))
-                end
-
-                if not stillThere(target) or promptDead(target) then
-                    STATE.collected += 1
-                else
-                    STATE.skipped += 1
-                    STATE.log = "stuck: " .. target.Name
-                end
-
-                attempts[target] = CONFIG.MaxAttempts
-                STATE.hops += 1
-                nextHop = os.clock() + jit(CONFIG.HopInterval)
-
-                hopsSinceRest += 1
-                if hopsSinceRest >= restTarget then
-                    hopsSinceRest = 0
-                    restTarget = math.random(CONFIG.RestAfterMin, CONFIG.RestAfterMax)
-                    local rest = CONFIG.RestMin + math.random() * (CONFIG.RestMax - CONFIG.RestMin)
-                    STATE.log = string.format("rest %.1fs", rest)
-                    task.wait(rest)
-                end
-            else
-                nextHop = now + 0.2
-            end
-        end
-    end
-end)
-mark("farm loop")
-
-local function isOwnGui(o)
+local function own(o)
     local p = o
     while p do
-        if p:IsA("ScreenGui") then return p.Name == OWN_GUI_NAME end
+        if p:IsA("ScreenGui") then return p.Name == OWN end
         p = p.Parent
     end
     return false
 end
 
-local function chainVisible(o)
+local function chainVis(o)
     local pg = pgui()
     local p = o
     while p and p ~= pg do
@@ -387,267 +62,382 @@ local function chainVisible(o)
     return true
 end
 
-local function visibleButtons()
+local function buttons()
     local out = {}
-    local pg = pgui(); if not pg then return out end
-    for _, d in ipairs(pg:GetDescendants()) do
+    local pg = pgui()
+    if not pg then return out end
+    local kids = pg:GetDescendants()
+    for i = 1, #kids do
+        local d = kids[i]
         if (d:IsA("TextButton") or d:IsA("ImageButton"))
             and d.Visible and d.AbsoluteSize.X > 0 and d.AbsoluteSize.Y > 0
-            and not isOwnGui(d) and chainVisible(d.Parent) then
+            and chainVis(d.Parent) and not own(d) then
             out[#out + 1] = d
         end
     end
     return out
 end
 
-local function buttonLabel(b)
-    local t = b.Name
-    if b:IsA("TextButton") then t = t .. " " .. b.Text end
-    return t
+local function label(b)
+    if b:IsA("TextButton") then return b.Name .. " " .. b.Text end
+    return b.Name
 end
 
 local function labelDeep(b)
-    local parts = { buttonLabel(b) }
-    local n = 1
-    for _, c in ipairs(b:GetChildren()) do
+    local s = label(b)
+    local n = 0
+    local kids = b:GetChildren()
+    for i = 1, #kids do
+        local c = kids[i]
         if c:IsA("TextLabel") or c:IsA("TextButton") then
-            parts[#parts + 1] = c.Text
-            n += 1
-            if n >= 5 then break end
+            s = s .. " " .. c.Text
+            n = n + 1
+            if n >= 4 then break end
         end
     end
-    return table.concat(parts, " ")
-end
-
-local function sigOf(list)
-    local parts = {}
-    for i = 1, #list do parts[i] = list[i]:GetFullName() end
-    return table.concat(parts, ",")
-end
-
-local function buttonSet()
-    local s = {}
-    for _, b in ipairs(visibleButtons()) do s[b] = true end
     return s
 end
 
-local function fireButton(b)
-    if not b or not b.Parent then return false end
-    pcall(function() b.Active = true end)
-    local function via(sig)
-        if not getconnections then return false end
-        local n = 0
-        pcall(function()
-            for _, c in ipairs(getconnections(sig)) do
-                if c.Enabled ~= false and c.Function then
-                    n += 1
-                    pcall(function() c.Function(b) end)
-                end
-            end
-        end)
-        return n > 0
-    end
-    if via(b.MouseButton1Click) then return true end
-    if via(b.Activated) then return true end
-    if firesignal and pcall(firesignal, b.MouseButton1Click) then return true end
-    if via(b.MouseButton1Down) then return true end
-    return pcall(function() b:Activate() end)
+local function textOf(o)
+    local t = o.Name
+    if o:IsA("TextLabel") or o:IsA("TextButton") then t = t .. " " .. o.Text end
+    return t
 end
 
-local function pickTopButtonAt(mx, my)
-    local pg = pgui(); if not pg then return nil end
-    local fallback
-    for _, y in ipairs({my, my - 36}) do
-        for _, o in ipairs(pg:GetGuiObjectsAtPosition(mx, y)) do
-            if o:IsA("GuiButton") and o.Visible and chainVisible(o.Parent) then
-                if not fallback then fallback = o end
-                if getconnections and #getconnections(o.MouseButton1Click) > 0 then return o end
-            end
-        end
-    end
-    return fallback
+local function vpY()
+    local c = workspace.CurrentCamera
+    if c then return c.ViewportSize.Y end
+    return 1080
 end
 
-local function resolvePath(path)
-    local node = pgui()
-    if not node then return nil end
-    for part in string.gmatch(path, "[^%.]+") do
-        node = node and node:FindFirstChild(part)
-    end
-    return node
+local function vpX()
+    local c = workspace.CurrentCamera
+    if c then return c.ViewportSize.X end
+    return 1920
 end
 
-local function pathFromPg(o)
-    local parts, n, pg = {}, o, pgui()
-    while n and n ~= pg do
-        table.insert(parts, 1, n.Name)
-        n = n.Parent
-    end
-    return table.concat(parts, ".")
-end
-mark("ui helpers")
-
-local function viewportY()
-    local cam = workspace.CurrentCamera
-    return cam and cam.ViewportSize.Y or 1080
+local function inBottom(b)
+    return b.AbsolutePosition.Y >= vpY() * CFG.BottomY
 end
 
-local function viewportX()
-    local cam = workspace.CurrentCamera
-    return cam and cam.ViewportSize.X or 1920
-end
-
-local function inBottomRow(b)
-    return b.AbsolutePosition.Y >= viewportY() * CONFIG.RowYThreshold
-end
-
-local function bottomRow(list)
+local function bodyButtons()
     local out = {}
-    for _, b in ipairs(list) do
-        if inBottomRow(b) then out[#out + 1] = b end
+    local all = buttons()
+    for i = 1, #all do
+        if not inBottom(all[i]) then out[#out + 1] = all[i] end
+    end
+    return out
+end
+
+local function bottomRow()
+    local out = {}
+    local all = buttons()
+    for i = 1, #all do
+        if inBottom(all[i]) then out[#out + 1] = all[i] end
     end
     table.sort(out, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
     return out
 end
 
-local function findIn(list, keywords)
-    for _, kw in ipairs(keywords) do
-        for _, b in ipairs(list) do
-            if buttonLabel(b):lower():find(kw, 1, true) then return b end
+local function findKW(list, kws, deep)
+    for k = 1, #kws do
+        for i = 1, #list do
+            local s
+            if deep then s = labelDeep(list[i]) else s = label(list[i]) end
+            if s:lower():find(kws[k], 1, true) then return list[i] end
         end
     end
     return nil
 end
 
-local function findInDeep(list, keywords)
-    for _, kw in ipairs(keywords) do
-        for _, b in ipairs(list) do
-            if labelDeep(b):lower():find(kw, 1, true) then return b end
-        end
+local function click(b)
+    if not b or not b.Parent then return false end
+    pcall(function() b.Active = true end)
+    if getconnections then
+        local done = false
+        pcall(function()
+            local cs = getconnections(b.MouseButton1Click)
+            for i = 1, #cs do
+                if cs[i].Function then done = true; pcall(cs[i].Function, b) end
+            end
+        end)
+        if done then return true end
+        pcall(function()
+            local cs = getconnections(b.Activated)
+            for i = 1, #cs do
+                if cs[i].Function then done = true; pcall(cs[i].Function, b) end
+            end
+        end)
+        if done then return true end
+    end
+    if firesignal and pcall(firesignal, b.MouseButton1Click) then return true end
+    return pcall(function() b:Activate() end)
+end
+
+local function buttonAncestor(o)
+    local p = o
+    local d = 0
+    while p and d < 6 do
+        if p:IsA("GuiButton") then return p end
+        p = p.Parent
+        d = d + 1
     end
     return nil
 end
 
-local function nonTabButtons()
+local function validBtn(b)
+    return b and b.Parent and b.Visible and chainVis(b.Parent) and not own(b)
+end
+print("[MM2] helpers ok")
+
+--==================== LEFT SIDEBAR ====================
+
+local function sidebar()
     local out = {}
-    for _, b in ipairs(visibleButtons()) do
-        if not inBottomRow(b) then out[#out + 1] = b end
+    local all = buttons()
+    local vx = vpX()
+    for i = 1, #all do
+        local b = all[i]
+        local pos, sz = b.AbsolutePosition, b.AbsoluteSize
+        local cx = (pos.X + sz.X * 0.5) / vx
+        if cx < CFG.ShopBand and not inBottom(b)
+            and sz.X >= CFG.ShopMin and sz.Y >= CFG.ShopMin then
+            out[#out + 1] = b
+        end
     end
+    table.sort(out, function(a, b) return a.AbsolutePosition.Y < b.AbsolutePosition.Y end)
     return out
 end
 
-local function findUnbox()
-    for _, kw in ipairs(CONFIG.UnboxKeywords) do
-        for _, b in ipairs(nonTabButtons()) do
-            if buttonLabel(b):lower():find(kw, 1, true) then return b end
+--==================== WALLET ====================
+
+local walletEl = nil
+
+local function readCandy()
+    local e = walletEl
+    if not e or not e.Parent then return nil end
+    local d = e.Text:gsub("[^%d]", "")
+    if #d == 0 then return nil end
+    return tonumber(d)
+end
+
+local function findWallet()
+    local pg = pgui()
+    if not pg then return nil end
+    local best, bestScore = nil, 0
+    local kids = pg:GetDescendants()
+    for i = 1, #kids do
+        local o = kids[i]
+        if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Visible
+            and chainVis(o.Parent) and not own(o) then
+            local d = o.Text:gsub("[^%d]", "")
+            if #d > 0 then
+                local path = ""
+                local n = o
+                local depth = 0
+                while n and n ~= pg and depth < 4 do
+                    path = path .. " " .. n.Name
+                    n = n.Parent
+                    depth = depth + 1
+                end
+                path = path:lower()
+                local sc = 0
+                if path:find("wallet", 1, true) then sc = sc + 100 end
+                if path:find("balance", 1, true) then sc = sc + 60 end
+                if path:find("total", 1, true) then sc = sc + 60 end
+                if path:find("candy", 1, true) then sc = sc + 40 end
+                if path:find("owned", 1, true) then sc = sc + 40 end
+                if path:find("amount", 1, true) then sc = sc + 20 end
+                if path:find("cost", 1, true) then sc = sc - 40 end
+                if path:find("price", 1, true) then sc = sc - 40 end
+                if sc > bestScore then bestScore = sc; best = o end
+            end
         end
+    end
+    if best and bestScore > 0 then
+        S.walletName = best.Name
+        return best
     end
     return nil
 end
 
-local function waitForUnbox(timeout)
+local function canBuy()
+    if S.force then return true end
+    if not CFG.Gate then return true end
+    if not walletEl or not walletEl.Parent then walletEl = findWallet() end
+    local bal = readCandy()
+    if bal then S.candy = bal end
+    if not bal then bal = S.candy end
+    if bal == nil then return CFG.BuyIfUnknown end
+    return bal >= CFG.Cost
+end
+print("[MM2] wallet ok")
+
+--==================== NAV ====================
+
+local shopPin, tilePin = nil, nil
+
+local function findShop()
+    if validBtn(shopPin) then return shopPin, "pin" end
+
+    local pg = pgui()
+    if pg then
+        local kids = pg:GetDescendants()
+        local best, bestScore = nil, 0
+        for i = 1, #kids do
+            local o = kids[i]
+            if (o:IsA("TextLabel") or o:IsA("TextButton")
+                or o:IsA("ImageButton") or o:IsA("ImageLabel"))
+                and o.Visible and chainVis(o.Parent) and not own(o) then
+                local t = textOf(o):lower()
+                local sc = 0
+                if t:find("shop", 1, true) then sc = sc + 100 end
+                if t:find("store", 1, true) then sc = sc + 60 end
+                if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text:find("%$") then
+                    sc = sc + 45
+                end
+                if sc > 0 then
+                    local b = buttonAncestor(o)
+                    if validBtn(b) and not inBottom(b) then
+                        if sc > bestScore then bestScore = sc; best = b end
+                    end
+                end
+            end
+        end
+        if best then return best, "text" end
+    end
+
+    local col = sidebar()
+    local cand = col[CFG.ShopIndex]
+    if validBtn(cand) then return cand, "column#" .. CFG.ShopIndex end
+
+    local vx, vy = vpX(), vpY()
+    local all = buttons()
+    for i = 1, #all do
+        local b = all[i]
+        if not inBottom(b) then
+            local pos, sz = b.AbsolutePosition, b.AbsoluteSize
+            local cx = (pos.X + sz.X * 0.5) / vx
+            local cy = (pos.Y + sz.Y * 0.5) / vy
+            local c = b.BackgroundColor3
+            if cx > 0.02 and cx < 0.4 and cy > 0.12 and cy < 0.85
+                and sz.X > 60 and sz.X < 200
+                and c.R > 0.65 and c.G > 0.65 and c.B > 0.65 then
+                return b, "geometry"
+            end
+        end
+    end
+    return nil, "none"
+end
+
+-- v9: three passes. pin -> scored text/name -> biggest central card.
+local function findTile()
+    if validBtn(tilePin) then return tilePin, "pin" end
+
+    local pg = pgui()
+    if pg then
+        local kids = pg:GetDescendants()
+        local best, bestScore = nil, 0
+        for i = 1, #kids do
+            local o = kids[i]
+            if (o:IsA("TextLabel") or o:IsA("TextButton")
+                or o:IsA("ImageButton") or o:IsA("ImageLabel"))
+                and o.Visible and chainVis(o.Parent) and not own(o) then
+                local t = textOf(o):lower()
+                local sc = 0
+                if t:find("halloween", 1, true) then sc = sc + 130 end
+                if t:find("mystery", 1, true) then sc = sc + 95 end
+                if t:find("box", 1, true) then sc = sc + 60 end
+                if t:find("26", 1, true) then sc = sc + 25 end
+                if t:find("candy", 1, true) then sc = sc - 25 end
+                if t:find("shop", 1, true) then sc = sc - 15 end
+                if sc > 0 then
+                    local b = buttonAncestor(o)
+                    if validBtn(b) and not inBottom(b) and b ~= shopPin then
+                        local sz = b.AbsoluteSize
+                        if sz.X > 90 and sz.Y > 90 then
+                            if sc > bestScore then bestScore = sc; best = b end
+                        end
+                    end
+                end
+            end
+        end
+        if best then return best, "text" end
+    end
+
+    local vx, vy = vpX(), vpY()
+    local all = buttons()
+    local best, bestArea = nil, 0
+    for i = 1, #all do
+        local b = all[i]
+        local pos, sz = b.AbsolutePosition, b.AbsoluteSize
+        local cx = (pos.X + sz.X * 0.5) / vx
+        local cy = (pos.Y + sz.Y * 0.5) / vy
+        if not inBottom(b) and cx > 0.18 and cx < 0.92 and cy > 0.12 and cy < 0.88
+            and sz.X > 100 and sz.Y > 100 then
+            local area = sz.X * sz.Y
+            if area > bestArea then bestArea = area; best = b end
+        end
+    end
+    if best then return best, "geometry" end
+    return nil, "none"
+end
+
+local function findUnbox()
+    return findKW(bodyButtons(), CFG.UnboxKW, false)
+end
+
+local function waitUnbox(t)
     local t0 = os.clock()
-    repeat
+    while os.clock() - t0 < t do
         local b = findUnbox()
         if b then return b end
         task.wait(0.15)
-    until os.clock() - t0 > timeout
+    end
     return nil
 end
 
-local function isCloseButton(b)
-    local l = buttonLabel(b):lower()
-    for _, bad in ipairs(CONFIG.CloseNever) do
-        if l:find(bad, 1, true) then return false end
+-- v9: exact-ish only, so closeAll never grazes unrelated buttons
+local function isClose(b)
+    local l = label(b):lower()
+    for i = 1, #CFG.CloseNo do
+        if l:find(CFG.CloseNo[i], 1, true) then return false end
     end
-    for _, kw in ipairs(CONFIG.CloseKeywords) do
-        if l == kw then return true end
-        if #kw > 2 and l:find(kw, 1, true) then return true end
+    if b:IsA("TextButton") then
+        local tx = b.Text
+        if tx == "X" or tx == "x" or tx == "✕" then return true end
+    end
+    for i = 1, #CFG.CloseKW do
+        local k = CFG.CloseKW[i]
+        if l == k then return true end
+        if l == k .. "button" then return true end
+        if l == k .. " btn" then return true end
     end
     return false
 end
 
 local function closeAll()
-    STATE.onBoxPage = false
-    for _ = 1, 3 do
-        local vis = visibleButtons()
-        local before = sigOf(vis)
-        local found
-        for _, b in ipairs(vis) do
-            if isCloseButton(b) then found = b break end
+    S.onBox = false
+    for _ = 1, 2 do
+        local vis = buttons()
+        local target = nil
+        for i = 1, #vis do
+            if isClose(vis[i]) then target = vis[i]; break end
         end
-        if not found then return end
-        fireButton(found)
-        task.wait(jit(0.5))
-        if sigOf(visibleButtons()) == before then return end
+        if not target then return end
+        click(target)
+        task.wait(0.5)
     end
 end
-mark("nav helpers")
 
-local boxTabIdx, boxTabName, eventRef = nil, nil, nil
-local shopSrc, boxTileSrc = nil, nil
-
-local function clickFirst(keywords, preferBody)
-    local b
-    if preferBody then b = findIn(nonTabButtons(), keywords) end
-    if not b then b = findIn(visibleButtons(), keywords) end
-    if b then fireButton(b) end
-    return b
-end
-
-local function clickEvent()
-    local b = eventRef
-    if not (b and b.Parent and b.Visible and chainVisible(b.Parent)) then
-        b = findIn(visibleButtons(), CONFIG.EventKeywords)
-        eventRef = b
-    end
-    if b then fireButton(b) end
-    return b
-end
-
-local function findShop()
-    local s = shopSrc
-    if s and s.Parent and s.Visible and chainVisible(s.Parent) then return s end
-
-    local vis = visibleButtons()
-    for _, b in ipairs(vis) do
-        if b.Name:lower():find("shop", 1, true) then return b end
-    end
-    local byLabel = findInDeep(vis, CONFIG.ShopKeywords)
-    if byLabel then return byLabel end
-
-    local vx = viewportX()
-    for _, b in ipairs(vis) do
-        local sz, pos = b.AbsoluteSize, b.AbsolutePosition
-        if not inBottomRow(b) and pos.X > vx * 0.68
-            and sz.X > 34 and sz.X < 150 and math.abs(sz.X - sz.Y) < 40 then
-            print("[MM2] shop guess: " .. b.Name)
-            return b
-        end
-    end
-    return nil
-end
-
-local function clickShop()
-    local b = findShop()
-    if b then fireButton(b) end
-    return b
-end
-
-local function findBoxTile()
-    local s = boxTileSrc
-    if s and s.Parent and s.Visible and chainVisible(s.Parent) then return s end
-    return findInDeep(nonTabButtons(), CONFIG.BoxTileKeywords)
-end
-
-local function dismissReward()
+local function dismissPopup()
     if findUnbox() then return false end
-    for _, kw in ipairs(CONFIG.RewardKeywords) do
-        for _, b in ipairs(nonTabButtons()) do
-            if buttonLabel(b):lower() == kw then
-                fireButton(b)
-                STATE.log = "popup cleared: " .. b.Name
-                task.wait(jit(0.5))
+    local body = bodyButtons()
+    for k = 1, #CFG.PopupKW do
+        for i = 1, #body do
+            if label(body[i]):lower() == CFG.PopupKW[k] then
+                click(body[i])
+                task.wait(0.4)
                 return true
             end
         end
@@ -655,737 +445,511 @@ local function dismissReward()
     return false
 end
 
--- v5.2: the buy gate. Live read off the box page when we have it, cached value
--- otherwise. Unknown balance = not affordable (park and wait, never guess).
-local function affordable()
-    if STATE.force then return true end
-    if not CONFIG.RequireBalance then return true end
-    local bal = readCandy()
-    if bal then STATE.candy = bal end
-    if not bal then bal = STATE.candy end
-    return bal ~= nil and bal >= CONFIG.BoxCost
-end
-
-local function tabUsable(b)
-    return b and b.Parent and b.Visible and chainVisible(b.Parent)
-end
-
-local function tryTab(b, label)
-    if not tabUsable(b) then return nil end
-    fireButton(b)
-    local unbox = waitForUnbox(1.6)
-    if unbox then
-        STATE.log = "box tab " .. label .. ": " .. b.Name
-        return unbox
+local function doBuy(u)
+    click(u)
+    task.wait(1.2)
+    local b = findKW(bodyButtons(), CFG.BuyKW, false)
+    if not b then b = findKW(buttons(), CFG.BuyKW, false) end
+    if b then
+        click(b)
+        S.log = "buy: " .. b.Name
+        task.wait(1.0)
     end
-    return nil
+    local after = readCandy()
+    if after then
+        S.candy = after
+    elseif S.candy then
+        S.candy = math.max(0, S.candy - CFG.Cost)
+    end
+    S.boxes = S.boxes + 1
 end
 
-local function reachBoxPage(beforeSet)
-    local unbox = findUnbox()
-    if unbox then return unbox end
+local function navFromWorld()
+    closeAll()
+    task.wait(0.3)
+    local shop, how = findShop()
+    S.shopName = shop and shop.Name or "NONE"
+    S.shopHow = how
+    if not shop then
+        S.log = "NO SHOP - press PIN SHOP"
+        return false
+    end
+    click(shop)
+    S.log = "shop (" .. how .. "): " .. shop.Name
+    task.wait(1.2)
+    S.onBox = true
+    S.miss = 0
+    return true
+end
 
-    if CONFIG.UseShopButton then
-        unbox = waitForUnbox(1.2)
-        if unbox then STATE.log = "box page via SHOP"; return unbox end
+-- v9: once S.onBox is set we stay here. tile -> unbox -> gate -> buy.
+local function workBoxPage()
+    local u = findUnbox()
+    if not u and dismissPopup() then u = waitUnbox(1.0) end
 
-        local tile = findBoxTile()
+    if not u then
+        local tile, how = findTile()
+        S.tileName = tile and tile.Name or "NONE"
+        S.tileHow = how
         if tile then
-            STATE.log = "box tile: " .. tile.Name
-            fireButton(tile)
-            task.wait(jit(0.8))
-            unbox = waitForUnbox(2.5)
-            if unbox then STATE.log = "box page via SHOP>tile"; return unbox end
-            STATE.log = "tile clicked - no unbox"
-        else
-            STATE.log = "no box tile found"
-        end
-
-        if not CONFIG.TabFallback then return nil end
-        STATE.log = "SHOP path failed - trying tab row"
-    end
-
-    if boxTabIdx then
-        local row = bottomRow(visibleButtons())
-        local cand = row[boxTabIdx]
-        if cand and (not boxTabName or cand.Name == boxTabName) then
-            unbox = tryTab(cand, "(cached #" .. boxTabIdx .. ")")
-            if unbox then return unbox end
-        end
-        boxTabIdx, boxTabName = nil, nil
-    end
-
-    local fresh = {}
-    for _, b in ipairs(visibleButtons()) do
-        if not beforeSet[b] then fresh[#fresh + 1] = b end
-    end
-
-    local row = bottomRow(fresh)
-    if #row < CONFIG.BoxTabIndex then row = bottomRow(visibleButtons()) end
-
-    local order = {}
-    if row[CONFIG.BoxTabIndex] then order[#order + 1] = row[CONFIG.BoxTabIndex] end
-    for i, b in ipairs(row) do
-        if i ~= CONFIG.BoxTabIndex then order[#order + 1] = b end
-    end
-
-    for _, cand in ipairs(order) do
-        if not cand.Parent then continue end
-        unbox = tryTab(cand, "#" .. CONFIG.BoxTabIndex)
-        if unbox then
-            for i, b in ipairs(row) do
-                if b == cand then boxTabIdx, boxTabName = i, cand.Name break end
-            end
-            return unbox
+            click(tile)
+            S.log = "tile (" .. how .. "): " .. tile.Name
+            task.wait(0.9)
+            u = waitUnbox(2.5)
         end
     end
-    return nil
-end
 
-local function unboxAndBuy(unbox)
-    local before = readCandy()
-    fireButton(unbox)
-    task.wait(jit(1.3))
+    if not u then return false end
 
-    local buy = clickFirst(CONFIG.BuyKeywords, true)
-    if buy then
-        STATE.log = "buy: " .. buy.Name
-        task.wait(jit(1.2))
-        local after = readCandy()          -- v5.2: keep the gate value fresh
-        if after then STATE.candy = after
-        elseif before then STATE.candy = math.max(0, before - CONFIG.BoxCost) end
+    if not walletEl or not walletEl.Parent then walletEl = findWallet() end
+    if not canBuy() then
+        S.waiting = true
+        S.log = "waiting " .. tostring(S.candy) .. "/" .. CFG.Cost
         return true
     end
 
-    task.wait(jit(1.0))
-    local after = readCandy()
-    if before and after and after < before then
-        STATE.log = "opened (no confirm step)"
-        STATE.candy = after
-    else
-        STATE.log = "unbox fired - no confirm found"
-        if before then STATE.candy = math.max(0, before - CONFIG.BoxCost) end
-    end
+    doBuy(u)
+    S.waiting = false
     return true
 end
 
-local function runBoxCycle()
-    uiLock = true
+local function cycle()
+    S.busy = true
 
-    -- fast path: page already open -> gate first, then unbox
-    if STATE.onBoxPage then
-        if not affordable() then
-            STATE.log = string.format("have %s/%d - not buying",
-                STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost)
-            STATE.waiting = true
-            uiLock = false
-            return false
+    if S.onBox then
+        if workBoxPage() then
+            S.busy = false
+            return
         end
-        local unbox = findUnbox()
-        if not unbox and dismissReward() then unbox = waitForUnbox(1.0) end
-        if unbox and unboxAndBuy(unbox) then
-            STATE.boxes += 1
-            STATE.waiting = false
-            uiLock = false
-            return true
+        S.miss = S.miss + 1
+        if S.miss < 3 then
+            S.log = "on page, retry " .. S.miss .. "/3"
+            S.busy = false
+            return
         end
-        STATE.onBoxPage = false
-        STATE.log = "fast path miss - full cycle"
+        S.log = "page dead - renavigating"
+        S.miss = 0
+        S.onBox = false
     end
 
-    if CONFIG.CloseBeforeCycle then closeAll() end
-    task.wait(jit(0.3))
-
-    local before = buttonSet()
-    local ev
-    if CONFIG.UseShopButton then ev = clickShop() end
-    if not ev and (CONFIG.TabFallback or not CONFIG.UseShopButton) then ev = clickEvent() end
-    if not ev then STATE.log = "no shop/event button"; uiLock = false; return false end
-    STATE.log = "nav: " .. ev.Name
-    task.wait(jit(1.1))
-
-    local unbox = reachBoxPage(before)
-    if not unbox then
-        STATE.log = "box page not reached"
-        eventRef, shopSrc = nil, nil
-        uiLock = false
-        return false
+    if not navFromWorld() then
+        S.busy = false
+        return
     end
 
-    -- the account total is on this page: read it, then gate on it
-    candySrc = findCandySource()
-    local bal = readCandy()
-    if bal then
-        STATE.candy = bal
-        STATE.checkedOnce = true
-        STATE.lastCheck = os.clock()
+    if not workBoxPage() then
+        S.log = "shop open, no unbox/tile"
     end
+    S.busy = false
+end
+print("[MM2] nav ok")
 
-    if not affordable() then
-        STATE.log = string.format("have %s/%d - page open, waiting",
-            STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost)
-        STATE.waiting = true
-        STATE.onBoxPage = true          -- stay here, next cycle re-checks
-        uiLock = false
-        return false
+task.spawn(function()
+    while task.wait(0.5) do
+        if S.open and not S.busy then cycle() end
     end
+end)
+print("[MM2] open loop ok")
 
-    unboxAndBuy(unbox)
+--==================== FARM ====================
 
-    STATE.boxes += 1
-    STATE.waiting = false
-    STATE.onBoxPage = true
-    uiLock = false
+local function getChar()
+    local c = LP.Character
+    if not c or not c.Parent then return nil end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    local r = c:FindFirstChild("HumanoidRootPart")
+    if not h or not r or h.Health <= 0 then return nil end
+    return c, r
+end
+
+local function isCandy(p)
+    if not p:IsA("BasePart") then return false end
+    local n = p.Name:lower()
+    if not (n:find("candy", 1, true) or n:find("coin", 1, true)) then return false end
+    local sz = p.Size
+    if math.max(sz.X, sz.Y, sz.Z) > 8 then return false end
+    local m = p:FindFirstAncestorOfClass("Model")
+    if m and Players:GetPlayerFromCharacter(m) then return false end
     return true
 end
-mark("open flow")
 
-local function waitForButton(path, timeout)
+local function alive(p)
+    if not p or not p.Parent then return false end
+    if p.Transparency >= 1 then return false end
+    return p:IsDescendantOf(workspace)
+end
+
+local function firePrompt(part)
+    local kids = part:GetDescendants()
+    for i = 1, #kids do
+        local d = kids[i]
+        if d:IsA("ProximityPrompt") and d.Enabled ~= false then
+            if fireproximityprompt then pcall(fireproximityprompt, d, d.HoldDuration) end
+        elseif d:IsA("ClickDetector") then
+            if fireclickdetector then pcall(fireclickdetector, d) end
+        end
+    end
+end
+
+local function touchFire(part, char)
+    if not getconnections or not part.Parent then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    pcall(function()
+        local cs = getconnections(part.Touched)
+        for i = 1, #cs do
+            if cs[i].Function then pcall(cs[i].Function, hrp) end
+        end
+    end)
+end
+
+local function glide(pos, char, hrp)
+    if not char.Parent or not hrp.Parent then return end
+    local startP = hrp.Position
+    local delta = pos - startP
+    local dist = delta.Magnitude
+    if dist < 0.1 then return end
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    local rot = hrp.CFrame - hrp.CFrame.Position
+    if flat.Magnitude > 1 then rot = CFrame.lookAt(Vector3.zero, flat.Unit) end
+    local dur = dist / math.max(CFG.Speed, 1)
     local t0 = os.clock()
-    repeat
-        local b = resolvePath(path)
-        if b and b.Visible and chainVisible(b.Parent) then return b end
-        task.wait(0.08)
-    until os.clock() - t0 > timeout
-    return nil
+    while true do
+        if not char.Parent or not hrp.Parent then return end
+        local a = (os.clock() - t0) / dur
+        if a > 1 then a = 1 end
+        hrp.CFrame = CFrame.new(startP:Lerp(pos, a)) * rot
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        if a >= 1 then break end
+        task.wait()
+    end
 end
 
-local function replaySequence()
-    local before = STATE.candy
-    local sigBefore = sigOf(visibleButtons())
-    local timedOut = 0
-    for i, path in ipairs(CONFIG.Sequence) do
-        local b = waitForButton(path, CONFIG.StepTimeout)
-        if b then
-            fireButton(b)
-            STATE.log = "step " .. i .. "/" .. #CONFIG.Sequence .. "  " .. b.Name
-        else
-            timedOut += 1
-            STATE.log = "step " .. i .. " TIMEOUT  " .. path:sub(-20)
-        end
-        task.wait(jit(CONFIG.SequenceDelay))
+local function goGrab(target, char, hrp, hold)
+    glide(target.Position, char, hrp)
+    local rot = hrp.CFrame - hrp.CFrame.Position
+    local base = target.Position
+    local t0 = os.clock()
+    while os.clock() - t0 < hold do
+        if not alive(target) then break end
+        local bob = math.sin((os.clock() - t0) * 6) * 0.4
+        hrp.CFrame = CFrame.new(base + Vector3.new(0, bob, 0)) * rot
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        firePrompt(target)
+        touchFire(target, char)
+        task.wait(0.05)
     end
-    task.wait(jit(1.2))
-    local after = readCandy()
-    if before and after and after < before then
-        STATE.boxes += 1
-        if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
-        STATE.log = "OPENED"
-    elseif timedOut > 0 then
-        STATE.log = timedOut .. " step(s) never appeared"
-    elseif sigOf(visibleButtons()) == sigBefore then
-        STATE.log = "no UI change - wrong step order?"
-    end
-    if after then STATE.candy = after end
+    if alive(target) then firePrompt(target); touchFire(target, char) end
 end
 
 task.spawn(function()
-    local lastCycle = 0
-    while task.wait(0.5) do
-        if not STATE.open then continue end
-        if uiLock then continue end
-        if os.clock() - lastCycle < jit(CONFIG.CycleCooldown) then continue end
+    local claimed, tries = {}, {}
+    local lastScan = 0
+    local noclipChar = nil
 
-        -- cheap early-out before touching any UI
-        if not affordable() and not STATE.onBoxPage then
-            if STATE.candy and STATE.candy < CONFIG.BoxCost then
-                STATE.log = string.format("have %d/%d - waiting", STATE.candy, CONFIG.BoxCost)
-                STATE.waiting = true
-                lastCycle = os.clock()
-                continue
+    while task.wait(CFG.Tick) do
+        local char, hrp = getChar()
+        if S.farm and char then
+            if char ~= noclipChar then
+                local kids = char:GetDescendants()
+                for i = 1, #kids do
+                    if kids[i]:IsA("BasePart") then kids[i].CanCollide = false end
+                end
+                noclipChar = char
             end
-        end
 
-        if CONFIG.OpenMode == "recorded" and #CONFIG.Sequence > 0 then
-            if CONFIG.CloseBeforeCycle then closeAll() end
-            replaySequence()
-        else
-            runBoxCycle()
-        end
-        lastCycle = os.clock()
-    end
-end)
-mark("open loop")
+            if os.clock() - lastScan > CFG.Rescan then
+                lastScan = os.clock()
+                local best, bestD = nil, nil
+                local kids = workspace:GetDescendants()
+                for i = 1, #kids do
+                    local p = kids[i]
+                    if isCandy(p) then
+                        local now = os.clock()
+                        local t = claimed[p]
+                        if (not t or t <= now) and (tries[p] or 0) < CFG.MaxTry then
+                            local d = (p.Position - hrp.Position).Magnitude
+                            if not bestD or d < bestD then best = p; bestD = d end
+                        end
+                    end
+                end
 
-local function walletPath(o)
-    local parts, n, pg, depth = {}, o, pgui(), 0
-    while n and n ~= pg and depth < 4 do
-        parts[#parts + 1] = n.Name
-        n = n.Parent
-        depth += 1
-    end
-    return table.concat(parts, " "):lower()
-end
-
-local function matchesWallet(o)
-    local n = walletPath(o)
-    for _, kw in ipairs(CONFIG.WalletKeywords) do
-        if n:find(kw, 1, true) then return true end
-    end
-    return false
-end
-
-local function scoreWallet(o)
-    local n = walletPath(o)
-    local s = 0
-    if n:find("wallet",  1, true) then s += 120 end
-    if n:find("balance", 1, true) then s += 60  end
-    if n:find("total",   1, true) then s += 60  end
-    if n:find("owned",   1, true) then s += 50  end
-    if n:find("candy",   1, true) then s += 40  end
-    if n:find("sweet",   1, true) then s += 25  end
-    if n:find("collect", 1, true) then s -= 30  end
-    if n:find("cost", 1, true) or n:find("price", 1, true) then s -= 40 end
-    if o:IsA("TextLabel") then s += 20 end
-    return s
-end
-
-readCandy = function()
-    local s = candySrc
-    if not s or not s.Parent then return nil end
-    if s:IsA("TextLabel") or s:IsA("TextButton") then
-        local t = s.Text:gsub("[^%d]", "")
-        return #t > 0 and tonumber(t) or nil
-    end
-    return tonumber(s.Value)
-end
-
-findCandySource = function()
-    local best, bestScore = nil, -math.huge
-    local function consider(o, numeric)
-        if not numeric or not matchesWallet(o) then return end
-        if o:FindFirstAncestor(OWN_GUI_NAME) then return end
-        local s = scoreWallet(o)
-        if s > bestScore then best, bestScore = o, s end
-    end
-    local pg = pgui()
-    if pg then
-        for _, o in ipairs(pg:GetDescendants()) do
-            if o:IsA("TextLabel") and o.Visible and chainVisible(o.Parent) then
-                consider(o, #(o.Text:gsub("[^%d]", "")) > 0)
-            end
-        end
-    end
-    for _, root in ipairs({LP:FindFirstChild("leaderstats"), LP, RS}) do
-        if root then
-            for _, o in ipairs(root:GetDescendants()) do
-                if o:IsA("IntValue") or o:IsA("NumberValue") or o:IsA("StringValue") then
-                    consider(o, tonumber(o.Value) ~= nil)
+                if best then
+                    tries[best] = (tries[best] or 0) + 1
+                    claimed[best] = os.clock() + CFG.Dwell + 2
+                    goGrab(best, char, hrp, CFG.Dwell)
+                    if alive(best) then goGrab(best, char, hrp, CFG.Retry) end
+                    if not alive(best) then S.picked = S.picked + 1 end
+                    tries[best] = CFG.MaxTry
                 end
             end
         end
     end
-    return best
-end
-
-probeBalance = function()
-    if uiLock then return end
-    uiLock = true
-
-    local navigated = false
-    if findUnbox() then
-        STATE.onBoxPage = true
-    else
-        local before = buttonSet()
-        local ev
-        if CONFIG.UseShopButton then ev = clickShop() end
-        if not ev and (CONFIG.TabFallback or not CONFIG.UseShopButton) then ev = clickEvent() end
-        if ev then
-            task.wait(jit(1.1))
-            navigated = reachBoxPage(before) ~= nil
-            STATE.onBoxPage = navigated
-        end
-    end
-
-    candySrc = findCandySource()
-    local v = readCandy()
-    if v then STATE.candy = v end
-    if candySrc then STATE.walletName = candySrc.Name end
-    STATE.checkedOnce = true
-    STATE.lastCheck = os.clock()
-    STATE.log = string.format("balance %s/%d%s",
-        STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost,
-        (STATE.candy and STATE.candy >= CONFIG.BoxCost) and " OK" or " low")
-
-    if navigated and not STATE.open and CONFIG.CloseBeforeCycle then closeAll() end
-    uiLock = false
-end
-
-task.spawn(function()
-    task.wait(4)
-    while true do
-        local gap = CONFIG.BalanceCheckMin
-            + math.random() * (CONFIG.BalanceCheckMax - CONFIG.BalanceCheckMin)
-        task.wait(gap)
-        if os.clock() - STATE.lastCheck >= gap then probeBalance() end
-    end
 end)
-mark("wallet")
+print("[MM2] farm loop ok")
 
-local function new(class, props, parent)
-    local o = Instance.new(class)
-    for k, v in pairs(props) do o[k] = v end
-    o.Parent = parent
-    return o
-end
+--==================== UI (centred) ====================
 
-local gui = new("ScreenGui", {
-    Name = OWN_GUI_NAME, ResetOnSpawn = false, IgnoreGuiInset = true,
-}, LP:WaitForChild("PlayerGui"))
-mark("gui created")
+local gui = Instance.new("ScreenGui")
+gui.Name = OWN
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = pgui()
 
-local main = new("Frame", {
-    Size = UDim2.new(0, 310, 0, 720), Position = UDim2.new(0, 20, 0, 45),
-    BackgroundColor3 = Color3.fromRGB(20, 16, 28), BorderSizePixel = 0, Active = true,
-}, gui)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
-new("UIStroke", { Color = Color3.fromRGB(255, 140, 40), Thickness = 1.5 }, main)
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 320, 0, 540)
+frame.AnchorPoint = Vector2.new(0.5, 0.5)
+frame.Position = UDim2.new(0.5, 0, 0.5, 0)
+frame.BackgroundColor3 = Color3.fromRGB(18, 15, 26)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = gui
+local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(0, 10); fc.Parent = frame
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(255, 140, 40)
+stroke.Thickness = 1.5
+stroke.Parent = frame
 
-local header = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Color3.fromRGB(32, 22, 42),
-    Text = "  MM2 CANDY FARM", TextColor3 = Color3.fromRGB(255, 170, 70),
-    Font = Enum.Font.GothamBold, TextSize = 15,
-    TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, header)
+local head = Instance.new("TextLabel")
+head.Size = UDim2.new(1, 0, 0, 30)
+head.BackgroundColor3 = Color3.fromRGB(30, 22, 40)
+head.BorderSizePixel = 0
+head.Text = "  MM2 FARM v9  -  LOADED"
+head.TextColor3 = Color3.fromRGB(255, 175, 80)
+head.Font = Enum.Font.GothamBold
+head.TextSize = 14
+head.TextXAlignment = Enum.TextXAlignment.Left
+head.Parent = frame
+local hc = Instance.new("UICorner"); hc.CornerRadius = UDim.new(0, 10); hc.Parent = head
 
-local body = new("Frame", {
-    Size = UDim2.new(1, -20, 1, -42), Position = UDim2.new(0, 10, 0, 38),
-    BackgroundTransparency = 1,
-}, main)
-new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, -16, 1, -40)
+body.Position = UDim2.new(0, 8, 0, 34)
+body.BackgroundTransparency = 1
+body.Parent = frame
+local lay = Instance.new("UIListLayout")
+lay.Padding = UDim.new(0, 5)
+lay.SortOrder = Enum.SortOrder.LayoutOrder
+lay.Parent = body
 
-local stats = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 118), LayoutOrder = 1,
-    BackgroundColor3 = Color3.fromRGB(28, 22, 36), BorderSizePixel = 0,
-    TextColor3 = Color3.fromRGB(200, 200, 210), Font = Enum.Font.Code,
-    TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top, Text = "",
-}, body)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, stats)
-new("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 8) }, stats)
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, 0, 0, 140)
+status.LayoutOrder = 1
+status.BackgroundColor3 = Color3.fromRGB(26, 20, 34)
+status.BorderSizePixel = 0
+status.TextColor3 = Color3.fromRGB(205, 205, 215)
+status.Font = Enum.Font.Code
+status.TextSize = 11
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.Text = ""
+status.Parent = body
+local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(0, 6); sc.Parent = status
+local pad = Instance.new("UIPadding")
+pad.PaddingTop = UDim.new(0, 6)
+pad.PaddingLeft = UDim.new(0, 8)
+pad.Parent = status
 
-local function mkBtn(order, text, color, h)
-    local b = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, h or 26), LayoutOrder = order,
-        BackgroundColor3 = color, Text = text,
-        TextColor3 = Color3.fromRGB(230, 230, 235),
-        Font = Enum.Font.GothamMedium, TextSize = 12, BorderSizePixel = 0,
-    }, body)
-    new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+local order = 1
+local function mk(text, color, h)
+    order = order + 1
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, 0, 0, h or 26)
+    b.LayoutOrder = order
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(235, 235, 240)
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = 12
+    b.BorderSizePixel = 0
+    b.Parent = body
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = b
     return b
 end
 
-local function makeToggle(order, text, getter, setter)
-    local b = mkBtn(order, "", Color3.fromRGB(35, 28, 45))
+local function toggle(text, get, set)
+    local b = mk("", Color3.fromRGB(35, 28, 45))
     local function refresh()
-        b.Text = text .. ": " .. (getter() and "ON" or "OFF")
-        b.TextColor3 = getter() and Color3.fromRGB(120, 255, 140) or Color3.fromRGB(255, 110, 110)
+        b.Text = text .. ": " .. (get() and "ON" or "OFF")
+        if get() then
+            b.TextColor3 = Color3.fromRGB(120, 255, 140)
+        else
+            b.TextColor3 = Color3.fromRGB(255, 110, 110)
+        end
     end
-    b.MouseButton1Click:Connect(function() setter(not getter()); refresh() end)
+    b.MouseButton1Click:Connect(function() set(not get()); refresh() end)
     refresh()
 end
 
-makeToggle(2, "Candy Autofarm", function() return STATE.farm end, function(v) STATE.farm = v end)
-makeToggle(3, "Auto Open Box", function() return STATE.open end, function(v) STATE.open = v end)
-makeToggle(4, "Anti-kick (humanize)", function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
--- v5.2: the buy gate itself
-makeToggle(5, "Buy only if >= " .. CONFIG.BoxCost,
-    function() return CONFIG.RequireBalance end, function(v) CONFIG.RequireBalance = v end)
+toggle("Candy farm", function() return S.farm end, function(v) S.farm = v end)
+toggle("Auto open box", function() return S.open end, function(v) S.open = v end)
+toggle("Buy only if >= " .. CFG.Cost, function() return CFG.Gate end, function(v) CFG.Gate = v end)
+toggle("Click tab row if stuck", function() return CFG.TabFallback end, function(v) CFG.TabFallback = v end)
 
-local navBtn = mkBtn(6, "", Color3.fromRGB(40, 50, 65))
-local function refreshNav()
-    navBtn.Text = "Nav: " .. (CONFIG.UseShopButton and "SHOP button" or "bottom tabs") .. "  (click to change)"
-    navBtn.TextColor3 = CONFIG.UseShopButton and Color3.fromRGB(140, 220, 255) or Color3.fromRGB(255, 190, 120)
-end
-navBtn.MouseButton1Click:Connect(function()
-    CONFIG.UseShopButton = not CONFIG.UseShopButton
-    shopSrc, boxTileSrc, eventRef = nil, nil, nil
-    refreshNav()
-    STATE.log = "nav: " .. (CONFIG.UseShopButton and "SHOP" or "tabs")
-end)
-refreshNav()
-
-local pinningShop = false
-local function pickShop()
-    if pinningShop then return end
-    pinningShop = true
-    local conn
-    local function cleanup() pinningShop = false; if conn then conn:Disconnect() end end
-    task.delay(8, function() if pinningShop then cleanup(); STATE.log = "shop pick timed out" end end)
-    conn = UIS.InputBegan:Connect(function(i, gp)
-        if not pinningShop or gp then return end
-        if i.UserInputType ~= Enum.UserInputType.MouseButton1
-            and i.UserInputType ~= Enum.UserInputType.Touch then return end
-        local m = UIS:GetMouseLocation()
-        local b = pickTopButtonAt(m.X, m.Y)
-        cleanup()
-        if not b then STATE.log = "no button there"; return end
-        shopSrc = b
-        STATE.log = "shop pinned: " .. b.Name
-        print("[MM2] shop pinned: " .. b:GetFullName())
-    end)
-end
-
-mkBtn(7, "PIN SHOP BUTTON  (click the SHOP bag)", Color3.fromRGB(35, 60, 80), 30)
-    .MouseButton1Click:Connect(pickShop)
-
-local pinningTile = false
-local function pickBoxTile()
-    if pinningTile then return end
-    pinningTile = true
-    local conn
-    local function cleanup() pinningTile = false; if conn then conn:Disconnect() end end
-    task.delay(8, function() if pinningTile then cleanup(); STATE.log = "tile pick timed out" end end)
-    conn = UIS.InputBegan:Connect(function(i, gp)
-        if not pinningTile or gp then return end
-        if i.UserInputType ~= Enum.UserInputType.MouseButton1
-            and i.UserInputType ~= Enum.UserInputType.Touch then return end
-        local m = UIS:GetMouseLocation()
-        local b = pickTopButtonAt(m.X, m.Y)
-        cleanup()
-        if not b then STATE.log = "no button there"; return end
-        boxTileSrc = b
-        STATE.log = "tile pinned: " .. b.Name
-        print("[MM2] tile pinned: " .. b:GetFullName())
-    end)
-end
-
-mkBtn(8, "PIN BOX TILE  (click the Halloween Box)", Color3.fromRGB(35, 60, 80), 30)
-    .MouseButton1Click:Connect(pickBoxTile)
-
-mkBtn(9, "Check balance now", Color3.fromRGB(40, 60, 45))
-    .MouseButton1Click:Connect(function() probeBalance() end)
-
-local pinning = false
-local function pickWallet()
-    if pinning then return end
-    pinning = true
-    local conn
-    local function cleanup() pinning = false; if conn then conn:Disconnect() end end
-    task.delay(8, function() if pinning then cleanup(); STATE.log = "wallet pick timed out" end end)
-    conn = UIS.InputBegan:Connect(function(i, gp)
-        if not pinning or gp then return end
-        if i.UserInputType ~= Enum.UserInputType.MouseButton1
-            and i.UserInputType ~= Enum.UserInputType.Touch then return end
-        local m = UIS:GetMouseLocation()
-        cleanup()
-        local pg = pgui()
-        local found
-        for _, y in ipairs({m.Y, m.Y - 36}) do
-            for _, o in ipairs(pg:GetGuiObjectsAtPosition(m.X, y)) do
-                if (o:IsA("TextLabel") or o:IsA("TextButton"))
-                    and o.Visible and chainVisible(o.Parent)
-                    and #(o.Text:gsub("[^%d]", "")) > 0 then found = o; break end
+local function pickAt(mx, my)
+    local pg = pgui()
+    if not pg then return nil end
+    for _, y in ipairs({my, my - 36}) do
+        local objs = pg:GetGuiObjectsAtPosition(mx, y)
+        for i = 1, #objs do
+            local o = objs[i]
+            if o:IsA("GuiButton") and o.Visible and chainVis(o.Parent) and not own(o) then
+                return o
             end
-            if found then break end
         end
-        if not found then STATE.log = "no number label there"; return end
-        candySrc = found
-        STATE.candy = readCandy()
-        STATE.checkedOnce = true
-        STATE.walletName = found.Name
-        STATE.lastCheck = os.clock()
-        STATE.log = "wallet pinned: " .. found.Name
-    end)
-end
-
-mkBtn(10, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
-    .MouseButton1Click:Connect(pickWallet)
-
-local TABS = {1, 2, 3, 4, 5, 6, 7, 8}
-local tabBtn = mkBtn(11, "", Color3.fromRGB(50, 42, 30))
-local function refreshTab()
-    tabBtn.Text = string.format("Fallback tab #%d  (click to change)", CONFIG.BoxTabIndex)
-end
-tabBtn.MouseButton1Click:Connect(function()
-    local idx = 1
-    for i, v in ipairs(TABS) do
-        if v == CONFIG.BoxTabIndex then idx = i break end
     end
-    idx = idx % #TABS + 1
-    CONFIG.BoxTabIndex = TABS[idx]
-    boxTabIdx, boxTabName = nil, nil
-    refreshTab()
-    STATE.log = "fallback tab #" .. CONFIG.BoxTabIndex
-end)
-refreshTab()
-
-local fbBtn = mkBtn(12, "", Color3.fromRGB(50, 42, 30))
-local function refreshFallback()
-    fbBtn.Text = "Tab-row fallback: " .. (CONFIG.TabFallback and "ON" or "OFF") .. "  (click to change)"
-    fbBtn.TextColor3 = CONFIG.TabFallback and Color3.fromRGB(255, 190, 120) or Color3.fromRGB(160, 200, 255)
-end
-fbBtn.MouseButton1Click:Connect(function()
-    CONFIG.TabFallback = not CONFIG.TabFallback
-    refreshFallback()
-    STATE.log = "tab fallback: " .. (CONFIG.TabFallback and "ON" or "OFF")
-end)
-refreshFallback()
-
-local modeBtn = mkBtn(13, "", Color3.fromRGB(45, 40, 55))
-local function refreshMode()
-    modeBtn.Text = "Open flow: " .. (CONFIG.OpenMode == "builtin" and "built-in" or "recorded") .. "  (click to change)"
-end
-modeBtn.MouseButton1Click:Connect(function()
-    CONFIG.OpenMode = CONFIG.OpenMode == "builtin" and "recorded" or "builtin"
-    refreshMode()
-    STATE.log = "open flow: " .. CONFIG.OpenMode
-end)
-refreshMode()
-
-local DWELLS = {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0}
-local dwellBtn = mkBtn(14, "", Color3.fromRGB(50, 42, 30))
-local function refreshDwell()
-    dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
-end
-dwellBtn.MouseButton1Click:Connect(function()
-    local idx = 1
-    for i, v in ipairs(DWELLS) do
-        if math.abs(v - CONFIG.DwellTime) < 0.01 then idx = i break end
-    end
-    idx = idx % #DWELLS + 1
-    CONFIG.DwellTime = DWELLS[idx]
-    CONFIG.ReInteractAt = math.min(CONFIG.DwellTime * 0.3, 0.6)
-    refreshDwell()
-    STATE.log = "dwell " .. CONFIG.DwellTime .. "s"
-end)
-refreshDwell()
-
-local picking = false
-
-local function printSteps()
-    print("===== RECORDED STEPS (" .. #CONFIG.Sequence .. ") =====")
-    for i, p in ipairs(CONFIG.Sequence) do print("  " .. i .. ") " .. p) end
+    return nil
 end
 
-local function addStep()
-    if picking then return end
-    picking = true
+local function pin(what, assign)
+    S.log = "click the " .. what .. " now"
     local conn
-    local function cleanup() picking = false; if conn then conn:Disconnect() end end
-    task.delay(8, function() if picking then cleanup(); STATE.log = "pick timed out" end end)
     conn = UIS.InputBegan:Connect(function(i, gp)
-        if not picking or gp then return end
+        if gp then return end
         if i.UserInputType ~= Enum.UserInputType.MouseButton1
             and i.UserInputType ~= Enum.UserInputType.Touch then return end
         local m = UIS:GetMouseLocation()
-        local b = pickTopButtonAt(m.X, m.Y)
-        cleanup()
-        if not b then STATE.log = "no button there"; return end
-        CONFIG.Sequence[#CONFIG.Sequence + 1] = pathFromPg(b)
-        STATE.log = "step " .. #CONFIG.Sequence .. ": " .. b.Name
-        printSteps()
+        local b = pickAt(m.X, m.Y)
+        conn:Disconnect()
+        if b then
+            assign(b)
+            S.log = "pinned " .. what .. ": " .. b.Name
+            print("[MM2] pinned " .. what .. ": " .. b:GetFullName())
+        else
+            S.log = "nothing there"
+        end
     end)
 end
 
-mkBtn(15, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
-    .MouseButton1Click:Connect(addStep)
+local function refreshShopIdx()
+    shopIdxBtn.Text = "Shop = sidebar item #" .. CFG.ShopIndex .. " (click to change)"
+end
 
-mkBtn(16, "Remove last step", Color3.fromRGB(55, 45, 35))
+local shopIdxBtn
+shopIdxBtn = mk("", Color3.fromRGB(50, 42, 30))
+shopIdxBtn.MouseButton1Click:Connect(function()
+    CFG.ShopIndex = (CFG.ShopIndex % 6) + 1
+    refreshShopIdx()
+    S.log = "shop slot #" .. CFG.ShopIndex
+end)
+refreshShopIdx()
+
+mk("PIN SHOP (click the $ SHOP)", Color3.fromRGB(35, 60, 80), 30)
     .MouseButton1Click:Connect(function()
-        if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
-        local removed = table.remove(CONFIG.Sequence)
-        STATE.log = "removed: " .. removed:sub(-22)
-        printSteps()
+        pin("SHOP button", function(b)
+            shopPin = b
+            local col = sidebar()
+            for i = 1, #col do
+                if col[i] == b then CFG.ShopIndex = i; refreshShopIdx() end
+            end
+        end)
+    end)
+
+mk("PIN BOX TILE (click Halloween Box)", Color3.fromRGB(35, 60, 80), 30)
+    .MouseButton1Click:Connect(function() pin("box tile", function(b) tilePin = b end) end)
+
+mk("PIN WALLET (click candy total)", Color3.fromRGB(35, 55, 70), 30)
+    .MouseButton1Click:Connect(function()
+        pin("wallet total", function(b)
+            walletEl = b
+            S.candy = readCandy()
+            S.walletName = b.Name
+        end)
+    end)
+
+mk("NAV TEST (1 pass, no buy)", Color3.fromRGB(45, 40, 55))
+    .MouseButton1Click:Connect(function()
+        task.spawn(function()
+            S.log = "nav test..."
+            if not S.onBox then
+                if not navFromWorld() then return end
+            end
+            local u = waitUnbox(1.5)
+            local t, how = findTile()
+            print("[MM2] nav test: unbox=" .. (u and u.Name or "nil")
+                .. " tile=" .. (t and t:GetFullName() or "nil") .. " via " .. how)
+            S.log = "test: tile " .. how
+        end)
+    end)
+
+mk("Dump buttons", Color3.fromRGB(45, 40, 55))
+    .MouseButton1Click:Connect(function()
+        local vis = buttons()
+        for i = 1, #vis do
+            print(string.format("   %-26s pos=(%d,%d) size=(%d,%d) label=%s",
+                vis[i].Name, math.floor(vis[i].AbsolutePosition.X),
+                math.floor(vis[i].AbsolutePosition.Y),
+                math.floor(vis[i].AbsoluteSize.X), math.floor(vis[i].AbsoluteSize.Y),
+                labelDeep(vis[i]):sub(1, 30)))
+        end
+    end)
+
+mk("Clear pins", Color3.fromRGB(50, 42, 30))
+    .MouseButton1Click:Connect(function()
+        shopPin, tilePin, walletEl = nil, nil, nil
+        S.shopName, S.tileName = "NONE", "NONE"
+        S.log = "pins cleared"
     end)
 
 do
     local dragging, startPos, startInput
-    header.InputBegan:Connect(function(i)
+    head.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1
             or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = true; startInput = i.Position; startPos = main.Position
+            dragging = true
+            startInput = i.Position
+            startPos = frame.Position
         end
     end)
-    header.InputEnded:Connect(function(i)
+    head.InputEnded:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1
-            or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
     end)
     UIS.InputChanged:Connect(function(i)
         if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
             or i.UserInputType == Enum.UserInputType.Touch) then
             local d = i.Position - startInput
-            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
                 startPos.Y.Scale, startPos.Y.Offset + d.Y)
         end
     end)
 end
-mark("buttons")
 
 task.spawn(function()
-    local lastText = ""
+    local last = ""
     while task.wait(0.5) do
-        local run = os.clock() - STATE.started
-        local since = STATE.lastCheck > 0
-            and string.format("%dm%02ds", math.floor((os.clock() - STATE.lastCheck) / 60),
-                math.floor((os.clock() - STATE.lastCheck) % 60)) or "never"
-        local gate = STATE.force and "FORCED"
-            or (not CONFIG.RequireBalance and "off")
-            or (STATE.waiting and "WAITING") or "armed"
+        local gate
+        if S.force then gate = "FORCED"
+        elseif not CFG.Gate then gate = "off"
+        elseif S.waiting then gate = "WAITING"
+        else gate = "armed" end
         local txt = string.format(
-            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   steps: %d\ngate    : %s  (%s)\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
-            STATE.collected, STATE.skipped, STATE.hops,
-            STATE.hops / math.max(run, 0.001),
-            math.floor(run / 60), math.floor(run % 60),
-            STATE.boxes, #CONFIG.Sequence, gate,
-            STATE.candy and (STATE.candy >= CONFIG.BoxCost and "can buy" or "too low") or "unknown",
-            STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost, since,
-            (STATE.walletName or "?"):sub(1, 28),
-            (STATE.log or ""):sub(1, 30))
-        if txt ~= lastText then lastText = txt; stats.Text = txt end
+            "picked : %d   boxes: %d\ngate   : %s\nbalance: %s / %d\non page: %s  miss:%d\nshop   : %s [%s]\ntile   : %s [%s]\nlog    : %s",
+            S.picked, S.boxes, gate,
+            S.candy and tostring(S.candy) or "?", CFG.Cost,
+            S.onBox and "YES" or "no", S.miss,
+            (S.shopName or "NONE"):sub(1, 18), S.shopHow,
+            (S.tileName or "-"):sub(1, 18), S.tileHow,
+            (S.log or ""):sub(1, 32))
+        if txt ~= last then last = txt; status.Text = txt end
     end
 end)
 
 UIS.InputBegan:Connect(function(i, gp)
     if gp then return end
-    if i.KeyCode == CONFIG.Keybinds.UI then main.Visible = not main.Visible
-    elseif i.KeyCode == CONFIG.Keybinds.Farm then STATE.farm = not STATE.farm
-    elseif i.KeyCode == CONFIG.Keybinds.Open then STATE.open = not STATE.open
-    elseif i.KeyCode == CONFIG.Keybinds.Force then STATE.force = not STATE.force end
-end)
-
-task.spawn(function()
-    task.wait(3)
-    local vis = visibleButtons()
-    print("[MM2] DUMP visible buttons: " .. #vis)
-    for _, b in ipairs(vis) do
-        print(string.format("   %-28s pos=(%d,%d) size=(%d,%d) label=%s",
-            b.Name, math.floor(b.AbsolutePosition.X), math.floor(b.AbsolutePosition.Y),
-            math.floor(b.AbsoluteSize.X), math.floor(b.AbsoluteSize.Y),
-            labelDeep(b):sub(1, 40)))
+    if i.KeyCode == Enum.KeyCode.RightShift then
+        frame.Visible = not frame.Visible
+    elseif i.KeyCode == Enum.KeyCode.F1 then
+        S.farm = not S.farm
+    elseif i.KeyCode == Enum.KeyCode.F2 then
+        S.open = not S.open
+    elseif i.KeyCode == Enum.KeyCode.F3 then
+        S.force = not S.force
     end
-    local row = bottomRow(vis)
-    print("[MM2] DUMP bottom row: " .. #row)
-    for i, b in ipairs(row) do print(string.format("   %d) %s", i, b.Name)) end
 end)
-mark("input + dump")
 
-end -- BOOT
-
-local ok, err = xpcall(BOOT, function(e) return tostring(e) .. "\n" .. debug.traceback("", 2) end)
-
-if not ok then
-    print("[MM2] FATAL: " .. tostring(err))
-    pcall(function()
-        local pg = game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        if not pg then return end
-        local sg = Instance.new("ScreenGui")
-        sg.Name = "MM2CandyFarm_ERR"; sg.ResetOnSpawn = false; sg.Parent = pg
-        local f = Instance.new("Frame")
-        f.Size = UDim2.new(0, 470, 0, 240)
-        f.Position = UDim2.new(0.5, -235, 0, 80)
-        f.BackgroundColor3 = Color3.fromRGB(70, 14, 14)
-        f.BorderSizePixel = 0; f.Parent = sg
-        local t = Instance.new("TextLabel")
-        t.Size = UDim2.new(1, -20, 1, -20); t.Position = UDim2.new(0, 10, 0, 10)
-        t.BackgroundTransparency = 1; t.TextColor3 = Color3.fromRGB(255, 210, 210)
-        t.Font = Enum.Font.Code; t.TextSize = 12; t.TextWrapped = true
-        t.TextXAlignment = Enum.TextXAlignment.Left
-        t.TextYAlignment = Enum.TextYAlignment.Top
-        t.Text = "[MM2] " .. VERSION .. " script error:\n\n" .. tostring(err)
-        t.Parent = f
-    end)
-end
-
-print("[MM2] === LOAD COMPLETE " .. VERSION .. " ===")
+print("[MM2] === v9 LOAD COMPLETE ===")
