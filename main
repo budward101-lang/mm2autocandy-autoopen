@@ -5,20 +5,14 @@
 --============================================================
 
 local CFG = {
-	Tween         = 25,                 -- studs per second
-	Hold          = 0.10,               -- seconds parked on a candy
-	MaxSize       = 8,                  -- ignore map parts bigger than this
-	AntiAFK       = true,
-	Mode          = "Remote",           -- Remote | GUI
-	Crate         = "Halloween2026Box", -- arg 1 (captured from OpenCrate)
-	BoxType       = "MysteryBox",       -- arg 2
-	Pay           = "Candies2026",      -- arg 3 (currency)
-	-- collection tuning
-	MaxTween      = 1.2,                -- seconds, hard cap on one tween
-	SnapBeyond    = 250,                -- studs; farther than this = teleport instead of tween
-	MaxRise       = 80,                 -- reject parts this far above the candy median (skybox)
-	VoidDrop      = 120,                -- if we fall this far below the candies, snap back
-	ScanRate      = 0.20,               -- seconds between full scans
+	Tween     = 25,                 -- studs per second
+	Hold      = 0.10,               -- seconds parked on a candy
+	MaxSize   = 8,                  -- ignore map parts bigger than this
+	AntiAFK   = true,
+	Mode      = "Remote",           -- Remote | GUI
+	Crate     = "Halloween2026Box", -- arg 1 (captured from OpenCrate)
+	BoxType   = "MysteryBox",       -- arg 2
+	Pay       = "Candies2026",      -- arg 3 (currency)
 }
 
 local P   = game:GetService("Players")
@@ -26,7 +20,6 @@ local RS  = game:GetService("ReplicatedStorage")
 local TS  = game:GetService("TweenService")
 local UIS = game:GetService("UserInputService")
 local RUN = game:GetService("RunService")
-local CS  = game:GetService("CollectionService")
 local VU  = game:GetService("VirtualUser")
 local lp  = P.LocalPlayer
 
@@ -35,16 +28,9 @@ local lastRarity = "-"
 local started = os.clock()
 local status
 
+-- resolved once, hardcoded path (findRemotes() order is not stable)
 local Shop      = RS:WaitForChild("Remotes"):WaitForChild("Shop")
 local OpenCrate = Shop:WaitForChild("OpenCrate")
-
-local moving  = false      -- true while a grab owns the CFrame
-local holdCF  = nil        -- CFrame to pin the character to while parked
-
-local function getHRP()
-	local ch = lp.Character
-	return ch and ch:FindFirstChild("HumanoidRootPart")
-end
 
 --==================== BUILD UI ====================
 local function new(c, props, parent)
@@ -107,7 +93,7 @@ new("UIPadding", { PaddingTop = UDim.new(0, 5), PaddingLeft = UDim.new(0, 7) }, 
 local farmBtn = btn("Farm Candy: OFF", 1)
 local boxBtn  = btn("Open Halloween Box", 2, Color3.fromRGB(70, 40, 95))
 local modeBtn = btn("Box Mode: Remote", 3)
-local scanBtn = btn("Scan Candies + Remotes", 4)
+local scanBtn = btn("Scan Remotes + Buttons", 4)
 
 status = new("TextLabel", {
 	Size = UDim2.new(1, 0, 0, 46), LayoutOrder = 5,
@@ -162,134 +148,44 @@ RUN.Stepped:Connect(function()
 end)
 
 --==================== CANDY ====================
--- Candies spawn in place of Coins during rounds; collected by touch.
--- Detection is attribute-first so decorations named "candy"/"coin" don't get targeted.
-
-local function candyAttr(d)
-	local id = d:GetAttribute("CoinID")
-	if id ~= nil then
-		return tostring(id):lower():find("candy", 1, true) ~= nil
-	end
-	return nil
-end
-
-local function tagHasCandy(d)
-	for _, t in ipairs(CS:GetTags(d)) do
-		local tl = t:lower()
-		if tl:find("candy", 1, true) or tl:find("coin", 1, true) then return true end
-	end
-	return false
-end
-
 local function isCandy(d)
 	if not d:IsA("BasePart") then return false end
-	local m = d:FindFirstAncestorOfClass("Model")
-	if m and P:GetPlayerFromCharacter(m) then return false end
+	local id = d:GetAttribute("CoinID")
+	if id then return id == "Candy" end
+	local n = d.Name:lower()
+	if not (n:find("candy", 1, true) or n:find("coin", 1, true)) then return false end
 	local s = d.Size
 	if math.max(s.X, s.Y, s.Z) > CFG.MaxSize then return false end
-
-	local attr = candyAttr(d)
-	if attr ~= nil then return attr end       -- authoritative when the game sets it
-	if tagHasCandy(d) then return true end
-	local n = d.Name:lower()
-	return n:find("candy", 1, true) ~= nil or n:find("coin", 1, true) ~= nil
+	local m = d:FindFirstAncestorOfClass("Model")
+	if m and P:GetPlayerFromCharacter(m) then return false end
+	return true
 end
 
--- find the folder/model that actually holds the candies (don't scan all of workspace)
-local scopeCache, scopeAt
-local function candyScope()
-	if scopeCache and scopeCache.Parent and os.clock() - scopeAt < 5 then
-		return scopeCache
-	end
-	local best, bestN
-	for _, d in ipairs(workspace:GetChildren()) do
-		if d:IsA("Folder") or d:IsA("Model") then
-			local n = 0
-			for _, x in ipairs(d:GetDescendants()) do
-				if x:IsA("BasePart") and x:GetAttribute("CoinID") ~= nil then n = n + 1 end
-			end
-			if n > 0 and (not bestN or n > bestN) then best, bestN = d, n end
-		end
-	end
-	scopeCache, scopeAt = best or workspace, os.clock()
-	return scopeCache
-end
-
-local function scanCandy()
-	local scope = candyScope()
+local function findCandy()
+	local scope = workspace:FindFirstChild("CoinContainer", true) or workspace
 	local out = {}
 	for _, d in ipairs(scope:GetDescendants()) do
 		if isCandy(d) then out[#out + 1] = d end
 	end
-	if #out < 3 then return out end
-
-	-- reject vertical outliers (skybox / props floating way above the pickups)
-	local ys = {}
-	for i, c in ipairs(out) do ys[i] = c.Position.Y end
-	table.sort(ys)
-	local medY = ys[math.max(1, math.ceil(#ys / 2))]
-	local keep = {}
-	for _, c in ipairs(out) do
-		local dy = c.Position.Y - medY
-		if dy <= CFG.MaxRise and dy >= -CFG.MaxRise then keep[#keep + 1] = c end
-	end
-	return keep
+	return out
 end
 
--- throttled scan + drop dead refs
-local list, listAt = {}, 0
-local function candies()
-	if os.clock() - listAt > CFG.ScanRate then
-		list, listAt = scanCandy(), os.clock()
-	end
-	local live = {}
-	for _, c in ipairs(list) do if c.Parent then live[#live + 1] = c end end
-	list = live
-	return live
-end
-
---==================== MOVEMENT ====================
--- noclip means nothing supports the character, so we pin it while parked.
-
-RUN.RenderStepped:Connect(function()
-	if not farmOn or moving or not holdCF then return end
-	local hrp = getHRP()
-	if not hrp then return end
-	hrp.CFrame = holdCF
-	hrp.AssemblyLinearVelocity  = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
-end)
-
+-- tween onto the candy, park, then nudge so the touch always lands
 local function grab(part, hrp)
-	moving = true
-
 	local dist = (part.Position - hrp.Position).Magnitude
-	local dest = CFrame.new(part.Position)
+	local tw = TS:Create(hrp,
+		TweenInfo.new(math.max(dist / CFG.Tween, 0.04), Enum.EasingStyle.Linear),
+		{ CFrame = CFrame.new(part.Position) })
+	tw:Play()
+	tw.Completed:Wait()
 
-	if dist > CFG.SnapBeyond then
-		hrp.CFrame = dest                                  -- too far to tween slowly
-	else
-		local dur = math.clamp(dist / CFG.Tween, 0.05, CFG.MaxTween)
-		local tw = TS:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = dest })
-		tw:Play()
-		local t0 = os.clock()
-		repeat RUN.RenderStepped:Wait() until os.clock() - t0 >= dur
-	end
-
-	if not part.Parent then                                -- candy got taken mid-flight
-		holdCF = hrp.CFrame
-		moving = false
-		return false
-	end
-
-	-- nudge to force the Touched, then settle
-	hrp.CFrame = part.CFrame * CFrame.new(0, 0.8, 0)
-	task.wait(0.03)
-	hrp.CFrame = part.CFrame
-	hrp.AssemblyLinearVelocity  = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
-	holdCF = hrp.CFrame
+	if not part.Parent then return end
 	task.wait(CFG.Hold)
+	if part.Parent then
+		hrp.CFrame = part.CFrame * CFrame.new(0, 0.8, 0)
+		task.wait(0.03)
+		hrp.CFrame = part.CFrame
+	end
 
 	for _, x in ipairs(part:GetDescendants()) do
 		if x:IsA("ProximityPrompt") then
@@ -304,36 +200,24 @@ local function grab(part, hrp)
 			pcall(fireclickdetector, x)
 		end
 	end
-
-	moving = false
-	return not part.Parent
 end
 
 task.spawn(function()
-	while task.wait(0.05) do
+	while task.wait() do
 		if farmOn then
-			local hrp = getHRP()
+			local ch = lp.Character
+			local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
 			if hrp then
-				local cs = candies()
-				if #cs > 0 then
-					-- void watchdog: if we dropped below the pickups, snap to the nearest
-					local sumY = 0
-					for _, c in ipairs(cs) do sumY = sumY + c.Position.Y end
-					if hrp.Position.Y < (sumY / #cs) - CFG.VoidDrop then
-						holdCF = nil
-						hrp.CFrame = CFrame.new(cs[1].Position)
-					end
-
+				local list = findCandy()
+				if #list > 0 then
 					local best, bd
-					for _, c in ipairs(cs) do
+					for _, c in ipairs(list) do
 						local d = (c.Position - hrp.Position).Magnitude
 						if not bd or d < bd then best, bd = c, d end
 					end
-
-					local ok, got = pcall(grab, best, hrp)
-					if ok and got then picked = picked + 1 end
+					local ok = pcall(grab, best, hrp)
+					if ok and not best.Parent then picked = picked + 1 end
 				else
-					holdCF = hrp.CFrame                      -- pin in place, don't drift
 					task.wait(0.1)
 				end
 			else
@@ -343,9 +227,10 @@ task.spawn(function()
 	end
 end)
 
-lp.CharacterAdded:Connect(function() holdCF, moving = nil, false end)
-
 --==================== BOX ====================
+-- Real opener: ReplicatedStorage.Remotes.Shop.OpenCrate (RemoteFunction)
+-- Args captured from the live game: (crate, boxType, currency)
+
 local function visibleButtons()
 	local out = {}
 	local p = lp:FindFirstChildOfClass("PlayerGui")
@@ -383,13 +268,19 @@ local function openBox()
 		local ok, result = pcall(function()
 			return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
 		end)
-		if not ok then return "invoke errored: " .. tostring(result) end
+
+		if not ok then
+			return "invoke errored: " .. tostring(result)
+		end
+
 		if type(result) == "table" then
 			boxes = boxes + 1
 			lastRarity = tostring(result.Rarity or "?")
 			print("[MM2] rolled:", result.Rarity, result.Name or result.Item or "?")
 			return "opened - rarity: " .. lastRarity
 		end
+
+		-- nil / non-table return = server refused the roll (usually not enough Candies2026)
 		return "returned " .. tostring(result) .. " (nil = open failed, check Candies2026)"
 	else
 		local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
@@ -401,7 +292,6 @@ end
 --==================== BUTTONS ====================
 farmBtn.MouseButton1Click:Connect(function()
 	farmOn = not farmOn
-	if not farmOn then holdCF = nil end
 	farmBtn.Text = "Farm Candy: " .. (farmOn and "ON" or "OFF")
 	farmBtn.BackgroundColor3 = farmOn and Color3.fromRGB(26, 120, 60)
 		or Color3.fromRGB(46, 34, 62)
@@ -421,16 +311,17 @@ modeBtn.MouseButton1Click:Connect(function()
 end)
 
 scanBtn.MouseButton1Click:Connect(function()
-	local cs = scanCandy()
-	print(("===== CANDY CANDIDATES: %d ====="):format(#cs))
-	for i = 1, math.min(#cs, 20) do
-		local c = cs[i]
-		print(i, c:GetFullName(), "CoinID=", tostring(c:GetAttribute("CoinID")), "size=", tostring(c.Size))
-	end
-	print("scope:", candyScope():GetFullName())
 	print("===== SHOP REMOTES =====")
-	for _, x in ipairs(Shop:GetChildren()) do print(x.ClassName, x:GetFullName()) end
-	say(("candies: %d | scope: %s - check console"):format(#cs, candyScope():GetFullName()))
+	for _, x in ipairs(Shop:GetChildren()) do
+		print(x.ClassName, x:GetFullName())
+	end
+	print("===== VISIBLE GUI BUTTONS =====")
+	local b = visibleButtons()
+	for i, x in ipairs(b) do
+		print(i, x:GetFullName(), x:IsA("TextButton") and x.Text or "")
+	end
+	if #b == 0 then print("none") end
+	say(("shop: %d remote(s), gui: %d button(s) - check console"):format(#Shop:GetChildren(), #b))
 end)
 
 --==================== STATS ====================
