@@ -1,11 +1,11 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026 — CANDY AUTOFARM + AUTO OPEN BOX
---  v5.1-debug: xpcall wrapped, staged prints, error box, button dump
+--  v5.2: buy gate - only Unbox/Confirm when live balance >= BoxCost
 --  Nav = SHOP (image 2) -> Halloween Box tile (image 3) -> Unbox
 --  Bottom tab row (image 1) = fallback only
 --=============================================================
 
-local VERSION = "v5.1-debug"
+local VERSION = "v5.2"
 print("[MM2] " .. VERSION .. " starting")
 print(string.format("[MM2] executor: getconnections=%s firesignal=%s fireproximityprompt=%s fireclickdetector=%s",
     tostring(getconnections ~= nil), tostring(firesignal ~= nil),
@@ -45,7 +45,7 @@ local CONFIG = {
     AutoFarm      = true,
     AutoOpen      = true,
     BoxCost       = 600,
-    RequireBalance = true,
+    RequireBalance = true,         -- v5.2: the buy gate (needs balance >= BoxCost)
     CycleCooldown = 3.0,
 
     WalletKeywords  = {"wallet", "candy", "sweet", "balance", "currency",
@@ -99,7 +99,7 @@ local STATE = {
     collected = 0, hops = 0, boxes = 0, skipped = 0,
     started = os.clock(), candy = nil, checkedOnce = false,
     lastCheck = 0, log = "starting...", walletName = "?",
-    onBoxPage = false,
+    onBoxPage = false, waiting = false,
 }
 local attempts, claimed = {}, {}
 
@@ -655,6 +655,17 @@ local function dismissReward()
     return false
 end
 
+-- v5.2: the buy gate. Live read off the box page when we have it, cached value
+-- otherwise. Unknown balance = not affordable (park and wait, never guess).
+local function affordable()
+    if STATE.force then return true end
+    if not CONFIG.RequireBalance then return true end
+    local bal = readCandy()
+    if bal then STATE.candy = bal end
+    if not bal then bal = STATE.candy end
+    return bal ~= nil and bal >= CONFIG.BoxCost
+end
+
 local function tabUsable(b)
     return b and b.Parent and b.Visible and chainVisible(b.Parent)
 end
@@ -740,14 +751,20 @@ local function unboxAndBuy(unbox)
     if buy then
         STATE.log = "buy: " .. buy.Name
         task.wait(jit(1.2))
+        local after = readCandy()          -- v5.2: keep the gate value fresh
+        if after then STATE.candy = after
+        elseif before then STATE.candy = math.max(0, before - CONFIG.BoxCost) end
         return true
     end
+
     task.wait(jit(1.0))
     local after = readCandy()
     if before and after and after < before then
         STATE.log = "opened (no confirm step)"
+        STATE.candy = after
     else
         STATE.log = "unbox fired - no confirm found"
+        if before then STATE.candy = math.max(0, before - CONFIG.BoxCost) end
     end
     return true
 end
@@ -755,12 +772,20 @@ end
 local function runBoxCycle()
     uiLock = true
 
+    -- fast path: page already open -> gate first, then unbox
     if STATE.onBoxPage then
+        if not affordable() then
+            STATE.log = string.format("have %s/%d - not buying",
+                STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost)
+            STATE.waiting = true
+            uiLock = false
+            return false
+        end
         local unbox = findUnbox()
         if not unbox and dismissReward() then unbox = waitForUnbox(1.0) end
         if unbox and unboxAndBuy(unbox) then
             STATE.boxes += 1
-            if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
+            STATE.waiting = false
             uiLock = false
             return true
         end
@@ -787,6 +812,7 @@ local function runBoxCycle()
         return false
     end
 
+    -- the account total is on this page: read it, then gate on it
     candySrc = findCandySource()
     local bal = readCandy()
     if bal then
@@ -795,10 +821,19 @@ local function runBoxCycle()
         STATE.lastCheck = os.clock()
     end
 
+    if not affordable() then
+        STATE.log = string.format("have %s/%d - page open, waiting",
+            STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost)
+        STATE.waiting = true
+        STATE.onBoxPage = true          -- stay here, next cycle re-checks
+        uiLock = false
+        return false
+    end
+
     unboxAndBuy(unbox)
 
     STATE.boxes += 1
-    if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
+    STATE.waiting = false
     STATE.onBoxPage = true
     uiLock = false
     return true
@@ -851,11 +886,12 @@ task.spawn(function()
         if uiLock then continue end
         if os.clock() - lastCycle < jit(CONFIG.CycleCooldown) then continue end
 
-        if CONFIG.RequireBalance and not STATE.force then
-            if not STATE.checkedOnce then continue end
-            local c = STATE.candy
-            if c and c < CONFIG.BoxCost then
-                STATE.log = string.format("balance %d/%d - waiting", c, CONFIG.BoxCost)
+        -- cheap early-out before touching any UI
+        if not affordable() and not STATE.onBoxPage then
+            if STATE.candy and STATE.candy < CONFIG.BoxCost then
+                STATE.log = string.format("have %d/%d - waiting", STATE.candy, CONFIG.BoxCost)
+                STATE.waiting = true
+                lastCycle = os.clock()
                 continue
             end
         end
@@ -967,7 +1003,9 @@ probeBalance = function()
     if candySrc then STATE.walletName = candySrc.Name end
     STATE.checkedOnce = true
     STATE.lastCheck = os.clock()
-    STATE.log = "wallet: " .. (STATE.candy and tostring(STATE.candy) or "?") .. "/" .. CONFIG.BoxCost
+    STATE.log = string.format("balance %s/%d%s",
+        STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost,
+        (STATE.candy and STATE.candy >= CONFIG.BoxCost) and " OK" or " low")
 
     if navigated and not STATE.open and CONFIG.CloseBeforeCycle then closeAll() end
     uiLock = false
@@ -997,7 +1035,7 @@ local gui = new("ScreenGui", {
 mark("gui created")
 
 local main = new("Frame", {
-    Size = UDim2.new(0, 310, 0, 700), Position = UDim2.new(0, 20, 0, 50),
+    Size = UDim2.new(0, 310, 0, 720), Position = UDim2.new(0, 20, 0, 45),
     BackgroundColor3 = Color3.fromRGB(20, 16, 28), BorderSizePixel = 0, Active = true,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
@@ -1018,7 +1056,7 @@ local body = new("Frame", {
 new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, body)
 
 local stats = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 104), LayoutOrder = 1,
+    Size = UDim2.new(1, 0, 0, 118), LayoutOrder = 1,
     BackgroundColor3 = Color3.fromRGB(28, 22, 36), BorderSizePixel = 0,
     TextColor3 = Color3.fromRGB(200, 200, 210), Font = Enum.Font.Code,
     TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
@@ -1051,8 +1089,11 @@ end
 makeToggle(2, "Candy Autofarm", function() return STATE.farm end, function(v) STATE.farm = v end)
 makeToggle(3, "Auto Open Box", function() return STATE.open end, function(v) STATE.open = v end)
 makeToggle(4, "Anti-kick (humanize)", function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
+-- v5.2: the buy gate itself
+makeToggle(5, "Buy only if >= " .. CONFIG.BoxCost,
+    function() return CONFIG.RequireBalance end, function(v) CONFIG.RequireBalance = v end)
 
-local navBtn = mkBtn(5, "", Color3.fromRGB(40, 50, 65))
+local navBtn = mkBtn(6, "", Color3.fromRGB(40, 50, 65))
 local function refreshNav()
     navBtn.Text = "Nav: " .. (CONFIG.UseShopButton and "SHOP button" or "bottom tabs") .. "  (click to change)"
     navBtn.TextColor3 = CONFIG.UseShopButton and Color3.fromRGB(140, 220, 255) or Color3.fromRGB(255, 190, 120)
@@ -1086,7 +1127,7 @@ local function pickShop()
     end)
 end
 
-mkBtn(6, "PIN SHOP BUTTON  (click the SHOP bag)", Color3.fromRGB(35, 60, 80), 30)
+mkBtn(7, "PIN SHOP BUTTON  (click the SHOP bag)", Color3.fromRGB(35, 60, 80), 30)
     .MouseButton1Click:Connect(pickShop)
 
 local pinningTile = false
@@ -1110,10 +1151,10 @@ local function pickBoxTile()
     end)
 end
 
-mkBtn(7, "PIN BOX TILE  (click the Halloween Box)", Color3.fromRGB(35, 60, 80), 30)
+mkBtn(8, "PIN BOX TILE  (click the Halloween Box)", Color3.fromRGB(35, 60, 80), 30)
     .MouseButton1Click:Connect(pickBoxTile)
 
-mkBtn(8, "Check balance now", Color3.fromRGB(40, 60, 45))
+mkBtn(9, "Check balance now", Color3.fromRGB(40, 60, 45))
     .MouseButton1Click:Connect(function() probeBalance() end)
 
 local pinning = false
@@ -1149,11 +1190,11 @@ local function pickWallet()
     end)
 end
 
-mkBtn(9, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
+mkBtn(10, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
     .MouseButton1Click:Connect(pickWallet)
 
 local TABS = {1, 2, 3, 4, 5, 6, 7, 8}
-local tabBtn = mkBtn(10, "", Color3.fromRGB(50, 42, 30))
+local tabBtn = mkBtn(11, "", Color3.fromRGB(50, 42, 30))
 local function refreshTab()
     tabBtn.Text = string.format("Fallback tab #%d  (click to change)", CONFIG.BoxTabIndex)
 end
@@ -1170,7 +1211,7 @@ tabBtn.MouseButton1Click:Connect(function()
 end)
 refreshTab()
 
-local fbBtn = mkBtn(11, "", Color3.fromRGB(50, 42, 30))
+local fbBtn = mkBtn(12, "", Color3.fromRGB(50, 42, 30))
 local function refreshFallback()
     fbBtn.Text = "Tab-row fallback: " .. (CONFIG.TabFallback and "ON" or "OFF") .. "  (click to change)"
     fbBtn.TextColor3 = CONFIG.TabFallback and Color3.fromRGB(255, 190, 120) or Color3.fromRGB(160, 200, 255)
@@ -1182,7 +1223,7 @@ fbBtn.MouseButton1Click:Connect(function()
 end)
 refreshFallback()
 
-local modeBtn = mkBtn(12, "", Color3.fromRGB(45, 40, 55))
+local modeBtn = mkBtn(13, "", Color3.fromRGB(45, 40, 55))
 local function refreshMode()
     modeBtn.Text = "Open flow: " .. (CONFIG.OpenMode == "builtin" and "built-in" or "recorded") .. "  (click to change)"
 end
@@ -1194,7 +1235,7 @@ end)
 refreshMode()
 
 local DWELLS = {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0}
-local dwellBtn = mkBtn(13, "", Color3.fromRGB(50, 42, 30))
+local dwellBtn = mkBtn(14, "", Color3.fromRGB(50, 42, 30))
 local function refreshDwell()
     dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
 end
@@ -1238,10 +1279,10 @@ local function addStep()
     end)
 end
 
-mkBtn(14, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+mkBtn(15, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
     .MouseButton1Click:Connect(addStep)
 
-mkBtn(15, "Remove last step", Color3.fromRGB(55, 45, 35))
+mkBtn(16, "Remove last step", Color3.fromRGB(55, 45, 35))
     .MouseButton1Click:Connect(function()
         if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
         local removed = table.remove(CONFIG.Sequence)
@@ -1279,12 +1320,16 @@ task.spawn(function()
         local since = STATE.lastCheck > 0
             and string.format("%dm%02ds", math.floor((os.clock() - STATE.lastCheck) / 60),
                 math.floor((os.clock() - STATE.lastCheck) % 60)) or "never"
+        local gate = STATE.force and "FORCED"
+            or (not CONFIG.RequireBalance and "off")
+            or (STATE.waiting and "WAITING") or "armed"
         local txt = string.format(
-            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   steps: %d\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
+            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   steps: %d\ngate    : %s  (%s)\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
             STATE.collected, STATE.skipped, STATE.hops,
             STATE.hops / math.max(run, 0.001),
             math.floor(run / 60), math.floor(run % 60),
-            STATE.boxes, #CONFIG.Sequence,
+            STATE.boxes, #CONFIG.Sequence, gate,
+            STATE.candy and (STATE.candy >= CONFIG.BoxCost and "can buy" or "too low") or "unknown",
             STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost, since,
             (STATE.walletName or "?"):sub(1, 28),
             (STATE.log or ""):sub(1, 30))
@@ -1300,7 +1345,6 @@ UIS.InputBegan:Connect(function(i, gp)
     elseif i.KeyCode == CONFIG.Keybinds.Force then STATE.force = not STATE.force end
 end)
 
--- debug: dump what the nav actually sees, 3s after load
 task.spawn(function()
     task.wait(3)
     local vis = visibleButtons()
