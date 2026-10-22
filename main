@@ -1,10 +1,11 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026 — CANDY FARM + AUTO OPEN BOX
---  v13: event button fully removed from the tile candidates.
+--  v14: no random clicking. Scoped + scored action/confirm search,
+--       event button removed, verified tile click, balance gate.
 --  RightShift UI | F1 farm | F2 open | F3 force
 --=============================================================
 
-print("[MM2] v13 booting")
+print("[MM2] v14 booting")
 
 local Players = game:GetService("Players")
 local UIS     = game:GetService("UserInputService")
@@ -15,9 +16,9 @@ print("[MM2] services ok")
 local CFG = {
     Speed = 20, Dwell = 3.0, Retry = 2.0, MaxTry = 3, Tick = 0.1, Rescan = 3.0,
     Cost = 600, Gate = true, BuyIfUnknown = true,
-    TabFallback = false,            -- off. Radio/Modes/Event stay untouched.
-    IgnoreEvent = true,             -- v13: never consider event buttons as the tile
-    EventFallback = false,          -- if true, use event buttons only when nothing else exists
+    TabFallback = false,
+    IgnoreEvent = true,             -- never consider event buttons as the tile
+    EventFallback = false,          -- only use them if literally nothing else exists
     ShopBand = 0.15, ShopMin = 60, ShopIndex = 2,
     ShopKW  = {"shop", "store"},
     TileKW  = {"halloween", "mystery", "box", "26"},
@@ -34,11 +35,12 @@ local S = {
     farm = true, open = true, force = false,
     onBox = false, waiting = false, candy = nil, miss = 0,
     boxes = 0, picked = 0, log = "boot", walletName = "?",
-    shopName = "NONE", shopHow = "-", tileName = "-", tileHow = "-", busy = false,
+    shopName = "NONE", shopHow = "-", tileName = "-", tileHow = "-",
+    lastClick = "-", busy = false,
 }
 print("[MM2] config ok")
 
-local OWN = "MM2FarmV13"
+local OWN = "MM2FarmV14"
 
 local function pgui()
     local p = LP:FindFirstChildOfClass("PlayerGui")
@@ -86,6 +88,13 @@ local function label(b)
     return b.Name
 end
 
+-- the button's own visible text (falls back to name), trimmed + lowercased
+local function textOnly(b)
+    local t = b:IsA("TextButton") and b.Text or ""
+    if t == "" then t = b.Name end
+    return (t:lower():gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
 local function labelDeep(b)
     local s = label(b)
     local n = 0
@@ -123,11 +132,30 @@ local function inBottom(b)
     return b.AbsolutePosition.Y >= vpY() * CFG.BottomY
 end
 
+-- left nav band
+local function inSidebar(b)
+    return (b.AbsolutePosition.X + b.AbsoluteSize.X * 0.5) / vpX() < CFG.ShopBand
+end
+
 local function bodyButtons()
     local out = {}
     local all = buttons()
     for i = 1, #all do
         if not inBottom(all[i]) then out[#out + 1] = all[i] end
+    end
+    return out
+end
+
+-- content area only: no sidebar, not the very bottom quick-bar
+local function actionButtons()
+    local out = {}
+    local all = buttons()
+    local lim = vpY() * 0.90
+    for i = 1, #all do
+        local b = all[i]
+        if not inSidebar(b) and b.AbsolutePosition.Y < lim then
+            out[#out + 1] = b
+        end
     end
     return out
 end
@@ -153,8 +181,11 @@ local function findKW(list, kws, deep)
     return nil
 end
 
+local lastClickBtn, lastClickAt = nil, 0
 local function click(b)
     if not b or not b.Parent then return false end
+    if b == lastClickBtn and os.clock() - lastClickAt < 0.35 then return true end
+    lastClickBtn, lastClickAt = b, os.clock()
     pcall(function() b.Active = true end)
     if getconnections then
         local done = false
@@ -283,7 +314,7 @@ local function canBuy()
 end
 print("[MM2] wallet ok")
 
---==================== NAV (event-free tile finder) ====================
+--==================== NAV ====================
 
 local shopPin, tilePin = nil, nil
 local badTile  = {}
@@ -350,11 +381,6 @@ local function findShop()
     return nil, "none"
 end
 
-local function inSidebar(b)
-    return (b.AbsolutePosition.X + b.AbsoluteSize.X * 0.5) / vpX() < CFG.ShopBand
-end
-
--- v13: name/label path used to recognise event buttons
 local function namePath(b)
     local s = labelDeep(b)
     local p, d = b.Parent, 0
@@ -393,7 +419,7 @@ local function tileScore(o)
     return sc
 end
 
--- ranked candidates. event buttons are dropped entirely unless includeEvent.
+-- event buttons are dropped entirely unless includeEvent
 local function tileList(includeEvent)
     local all, seen = {}, {}
     local pg = pgui()
@@ -453,7 +479,6 @@ local function tileList(includeEvent)
         return a.rank > b.rank
     end)
 
-    -- nothing left at all? optionally fall back to event buttons
     if #out == 0 and CFG.IgnoreEvent and CFG.EventFallback and not includeEvent then
         return tileList(true)
     end
@@ -467,8 +492,49 @@ local function findTile()
     return nil, "none"
 end
 
+-- fingerprint of the top tiles, used to tell "we navigated" from "we got stuck"
+local function topKey()
+    local list = tileList(true)
+    local s = ""
+    for i = 1, math.min(#list, 3) do s = s .. list[i].b:GetFullName() .. "|" end
+    return s
+end
+
+-- scored action-button finder: the box page's Unbox/Open/Buy button
+local function actionScore(b)
+    local t = textOnly(b)
+    local l = (b.Name .. " " .. t):lower()
+    local s = 0
+    if t == "unbox" or t == "open" or t == "hatch" or t == "buy" then s = s + 170 end
+    if l:find("open box", 1, true) then s = s + 120 end
+    if l:find("unbox", 1, true)    then s = s + 90  end
+    if l:find("hatch", 1, true)    then s = s + 90  end
+    if l:find("buy", 1, true)      then s = s + 80  end
+    if l:find("purchase", 1, true) then s = s + 80  end
+    if l:find("confirm", 1, true)  then s = s + 70  end
+    if l:find("open", 1, true)     then s = s + 40  end
+    if l:find(tostring(CFG.Cost), 1, true) then s = s + 30 end
+    -- things that are NOT the action button
+    if l:find("unboxed", 1, true)  then s = s - 60 end   -- shop tab
+    if l:find("backpack", 1, true) then s = s - 70 end
+    if l:find("shop", 1, true)     then s = s - 45 end
+    if l:find("close", 1, true) or l:find("exit", 1, true) then s = s - 90 end
+    if b.AbsoluteSize.Y < 34 then s = s - 50 end         -- tab row
+    local sz = b.AbsoluteSize
+    s = s + math.min(sz.X * sz.Y / 6000, 20)
+    local cx = (b.AbsolutePosition.X + sz.X * 0.5) / vpX()
+    if cx > 0.2 and cx < 0.8 then s = s + 10 end
+    return s
+end
+
 local function findUnbox()
-    return findKW(bodyButtons(), CFG.UnboxKW, false)
+    local best, bs = nil, 45
+    local body = actionButtons()
+    for i = 1, #body do
+        local s = actionScore(body[i])
+        if s > bs then bs = s; best = body[i] end
+    end
+    return best
 end
 
 local function waitUnbox(t)
@@ -482,20 +548,13 @@ local function waitUnbox(t)
 end
 
 local function isClose(b)
-    local l = label(b):lower()
+    local t    = textOnly(b)
+    local full = (b.Name .. " " .. (b:IsA("TextButton") and b.Text or "")):lower()
     for i = 1, #CFG.CloseNo do
-        if l:find(CFG.CloseNo[i], 1, true) then return false end
+        if full:find(CFG.CloseNo[i], 1, true) then return false end
     end
-    if b:IsA("TextButton") then
-        local tx = b.Text
-        if tx == "X" or tx == "x" or tx == "✕" then return true end
-    end
-    for i = 1, #CFG.CloseKW do
-        local k = CFG.CloseKW[i]
-        if l == k then return true end
-        if l == k .. "button" then return true end
-        if l == k .. " btn" then return true end
-    end
+    if t == "x" or t == "✕" or t == "close" or t == "exit" or t == "back" then return true end
+    if t:find("close", 1, true) and #t <= 12 then return true end
     return false
 end
 
@@ -509,6 +568,7 @@ local function closeAll()
         end
         if not target then return end
         click(target)
+        S.lastClick = "close " .. target.Name
         task.wait(0.5)
     end
 end
@@ -518,31 +578,53 @@ local function dismissPopup()
     local body = bodyButtons()
     for k = 1, #CFG.PopupKW do
         for i = 1, #body do
-            if label(body[i]):lower() == CFG.PopupKW[k] then
-                click(body[i])
-                task.wait(0.4)
-                return true
+            local b = body[i]
+            if textOnly(b) == CFG.PopupKW[k] then
+                local sz = b.AbsoluteSize
+                local cx = (b.AbsolutePosition.X + sz.X * 0.5) / vpX()
+                if sz.Y >= 32 and cx > 0.22 and cx < 0.78 then
+                    click(b)
+                    S.lastClick = "popup " .. b.Name
+                    task.wait(0.4)
+                    return true
+                end
             end
         end
     end
     return false
 end
 
+-- confirm search: content area only, never the sidebar, never the button we just hit
+local function findConfirm(exclude)
+    local body = actionButtons()
+    for k = 1, #CFG.BuyKW do
+        for i = 1, #body do
+            local b = body[i]
+            if b ~= exclude and textOnly(b):find(CFG.BuyKW[k], 1, true) then return b end
+        end
+    end
+    return nil
+end
+
 local function doBuy(u)
     click(u)
+    S.lastClick = "unbox " .. u.Name
     task.wait(1.2)
-    local b = findKW(bodyButtons(), CFG.BuyKW, false)
-    if not b then b = findKW(buttons(), CFG.BuyKW, false) end
+
+    local b = findConfirm(u)
+    if not b and validBtn(u) then
+        local t = textOnly(u)
+        if t:find("buy", 1, true) or t:find("purchase", 1, true) then b = u end
+    end
     if b then
-        local raw = b:IsA("TextButton") and b.Text or ""
-        local d = raw:gsub("[^%d]", "")
-        if #d == 0 then d = label(b):gsub("[^%d]", "") end
+        local d = textOnly(b):gsub("[^%d]", "")
         local n = #d > 0 and tonumber(d) or nil
         if n and n >= 1 and n <= 1000000 then CFG.Cost = n end
         click(b)
-        S.log = "confirm: " .. b.Name .. " (" .. CFG.Cost .. ")"
+        S.lastClick = "confirm " .. b.Name
         task.wait(1.0)
     end
+
     local after = readCandy()
     if after then
         S.candy = after
@@ -564,6 +646,7 @@ local function navFromWorld()
         return false
     end
     click(shop)
+    S.lastClick = "shop " .. shop.Name
     S.log = "shop (" .. how .. "): " .. shop.Name
     task.wait(1.2)
     S.onBox = true
@@ -576,8 +659,9 @@ local function isBad(b)
     return t and os.clock() < t
 end
 
+-- click a tile; succeed if the action button appears OR if the view actually changed
 local function openTileVerified()
-    for _ = 1, 3 do
+    for attempt = 1, 3 do
         local list = tileList()
         if #list == 0 then return nil end
 
@@ -587,28 +671,44 @@ local function openTileVerified()
         end
         if not pick then badTile = {}; pick = list[1] end
 
+        local before = topKey()
         click(pick.b)
-        task.wait(0.8)
+        S.lastClick = "tile " .. pick.b.Name
+        task.wait(0.9)
+
         local u = waitUnbox(1.6)
         if u then
             S.tileName = pick.b.Name
             S.tileHow  = pick.how
             return u
         end
+        if topKey() ~= before then
+            S.tileName = pick.b.Name
+            S.tileHow  = pick.how .. "+nav"
+            S.log = "tile opened: " .. pick.b.Name
+            return "NAV"
+        end
 
         badTile[pick.b:GetFullName()] = os.clock() + 25
         S.log = "tile miss: " .. pick.b.Name
-        closeAll()
-        task.wait(0.3)
-        if not navFromWorld() then return nil end
+        if attempt < 3 then
+            closeAll()
+            task.wait(0.4)
+            if not navFromWorld() then return nil end
+        end
     end
     return nil
 end
 
 local function workBoxPage()
     local u = findUnbox()
-    if not u and dismissPopup() then u = waitUnbox(1.0) end
-    if not u then u = openTileVerified() end
+    if not u and #tileList() == 0 and dismissPopup() then
+        u = waitUnbox(1.0)
+    end
+    if not u then
+        u = openTileVerified()
+        if u == "NAV" then u = waitUnbox(2.0) end
+    end
     if not u then return false end
 
     local bal = currentBalance()
@@ -823,7 +923,7 @@ gui.IgnoreGuiInset = true
 gui.Parent = pgui()
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 320, 0, 585)
+frame.Size = UDim2.new(0, 320, 0, 700)
 frame.AnchorPoint = Vector2.new(0.5, 0.5)
 frame.Position = UDim2.new(0.5, 0, 0.5, 0)
 frame.BackgroundColor3 = Color3.fromRGB(18, 15, 26)
@@ -840,7 +940,7 @@ local head = Instance.new("TextLabel")
 head.Size = UDim2.new(1, 0, 0, 30)
 head.BackgroundColor3 = Color3.fromRGB(30, 22, 40)
 head.BorderSizePixel = 0
-head.Text = "  MM2 FARM v13  -  LOADED"
+head.Text = "  MM2 FARM v14  -  LOADED"
 head.TextColor3 = Color3.fromRGB(255, 175, 80)
 head.Font = Enum.Font.GothamBold
 head.TextSize = 14
@@ -859,7 +959,7 @@ lay.SortOrder = Enum.SortOrder.LayoutOrder
 lay.Parent = body
 
 local status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, 0, 0, 140)
+status.Size = UDim2.new(1, 0, 0, 155)
 status.LayoutOrder = 1
 status.BackgroundColor3 = Color3.fromRGB(26, 20, 34)
 status.BorderSizePixel = 0
@@ -996,6 +1096,7 @@ mk("BUY 1 NOW (force one purchase)", Color3.fromRGB(60, 50, 30), 30)
             S.busy = true
             if not S.onBox then navFromWorld() end
             local u = findUnbox() or waitUnbox(2.0) or openTileVerified()
+            if u == "NAV" then u = waitUnbox(2.0) end
             if not u then
                 S.log = "buy now: no unbox button"
                 S.busy = false
@@ -1044,6 +1145,16 @@ mk("Dump tile candidates", Color3.fromRGB(45, 40, 55))
             print(string.format("   #%d tier=%d rank=%.1f text=%d ev=%s how=%s %s",
                 i, e.tier, e.rank, e.text, tostring(e.event), e.how, e.b:GetFullName()))
         end
+        local body = actionButtons()
+        print("[MM2] action scores:")
+        local scored = {}
+        for i = 1, #body do
+            scored[#scored + 1] = { b = body[i], s = actionScore(body[i]) }
+        end
+        table.sort(scored, function(a, b) return a.s > b.s end)
+        for i = 1, math.min(#scored, 8) do
+            print(string.format("   s=%d %s", scored[i].s, scored[i].b:GetFullName()))
+        end
     end)
 
 mk("Clear pins", Color3.fromRGB(50, 42, 30))
@@ -1090,13 +1201,14 @@ task.spawn(function()
         elseif S.waiting then gate = "WAITING"
         else gate = "armed" end
         local txt = string.format(
-            "picked : %d   boxes: %d\ngate   : %s\nevent  : %s\nbalance: %s / %d\non page: %s  miss:%d\nshop   : %s [%s]\ntile   : %s [%s]\nlog    : %s",
+            "picked : %d   boxes: %d\ngate   : %s\nevent  : %s\nbalance: %s / %d\non page: %s  miss:%d\nshop   : %s [%s]\ntile   : %s [%s]\nclick  : %s\nlog    : %s",
             S.picked, S.boxes, gate,
             CFG.IgnoreEvent and "ignored" or "allowed",
             S.candy and tostring(S.candy) or "?", CFG.Cost,
             S.onBox and "YES" or "no", S.miss,
             (S.shopName or "NONE"):sub(1, 18), S.shopHow,
             (S.tileName or "-"):sub(1, 18), S.tileHow,
+            (S.lastClick or "-"):sub(1, 24),
             (S.log or ""):sub(1, 32))
         if txt ~= last then last = txt; status.Text = txt end
     end
@@ -1115,4 +1227,4 @@ UIS.InputBegan:Connect(function(i, gp)
     end
 end)
 
-print("[MM2] === v13 LOAD COMPLETE ===")
+print("[MM2] === v14 LOAD COMPLETE ===")
