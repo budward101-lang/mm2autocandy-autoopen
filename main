@@ -5,13 +5,14 @@
 --============================================================
 
 local CFG = {
-	Tween   = 25,              -- studs per second
-	Hold    = 0.10,            -- seconds parked on a candy
-	MaxSize = 8,               -- ignore map parts bigger than this
-	AntiAFK = true,
-	Mode    = "Remote",        -- Remote | GUI
-	Crate   = "Halloween Box",
-	Pay     = "Coins",
+	Tween     = 25,                 -- studs per second
+	Hold      = 0.10,               -- seconds parked on a candy
+	MaxSize   = 8,                  -- ignore map parts bigger than this
+	AntiAFK   = true,
+	Mode      = "Remote",           -- Remote | GUI
+	Crate     = "Halloween2026Box", -- arg 1 (captured from OpenCrate)
+	BoxType   = "MysteryBox",       -- arg 2
+	Pay       = "Candies2026",      -- arg 3 (currency)
 }
 
 local P   = game:GetService("Players")
@@ -23,8 +24,13 @@ local VU  = game:GetService("VirtualUser")
 local lp  = P.LocalPlayer
 
 local farmOn, picked, boxes = false, 0, 0
+local lastRarity = "-"
 local started = os.clock()
 local status
+
+-- resolved once, hardcoded path (findRemotes() order is not stable)
+local Shop      = RS:WaitForChild("Remotes"):WaitForChild("Shop")
+local OpenCrate = Shop:WaitForChild("OpenCrate")
 
 --==================== BUILD UI ====================
 local function new(c, props, parent)
@@ -126,7 +132,8 @@ do
 			win.Visible = not win.Visible
 		elseif i.KeyCode == Enum.KeyCode.F1 then
 			farmBtn.MouseButton1Click:Fire()
-			-- toggled below; this is just a nudge
+		elseif i.KeyCode == Enum.KeyCode.F2 then
+			boxBtn.MouseButton1Click:Fire()
 		end
 	end)
 end
@@ -221,22 +228,8 @@ task.spawn(function()
 end)
 
 --==================== BOX ====================
-local function findRemotes()
-	local out = {}
-	local keys = { "unbox", "crate", "openbox", "open_box" }
-	for _, d in ipairs(RS:GetDescendants()) do
-		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-			local n = d.Name:lower()
-			for _, k in ipairs(keys) do
-				if n:find(k, 1, true) then
-					out[#out + 1] = d
-					break
-				end
-			end
-		end
-	end
-	return out
-end
+-- Real opener: ReplicatedStorage.Remotes.Shop.OpenCrate (RemoteFunction)
+-- Args captured from the live game: (crate, boxType, currency)
 
 local function visibleButtons()
 	local out = {}
@@ -272,17 +265,23 @@ end
 
 local function openBox()
 	if CFG.Mode == "Remote" then
-		local r = findRemotes()[1]
-		if not r then return "no unbox remote - try GUI mode" end
-		local ok = pcall(function()
-			if r:IsA("RemoteFunction") then
-				r:InvokeServer(CFG.Crate, 1, CFG.Pay)
-			else
-				r:FireServer(CFG.Crate, 1, CFG.Pay)
-			end
+		local ok, result = pcall(function()
+			return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
 		end)
-		if ok then boxes = boxes + 1; return "fired " .. r.Name end
-		return "remote errored - try GUI mode"
+
+		if not ok then
+			return "invoke errored: " .. tostring(result)
+		end
+
+		if type(result) == "table" then
+			boxes = boxes + 1
+			lastRarity = tostring(result.Rarity or "?")
+			print("[MM2] rolled:", result.Rarity, result.Name or result.Item or "?")
+			return "opened - rarity: " .. lastRarity
+		end
+
+		-- nil / non-table return = server refused the roll (usually not enough Candies2026)
+		return "returned " .. tostring(result) .. " (nil = open failed, check Candies2026)"
 	else
 		local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
 		if b then boxes = boxes + 1; return "clicked " .. b.Name end
@@ -312,17 +311,17 @@ modeBtn.MouseButton1Click:Connect(function()
 end)
 
 scanBtn.MouseButton1Click:Connect(function()
-	print("===== UNBOX REMOTE CANDIDATES =====")
-	local r = findRemotes()
-	for i, x in ipairs(r) do print(i, x:GetFullName(), x.ClassName) end
-	if #r == 0 then print("none") end
+	print("===== SHOP REMOTES =====")
+	for _, x in ipairs(Shop:GetChildren()) do
+		print(x.ClassName, x:GetFullName())
+	end
 	print("===== VISIBLE GUI BUTTONS =====")
 	local b = visibleButtons()
 	for i, x in ipairs(b) do
 		print(i, x:GetFullName(), x:IsA("TextButton") and x.Text or "")
 	end
 	if #b == 0 then print("none") end
-	say(("found %d remote(s), %d button(s) - check console"):format(#r, #b))
+	say(("shop: %d remote(s), gui: %d button(s) - check console"):format(#Shop:GetChildren(), #b))
 end)
 
 --==================== STATS ====================
@@ -330,8 +329,8 @@ task.spawn(function()
 	while task.wait(0.4) do
 		local run = os.clock() - started
 		stats.Text = string.format(
-			"picked : %d\nboxes  : %d\nuptime : %02d:%02d\nper/hr : %.0f",
-			picked, boxes, run // 60, run % 60,
+			"picked : %d\nboxes  : %d\nrarity : %s\nuptime : %02d:%02d\nper/hr : %.0f",
+			picked, boxes, lastRarity, run // 60, run % 60,
 			picked / math.max(run / 3600, 0.0001))
 	end
 end)
