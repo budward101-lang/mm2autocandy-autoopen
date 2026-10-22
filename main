@@ -1,11 +1,10 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026 — CANDY FARM + AUTO OPEN BOX
---  v12: tiered tile finder (never the Event button) + verified
---       tile click (blacklist) + reliable balance gate.
+--  v13: event button fully removed from the tile candidates.
 --  RightShift UI | F1 farm | F2 open | F3 force
 --=============================================================
 
-print("[MM2] v12 booting")
+print("[MM2] v13 booting")
 
 local Players = game:GetService("Players")
 local UIS     = game:GetService("UserInputService")
@@ -15,13 +14,15 @@ print("[MM2] services ok")
 
 local CFG = {
     Speed = 20, Dwell = 3.0, Retry = 2.0, MaxTry = 3, Tick = 0.1, Rescan = 3.0,
-    Cost = 600, Gate = true, BuyIfUnknown = true,   -- v12: buy even if balance unreadable
+    Cost = 600, Gate = true, BuyIfUnknown = true,
     TabFallback = false,            -- off. Radio/Modes/Event stay untouched.
+    IgnoreEvent = true,             -- v13: never consider event buttons as the tile
+    EventFallback = false,          -- if true, use event buttons only when nothing else exists
     ShopBand = 0.15, ShopMin = 60, ShopIndex = 2,
     ShopKW  = {"shop", "store"},
     TileKW  = {"halloween", "mystery", "box", "26"},
-    -- names that are nav / banners, never the shop tile
     TileNo  = {"event", "radio", "modes", "settings", "backpack", "trade", "index", "codes"},
+    EventKW = {"event"},
     UnboxKW = {"unbox", "open box", "hatch", "open"},
     BuyKW   = {"buy", "purchase", "confirm", "600"},
     CloseKW = {"close", "exit", "back", "x"},
@@ -37,7 +38,7 @@ local S = {
 }
 print("[MM2] config ok")
 
-local OWN = "MM2FarmV12"
+local OWN = "MM2FarmV13"
 
 local function pgui()
     local p = LP:FindFirstChildOfClass("PlayerGui")
@@ -254,7 +255,7 @@ local function findWallet()
                 if path:find("count", 1, true)     then sc = sc + 15 end
                 if path:find("cost", 1, true)      then sc = sc - 45 end
                 if path:find("price", 1, true)     then sc = sc - 45 end
-                if o.Text:match("^[%d,]+$") then sc = sc + 35 end   -- pure number
+                if o.Text:match("^[%d,]+$") then sc = sc + 35 end
                 if sc > bestScore then bestScore = sc; best = o end
             end
         end
@@ -282,11 +283,11 @@ local function canBuy()
 end
 print("[MM2] wallet ok")
 
---==================== NAV (tiered, sidebar-safe tile finder) ====================
+--==================== NAV (event-free tile finder) ====================
 
 local shopPin, tilePin = nil, nil
 local badTile  = {}
-local baseBtns = {}   -- chrome that exists on the world screen (sidebar, bottom bar)
+local baseBtns = {}
 
 local function snapshotBase()
     baseBtns = {}
@@ -353,6 +354,26 @@ local function inSidebar(b)
     return (b.AbsolutePosition.X + b.AbsoluteSize.X * 0.5) / vpX() < CFG.ShopBand
 end
 
+-- v13: name/label path used to recognise event buttons
+local function namePath(b)
+    local s = labelDeep(b)
+    local p, d = b.Parent, 0
+    while p and d < 3 do
+        s = s .. " " .. p.Name
+        p = p.Parent
+        d = d + 1
+    end
+    return s:lower()
+end
+
+local function isEventBtn(b)
+    local np = namePath(b)
+    for k = 1, #CFG.EventKW do
+        if np:find(CFG.EventKW[k], 1, true) then return true end
+    end
+    return false
+end
+
 local function tileScore(o)
     local t = textOf(o):lower()
     local sc = 0
@@ -362,8 +383,6 @@ local function tileScore(o)
     if t:find("26",        1, true) then sc = sc + 25  end
     if t:find("candy",     1, true) then sc = sc - 25  end
     if t:find("shop",      1, true) then sc = sc - 15  end
-    -- soft negatives (tier handles the hard part)
-    if t:find("event",     1, true) then sc = sc - 90  end
     if t:find("radio",     1, true) then sc = sc - 45  end
     if t:find("mode",      1, true) then sc = sc - 45  end
     if t:find("setting",   1, true) then sc = sc - 45  end
@@ -374,11 +393,11 @@ local function tileScore(o)
     return sc
 end
 
--- ranked candidates. tier 0 = real grid item, higher tier = nav/banner/chrome.
-local function tileList()
-    local list, seen = {}, {}
+-- ranked candidates. event buttons are dropped entirely unless includeEvent.
+local function tileList(includeEvent)
+    local all, seen = {}, {}
     local pg = pgui()
-    if not pg then return list end
+    if not pg then return all end
     local vx, vy = vpX(), vpY()
     local kids = pg:GetDescendants()
     for i = 1, #kids do
@@ -397,9 +416,9 @@ local function tileList()
                     local area = sz.X * sz.Y
                     local e = seen[b]
                     if not e then
-                        e = { b = b, text = 0, area = area, how = "geom" }
+                        e = { b = b, text = 0, area = area, how = "geom", event = false }
                         seen[b] = e
-                        list[#list + 1] = e
+                        all[#all + 1] = e
                     end
                     e.area = math.max(e.area, area)
                     if sc > e.text then e.text = sc; e.how = "text" end
@@ -407,26 +426,38 @@ local function tileList()
             end
         end
     end
-    for i = 1, #list do
-        local e = list[i]
+
+    local out = {}
+    for i = 1, #all do
+        local e = all[i]
         local ld = labelDeep(e.b):lower()
         local sz = e.b.AbsoluteSize
         local cx = (e.b.AbsolutePosition.X + sz.X * 0.5) / vx
         local cy = (e.b.AbsolutePosition.Y + sz.Y * 0.5) / vy
-        e.rank = e.text + math.min(e.area / 60000, 25)
-        e.tier = 0
+        e.event = isEventBtn(e.b)
+        e.rank  = e.text + math.min(e.area / 60000, 25)
+        e.tier  = 0
         if e.b:FindFirstAncestorOfClass("ScrollingFrame") then e.tier = e.tier - 1 end
         for k = 1, #CFG.TileNo do
             if ld:find(CFG.TileNo[k], 1, true) then e.tier = e.tier + 2; break end
         end
         if baseBtns[e.b:GetFullName()] then e.tier = e.tier + 1 end
-        if cy > 0.62 and cx < 0.24 then e.tier = e.tier + 1 end   -- bottom-left corner
+        if cy > 0.62 and cx < 0.24 then e.tier = e.tier + 1 end
+
+        if not (CFG.IgnoreEvent and e.event and not includeEvent) then
+            out[#out + 1] = e
+        end
     end
-    table.sort(list, function(a, b)
+    table.sort(out, function(a, b)
         if a.tier ~= b.tier then return a.tier < b.tier end
         return a.rank > b.rank
     end)
-    return list
+
+    -- nothing left at all? optionally fall back to event buttons
+    if #out == 0 and CFG.IgnoreEvent and CFG.EventFallback and not includeEvent then
+        return tileList(true)
+    end
+    return out
 end
 
 local function findTile()
@@ -507,7 +538,7 @@ local function doBuy(u)
         local d = raw:gsub("[^%d]", "")
         if #d == 0 then d = label(b):gsub("[^%d]", "") end
         local n = #d > 0 and tonumber(d) or nil
-        if n and n >= 1 and n <= 1000000 then CFG.Cost = n end   -- learn the price
+        if n and n >= 1 and n <= 1000000 then CFG.Cost = n end
         click(b)
         S.log = "confirm: " .. b.Name .. " (" .. CFG.Cost .. ")"
         task.wait(1.0)
@@ -524,7 +555,7 @@ end
 local function navFromWorld()
     closeAll()
     task.wait(0.3)
-    snapshotBase()                       -- record the world-screen chrome
+    snapshotBase()
     local shop, how = findShop()
     S.shopName = shop and shop.Name or "NONE"
     S.shopHow = how
@@ -545,7 +576,6 @@ local function isBad(b)
     return t and os.clock() < t
 end
 
--- click a tile, confirm an unbox button appeared; if not, blacklist and retry
 local function openTileVerified()
     for _ = 1, 3 do
         local list = tileList()
@@ -575,7 +605,6 @@ local function openTileVerified()
     return nil
 end
 
--- tile -> unbox -> balance gate (>= Cost) -> buy
 local function workBoxPage()
     local u = findUnbox()
     if not u and dismissPopup() then u = waitUnbox(1.0) end
@@ -794,7 +823,7 @@ gui.IgnoreGuiInset = true
 gui.Parent = pgui()
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 320, 0, 560)
+frame.Size = UDim2.new(0, 320, 0, 585)
 frame.AnchorPoint = Vector2.new(0.5, 0.5)
 frame.Position = UDim2.new(0.5, 0, 0.5, 0)
 frame.BackgroundColor3 = Color3.fromRGB(18, 15, 26)
@@ -811,7 +840,7 @@ local head = Instance.new("TextLabel")
 head.Size = UDim2.new(1, 0, 0, 30)
 head.BackgroundColor3 = Color3.fromRGB(30, 22, 40)
 head.BorderSizePixel = 0
-head.Text = "  MM2 FARM v12  -  LOADED"
+head.Text = "  MM2 FARM v13  -  LOADED"
 head.TextColor3 = Color3.fromRGB(255, 175, 80)
 head.Font = Enum.Font.GothamBold
 head.TextSize = 14
@@ -886,6 +915,7 @@ toggle("Auto open box", function() return S.open end, function(v) S.open = v end
 local gateToggle = toggle(function() return "Buy only if >= " .. CFG.Cost end,
     function() return CFG.Gate end,
     function(v) CFG.Gate = v end)
+toggle("Ignore event buttons", function() return CFG.IgnoreEvent end, function(v) CFG.IgnoreEvent = v end)
 toggle("Click tab row if stuck", function() return CFG.TabFallback end, function(v) CFG.TabFallback = v end)
 
 local function pickAt(mx, my)
@@ -1007,12 +1037,12 @@ mk("Dump buttons", Color3.fromRGB(45, 40, 55))
 
 mk("Dump tile candidates", Color3.fromRGB(45, 40, 55))
     .MouseButton1Click:Connect(function()
-        local list = tileList()
-        print("[MM2] tile candidates: " .. #list)
+        local list = tileList(true)
+        print("[MM2] tile candidates (incl. event): " .. #list)
         for i = 1, math.min(#list, 12) do
             local e = list[i]
-            print(string.format("   #%d tier=%d rank=%.1f text=%d how=%s %s",
-                i, e.tier, e.rank, e.text, e.how, e.b:GetFullName()))
+            print(string.format("   #%d tier=%d rank=%.1f text=%d ev=%s how=%s %s",
+                i, e.tier, e.rank, e.text, tostring(e.event), e.how, e.b:GetFullName()))
         end
     end)
 
@@ -1060,8 +1090,9 @@ task.spawn(function()
         elseif S.waiting then gate = "WAITING"
         else gate = "armed" end
         local txt = string.format(
-            "picked : %d   boxes: %d\ngate   : %s\nbalance: %s / %d\non page: %s  miss:%d\nshop   : %s [%s]\ntile   : %s [%s]\nlog    : %s",
+            "picked : %d   boxes: %d\ngate   : %s\nevent  : %s\nbalance: %s / %d\non page: %s  miss:%d\nshop   : %s [%s]\ntile   : %s [%s]\nlog    : %s",
             S.picked, S.boxes, gate,
+            CFG.IgnoreEvent and "ignored" or "allowed",
             S.candy and tostring(S.candy) or "?", CFG.Cost,
             S.onBox and "YES" or "no", S.miss,
             (S.shopName or "NONE"):sub(1, 18), S.shopHow,
@@ -1084,4 +1115,4 @@ UIS.InputBegan:Connect(function(i, gp)
     end
 end)
 
-print("[MM2] === v12 LOAD COMPLETE ===")
+print("[MM2] === v13 LOAD COMPLETE ===")
