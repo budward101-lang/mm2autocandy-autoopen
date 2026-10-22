@@ -1,11 +1,11 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026 — CANDY FARM + AUTO OPEN BOX
---  v9: sticky box-page state (no loopback), 3-pass box-tile finder,
---  tab-row clicking OFF by default, tight close matching.
+--  v10: sidebar-safe tile finder + verified tile click (blacklist).
+--  Fixes v9 clicking the EVENT button instead of the Halloween box.
 --  RightShift UI | F1 farm | F2 open | F3 force
 --=============================================================
 
-print("[MM2] v9 booting")
+print("[MM2] v10 booting")
 
 local Players = game:GetService("Players")
 local UIS     = game:GetService("UserInputService")
@@ -16,7 +16,7 @@ print("[MM2] services ok")
 local CFG = {
     Speed = 20, Dwell = 3.0, Retry = 2.0, MaxTry = 3, Tick = 0.1, Rescan = 3.0,
     Cost = 600, Gate = true, BuyIfUnknown = false,
-    TabFallback = false,            -- v9: off. Radio/Modes/Event stay untouched.
+    TabFallback = false,            -- v10: off. Radio/Modes/Event stay untouched.
     ShopBand = 0.15, ShopMin = 60, ShopIndex = 2,
     ShopKW  = {"shop", "store"},
     TileKW  = {"halloween", "mystery", "box", "26"},
@@ -35,7 +35,7 @@ local S = {
 }
 print("[MM2] config ok")
 
-local OWN = "MM2FarmV9"
+local OWN = "MM2FarmV10"
 
 local function pgui()
     local p = LP:FindFirstChildOfClass("PlayerGui")
@@ -273,9 +273,10 @@ local function canBuy()
 end
 print("[MM2] wallet ok")
 
---==================== NAV ====================
+--==================== NAV (v10: sidebar-safe tile finder) ====================
 
 local shopPin, tilePin = nil, nil
+local badTile = {}
 
 local function findShop()
     if validBtn(shopPin) then return shopPin, "pin" end
@@ -330,56 +331,78 @@ local function findShop()
     return nil, "none"
 end
 
--- v9: three passes. pin -> scored text/name -> biggest central card.
-local function findTile()
-    if validBtn(tilePin) then return tilePin, "pin" end
+-- v10: keep the tile search OUT of the left nav band, and never score
+-- the Event / Radio / Modes / etc. buttons as the box tile.
+local function inSidebar(b)
+    return (b.AbsolutePosition.X + b.AbsoluteSize.X * 0.5) / vpX() < CFG.ShopBand
+end
 
+local function tileScore(o)
+    local t = textOf(o):lower()
+    local sc = 0
+    if t:find("halloween", 1, true) then sc = sc + 130 end
+    if t:find("mystery",   1, true) then sc = sc + 95  end
+    if t:find("box",       1, true) then sc = sc + 60  end
+    if t:find("26",        1, true) then sc = sc + 25  end
+    if t:find("candy",     1, true) then sc = sc - 25  end
+    if t:find("shop",      1, true) then sc = sc - 15  end
+    -- hard negatives: nav / banner buttons, never the tile
+    if t:find("event",     1, true) then sc = sc - 90  end
+    if t:find("radio",     1, true) then sc = sc - 45  end
+    if t:find("mode",      1, true) then sc = sc - 45  end
+    if t:find("setting",   1, true) then sc = sc - 45  end
+    if t:find("backpack",  1, true) then sc = sc - 35  end
+    if t:find("trade",     1, true) then sc = sc - 35  end
+    if t:find("index",     1, true) then sc = sc - 35  end
+    if t:find("code",      1, true) then sc = sc - 35  end
+    return sc
+end
+
+-- returns ranked candidates: { b = button, text = score, area = px, how = "text"/"geom" }
+local function tileList()
+    local list, seen = {}, {}
     local pg = pgui()
-    if pg then
-        local kids = pg:GetDescendants()
-        local best, bestScore = nil, 0
-        for i = 1, #kids do
-            local o = kids[i]
-            if (o:IsA("TextLabel") or o:IsA("TextButton")
-                or o:IsA("ImageButton") or o:IsA("ImageLabel"))
-                and o.Visible and chainVis(o.Parent) and not own(o) then
-                local t = textOf(o):lower()
-                local sc = 0
-                if t:find("halloween", 1, true) then sc = sc + 130 end
-                if t:find("mystery", 1, true) then sc = sc + 95 end
-                if t:find("box", 1, true) then sc = sc + 60 end
-                if t:find("26", 1, true) then sc = sc + 25 end
-                if t:find("candy", 1, true) then sc = sc - 25 end
-                if t:find("shop", 1, true) then sc = sc - 15 end
-                if sc > 0 then
-                    local b = buttonAncestor(o)
-                    if validBtn(b) and not inBottom(b) and b ~= shopPin then
-                        local sz = b.AbsoluteSize
-                        if sz.X > 90 and sz.Y > 90 then
-                            if sc > bestScore then bestScore = sc; best = b end
-                        end
+    if not pg then return list end
+    local vx, vy = vpX(), vpY()
+    local kids = pg:GetDescendants()
+    for i = 1, #kids do
+        local o = kids[i]
+        if (o:IsA("TextLabel") or o:IsA("TextButton")
+            or o:IsA("ImageButton") or o:IsA("ImageLabel"))
+            and o.Visible and chainVis(o.Parent) and not own(o) then
+            local b = buttonAncestor(o)
+            -- never the bottom bar, never the left nav band, never shopPin
+            if validBtn(b) and b ~= shopPin and not inBottom(b) and not inSidebar(b) then
+                local sz, pos = b.AbsoluteSize, b.AbsolutePosition
+                local cx = (pos.X + sz.X * 0.5) / vx
+                local cy = (pos.Y + sz.Y * 0.5) / vy
+                if sz.X > 90 and sz.Y > 90
+                    and cx > 0.16 and cx < 0.96 and cy > 0.10 and cy < 0.92 then
+                    local sc   = tileScore(o)
+                    local area = sz.X * sz.Y
+                    local e = seen[b]
+                    if not e then
+                        e = { b = b, text = 0, area = area, how = "geom" }
+                        seen[b] = e
+                        list[#list + 1] = e
                     end
+                    e.area = math.max(e.area, area)
+                    if sc > e.text then e.text = sc; e.how = "text" end
                 end
             end
         end
-        if best then return best, "text" end
     end
+    for i = 1, #list do
+        list[i].rank = list[i].text + math.min(list[i].area / 60000, 25)
+    end
+    table.sort(list, function(a, b) return a.rank > b.rank end)
+    return list
+end
 
-    local vx, vy = vpX(), vpY()
-    local all = buttons()
-    local best, bestArea = nil, 0
-    for i = 1, #all do
-        local b = all[i]
-        local pos, sz = b.AbsolutePosition, b.AbsoluteSize
-        local cx = (pos.X + sz.X * 0.5) / vx
-        local cy = (pos.Y + sz.Y * 0.5) / vy
-        if not inBottom(b) and cx > 0.18 and cx < 0.92 and cy > 0.12 and cy < 0.88
-            and sz.X > 100 and sz.Y > 100 then
-            local area = sz.X * sz.Y
-            if area > bestArea then bestArea = area; best = b end
-        end
-    end
-    if best then return best, "geometry" end
+local function findTile()
+    if validBtn(tilePin) then return tilePin, "pin" end
+    local list = tileList()
+    if list[1] then return list[1].b, list[1].how end
     return nil, "none"
 end
 
@@ -397,7 +420,7 @@ local function waitUnbox(t)
     return nil
 end
 
--- v9: exact-ish only, so closeAll never grazes unrelated buttons
+-- tight close matching so closeAll never grazes unrelated buttons
 local function isClose(b)
     local l = label(b):lower()
     for i = 1, #CFG.CloseNo do
@@ -482,21 +505,49 @@ local function navFromWorld()
     return true
 end
 
--- v9: once S.onBox is set we stay here. tile -> unbox -> gate -> buy.
+-- v10: click a tile, confirm an unbox button actually appeared.
+-- If not, that button was the wrong one -> blacklist it and try the next.
+local function isBad(b)
+    local t = badTile[b:GetFullName()]
+    return t and os.clock() < t
+end
+
+local function openTileVerified()
+    for _ = 1, 3 do
+        local list = tileList()
+        if #list == 0 then return nil end
+
+        local pick = nil
+        for i = 1, #list do
+            if not isBad(list[i].b) then pick = list[i]; break end
+        end
+        if not pick then badTile = {}; pick = list[1] end
+
+        click(pick.b)
+        task.wait(0.8)
+        local u = waitUnbox(1.6)
+        if u then
+            S.tileName = pick.b.Name
+            S.tileHow  = pick.how
+            return u
+        end
+
+        badTile[pick.b:GetFullName()] = os.clock() + 25
+        S.log = "tile miss: " .. pick.b.Name
+        closeAll()
+        task.wait(0.3)
+        if not navFromWorld() then return nil end
+    end
+    return nil
+end
+
+-- v10: once S.onBox is set we stay here. tile -> unbox -> gate -> buy.
 local function workBoxPage()
     local u = findUnbox()
     if not u and dismissPopup() then u = waitUnbox(1.0) end
 
     if not u then
-        local tile, how = findTile()
-        S.tileName = tile and tile.Name or "NONE"
-        S.tileHow = how
-        if tile then
-            click(tile)
-            S.log = "tile (" .. how .. "): " .. tile.Name
-            task.wait(0.9)
-            u = waitUnbox(2.5)
-        end
+        u = openTileVerified()
     end
 
     if not u then return false end
@@ -509,6 +560,7 @@ local function workBoxPage()
     end
 
     doBuy(u)
+    badTile = {}
     S.waiting = false
     return true
 end
@@ -716,7 +768,7 @@ local head = Instance.new("TextLabel")
 head.Size = UDim2.new(1, 0, 0, 30)
 head.BackgroundColor3 = Color3.fromRGB(30, 22, 40)
 head.BorderSizePixel = 0
-head.Text = "  MM2 FARM v9  -  LOADED"
+head.Text = "  MM2 FARM v10  -  LOADED"
 head.TextColor3 = Color3.fromRGB(255, 175, 80)
 head.Font = Enum.Font.GothamBold
 head.TextSize = 14
@@ -886,10 +938,22 @@ mk("Dump buttons", Color3.fromRGB(45, 40, 55))
         end
     end)
 
+mk("Dump tile candidates", Color3.fromRGB(45, 40, 55))
+    .MouseButton1Click:Connect(function()
+        local list = tileList()
+        print("[MM2] tile candidates: " .. #list)
+        for i = 1, math.min(#list, 10) do
+            local e = list[i]
+            print(string.format("   #%d rank=%.1f text=%d how=%s %s",
+                i, e.rank, e.text, e.how, e.b:GetFullName()))
+        end
+    end)
+
 mk("Clear pins", Color3.fromRGB(50, 42, 30))
     .MouseButton1Click:Connect(function()
         shopPin, tilePin, walletEl = nil, nil, nil
         S.shopName, S.tileName = "NONE", "NONE"
+        badTile = {}
         S.log = "pins cleared"
     end)
 
@@ -952,4 +1016,4 @@ UIS.InputBegan:Connect(function(i, gp)
     end
 end)
 
-print("[MM2] === v9 LOAD COMPLETE ===")
+print("[MM2] === v10 LOAD COMPLETE ===")
