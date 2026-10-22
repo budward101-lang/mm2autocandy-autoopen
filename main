@@ -3,11 +3,12 @@
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
 --  Fixed 20 studs/s + bottom-tab-row navigation (box = 4th icon)
 --  Balance is read from the Halloween box page (account wallet).
+--  v2: learns the box tab once instead of clicking the whole bar.
 --=============================================================
 
 local CONFIG = {
     --========== MOVEMENT ==========
-    TweenSpeed    = 20,
+    TweenSpeed    = 25,
     SettleDelay   = 0.15,
     DwellTime     = 3.0,
     ReInteractAt  = 0.5,
@@ -87,6 +88,7 @@ local STATE = {
     collected = 0, hops = 0, boxes = 0, skipped = 0,
     started = os.clock(), candy = nil, checkedOnce = false,
     lastCheck = 0, log = "starting...", walletName = "?",
+    onBoxPage = false,
 }
 local attempts, claimed = {}, {}
 print("[MM2] boot")
@@ -531,6 +533,7 @@ local function isCloseButton(b)
 end
 
 local function closeAll()
+    STATE.onBoxPage = false
     for _ = 1, 3 do
         local vis = visibleButtons()
         local before = sigOf(vis)
@@ -547,16 +550,56 @@ end
 
 --==================== BOX OPEN FLOW ====================
 
+-- remembered so we don't re-click the whole tab bar every cycle
+local boxTabIdx, boxTabName, eventRef = nil, nil, nil
+
 local function clickFirst(keywords)
     local b = findIn(visibleButtons(), keywords)
     if b then fireButton(b) end
     return b
 end
 
-local function reachBoxPage(beforeSet)
-    if findUnbox() then return findUnbox() end
+local function clickEvent()
+    local b = eventRef
+    if not (b and b.Parent and b.Visible and chainVisible(b.Parent)) then
+        b = findIn(visibleButtons(), CONFIG.EventKeywords)
+        eventRef = b
+    end
+    if b then fireButton(b) end
+    return b
+end
 
-    -- candidates = new buttons in the bottom bar; fall back to the whole bar
+local function tabUsable(b)
+    return b and b.Parent and b.Visible and chainVisible(b.Parent)
+end
+
+local function tryTab(b, label)
+    if not tabUsable(b) then return nil end
+    fireButton(b)
+    local unbox = waitForUnbox(1.6)
+    if unbox then
+        STATE.log = "box tab " .. label .. ": " .. b.Name
+        return unbox
+    end
+    return nil
+end
+
+local function reachBoxPage(beforeSet)
+    local unbox = findUnbox()
+    if unbox then return unbox end
+
+    -- 1) reuse the tab we learned last time (index AND name must match)
+    if boxTabIdx then
+        local row = bottomRow(visibleButtons())
+        local cand = row[boxTabIdx]
+        if cand and (not boxTabName or cand.Name == boxTabName) then
+            unbox = tryTab(cand, "(cached #" .. boxTabIdx .. ")")
+            if unbox then return unbox end
+        end
+        boxTabIdx, boxTabName = nil, nil
+    end
+
+    -- 2) discovery pass - only runs until a tab is learned
     local fresh = {}
     for _, b in ipairs(visibleButtons()) do
         if not beforeSet[b] then fresh[#fresh + 1] = b end
@@ -582,10 +625,11 @@ local function reachBoxPage(beforeSet)
 
     for _, cand in ipairs(order) do
         if not cand.Parent then continue end
-        fireButton(cand)
-        local unbox = waitForUnbox(1.6)
+        unbox = tryTab(cand, "#" .. CONFIG.BoxTabIndex)
         if unbox then
-            STATE.log = "box tab #" .. CONFIG.BoxTabIndex .. ": " .. cand.Name
+            for i, b in ipairs(row) do
+                if b == cand then boxTabIdx, boxTabName = i, cand.Name break end
+            end
             print("[MM2] box page reached via: " .. cand.Name)
             return unbox
         end
@@ -593,13 +637,37 @@ local function reachBoxPage(beforeSet)
     return nil
 end
 
+local function unboxAndBuy(unbox)
+    fireButton(unbox)
+    task.wait(jit(1.3))
+    local buy = clickFirst(CONFIG.BuyKeywords)
+    if not buy then return false end
+    STATE.log = "buy: " .. buy.Name
+    task.wait(jit(1.2))
+    return true
+end
+
 local function runBoxCycle()
     uiLock = true
+
+    -- fast path: already on the box page -> no close, no event, no tab clicks
+    if STATE.onBoxPage then
+        local unbox = findUnbox()
+        if unbox and unboxAndBuy(unbox) then
+            STATE.boxes += 1
+            if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
+            uiLock = false
+            return true
+        end
+        STATE.onBoxPage = false
+        STATE.log = "fast path miss - full cycle"
+    end
+
     if CONFIG.CloseBeforeCycle then closeAll() end
     task.wait(jit(0.3))
 
     local before = buttonSet()
-    local ev = clickFirst(CONFIG.EventKeywords)
+    local ev = clickEvent()
     if not ev then STATE.log = "no event button"; uiLock = false; return false end
     STATE.log = "event: " .. ev.Name
     task.wait(jit(1.1))
@@ -607,6 +675,7 @@ local function runBoxCycle()
     local unbox = reachBoxPage(before)
     if not unbox then
         STATE.log = "box page not reached"
+        eventRef = nil
         uiLock = false
         return false
     end
@@ -620,18 +689,11 @@ local function runBoxCycle()
         STATE.lastCheck = os.clock()
     end
 
-    fireButton(unbox)
-    STATE.log = "unbox: " .. unbox.Name
-    task.wait(jit(1.3))
-
-    local buy = clickFirst(CONFIG.BuyKeywords)
-    if buy then
-        STATE.log = "buy: " .. buy.Name
-        task.wait(jit(1.2))
-    end
+    unboxAndBuy(unbox)
 
     STATE.boxes += 1
     if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
+    STATE.onBoxPage = true
     uiLock = false
     return true
 end
@@ -788,13 +850,16 @@ probeBalance = function()
     if uiLock then return end
     uiLock = true
 
-    local opened = false
-    if not findUnbox() then
+    local navigated = false
+    if findUnbox() then
+        STATE.onBoxPage = true
+    else
         local before = buttonSet()
-        local ev = clickFirst(CONFIG.EventKeywords)
+        local ev = clickEvent()
         if ev then
             task.wait(jit(1.1))
-            opened = reachBoxPage(before) ~= nil
+            navigated = reachBoxPage(before) ~= nil
+            STATE.onBoxPage = navigated
         end
     end
 
@@ -806,16 +871,19 @@ probeBalance = function()
     STATE.lastCheck = os.clock()
     STATE.log = "wallet: " .. (STATE.candy and tostring(STATE.candy) or "?") .. "/" .. CONFIG.BoxCost
 
-    if opened and CONFIG.CloseBeforeCycle then closeAll() end
+    -- leave it open if the open loop is going to use it anyway
+    if navigated and not STATE.open and CONFIG.CloseBeforeCycle then closeAll() end
     uiLock = false
 end
 
 task.spawn(function()
     task.wait(4)
     while true do
-        probeBalance()
-        task.wait(CONFIG.BalanceCheckMin
-            + math.random() * (CONFIG.BalanceCheckMax - CONFIG.BalanceCheckMin))
+        local gap = CONFIG.BalanceCheckMin
+            + math.random() * (CONFIG.BalanceCheckMax - CONFIG.BalanceCheckMin)
+        task.wait(gap)
+        -- an open cycle may have refreshed it more recently than this
+        if os.clock() - STATE.lastCheck >= gap then probeBalance() end
     end
 end)
 
@@ -945,6 +1013,7 @@ tabBtn.MouseButton1Click:Connect(function()
     end
     idx = idx % #TABS + 1
     CONFIG.BoxTabIndex = TABS[idx]
+    boxTabIdx, boxTabName = nil, nil      -- forget the learned tab, re-discover
     refreshTab()
     STATE.log = "bottom tab #" .. CONFIG.BoxTabIndex
 end)
