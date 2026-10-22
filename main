@@ -1,8 +1,8 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  Open flow: EVENT tab -> Nth preview tile -> unbox
---  Balance is read from the event/box page (account wallet).
+--  Fixed 20 studs/s + bottom-tab-row navigation (box = 4th icon)
+--  Balance is read from the Halloween box page (account wallet).
 --=============================================================
 
 local CONFIG = {
@@ -49,8 +49,9 @@ local CONFIG = {
 
     --========== BOX OPEN FLOW ==========
     OpenMode      = "builtin",
-    EventTabKeywords  = {"event"},   -- bottom tab that opens the event preview
-    EventPreviewIndex = 4,           -- 4th tile in the event preview = the box
+    EventKeywords = {"halloween", "event"},
+    BoxTabIndex   = 4,       -- 4th icon in the bottom bar = box
+    RowYThreshold = 0.70,    -- bottom 30% of screen = the tab bar
     UnboxKeywords = {"unbox", "open box", "hatch", "open"},
     BuyKeywords   = {"buy", "purchase", "confirm", "600"},
 
@@ -470,9 +471,10 @@ local function viewportY()
 end
 
 local function inBottomRow(b)
-    return b.AbsolutePosition.Y >= viewportY() * 0.70
+    return b.AbsolutePosition.Y >= viewportY() * CONFIG.RowYThreshold
 end
 
+-- the tab bar only: bottom strip, ordered left to right
 local function bottomRow(list)
     local out = {}
     for _, b in ipairs(list) do
@@ -551,73 +553,44 @@ local function clickFirst(keywords)
     return b
 end
 
--- find the horizontal row of event-preview tiles (5+ equal tiles in a row, lower half of screen)
-local function findPreviewTiles()
-    local byParent = {}
+local function reachBoxPage(beforeSet)
+    if findUnbox() then return findUnbox() end
+
+    -- candidates = new buttons in the bottom bar; fall back to the whole bar
+    local fresh = {}
     for _, b in ipairs(visibleButtons()) do
-        local p = b.Parent
-        if p then
-            local g = byParent[p]
-            if not g then g = {}; byParent[p] = g end
-            g[#g + 1] = b
+        if not beforeSet[b] then fresh[#fresh + 1] = b end
+    end
+
+    local row = bottomRow(fresh)
+    if #row < CONFIG.BoxTabIndex then
+        row = bottomRow(visibleButtons())
+    end
+
+    print("[MM2] bottom tab row (" .. #row .. "):")
+    for i, b in ipairs(row) do
+        print(string.format("  %d) x=%4d  %-24s | %s",
+            i, math.floor(b.AbsolutePosition.X), b.Name, buttonLabel(b)))
+    end
+
+    -- configured index first, then the rest of the row
+    local order = {}
+    if row[CONFIG.BoxTabIndex] then order[#order + 1] = row[CONFIG.BoxTabIndex] end
+    for i, b in ipairs(row) do
+        if i ~= CONFIG.BoxTabIndex then order[#order + 1] = b end
+    end
+
+    for _, cand in ipairs(order) do
+        if not cand.Parent then continue end
+        fireButton(cand)
+        local unbox = waitForUnbox(1.6)
+        if unbox then
+            STATE.log = "box tab #" .. CONFIG.BoxTabIndex .. ": " .. cand.Name
+            print("[MM2] box page reached via: " .. cand.Name)
+            return unbox
         end
     end
-
-    local vh = viewportY()
-    local best, bestN = nil, 0
-    for _, list in pairs(byParent) do
-        if #list >= 5 then
-            local row = {}
-            local refY, refH, refW = list[1].AbsolutePosition.Y,
-                list[1].AbsoluteSize.Y, list[1].AbsoluteSize.X
-            for _, b in ipairs(list) do
-                if math.abs(b.AbsolutePosition.Y - refY) < 24
-                    and math.abs(b.AbsoluteSize.Y - refH) < 24
-                    and math.abs(b.AbsoluteSize.X - refW) < 24 then
-                    row[#row + 1] = b
-                end
-            end
-            if #row >= 5 then
-                local avgY = 0
-                for _, b in ipairs(row) do avgY += b.AbsolutePosition.Y end
-                avgY /= #row
-                if avgY > vh * 0.5 and #row > bestN then
-                    best, bestN = row, #row
-                end
-            end
-        end
-    end
-    if not best then return {} end
-    table.sort(best, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
-    return best
-end
-
--- open the EVENT tab -> click the Nth preview tile -> return the unbox button if one appears
-local function reachBoxPage()
-    -- 1) open the event preview
-    local tiles = findPreviewTiles()
-    if #tiles < CONFIG.EventPreviewIndex then
-        local ev = findIn(visibleButtons(), CONFIG.EventTabKeywords)
-        if not ev then return nil, "no EVENT tab" end
-        fireButton(ev)
-        STATE.log = "event tab: " .. ev.Name
-        local t0 = os.clock()
-        repeat
-            task.wait(0.15)
-            tiles = findPreviewTiles()
-        until #tiles >= CONFIG.EventPreviewIndex or os.clock() - t0 > 3
-    end
-
-    if #tiles < CONFIG.EventPreviewIndex then
-        return nil, "event preview not found (" .. #tiles .. " tiles)"
-    end
-
-    -- 2) click the configured tile (the box)
-    local tile = tiles[CONFIG.EventPreviewIndex]
-    fireButton(tile)
-    STATE.log = "preview tile #" .. CONFIG.EventPreviewIndex .. ": " .. tile.Name
-
-    return waitForUnbox(2.0) or true
+    return nil
 end
 
 local function runBoxCycle()
@@ -625,13 +598,18 @@ local function runBoxCycle()
     if CONFIG.CloseBeforeCycle then closeAll() end
     task.wait(jit(0.3))
 
-    local unbox, err = reachBoxPage()
+    local before = buttonSet()
+    local ev = clickFirst(CONFIG.EventKeywords)
+    if not ev then STATE.log = "no event button"; uiLock = false; return false end
+    STATE.log = "event: " .. ev.Name
+    task.wait(jit(1.1))
+
+    local unbox = reachBoxPage(before)
     if not unbox then
-        STATE.log = err or "box page not reached"
+        STATE.log = "box page not reached"
         uiLock = false
         return false
     end
-    task.wait(jit(1.0))
 
     -- the account total is on this page: grab it while it's open
     candySrc = findCandySource()
@@ -642,11 +620,9 @@ local function runBoxCycle()
         STATE.lastCheck = os.clock()
     end
 
-    if unbox ~= true then
-        fireButton(unbox)
-        STATE.log = "unbox: " .. unbox.Name
-        task.wait(jit(1.3))
-    end
+    fireButton(unbox)
+    STATE.log = "unbox: " .. unbox.Name
+    task.wait(jit(1.3))
 
     local buy = clickFirst(CONFIG.BuyKeywords)
     if buy then
@@ -732,7 +708,7 @@ task.spawn(function()
 end)
 print("[MM2] open loop ok")
 
---==================== WALLET BALANCE (read off the event/box page) ====================
+--==================== WALLET BALANCE (read off the Halloween box page) ====================
 
 local function walletPath(o)
     local parts, n, pg, depth = {}, o, pgui(), 0
@@ -807,14 +783,19 @@ findCandySource = function()
     return best
 end
 
--- opens the event preview (view only, no cost), reads the total, closes again
+-- opens the Halloween box page (view only, no cost), reads the total, closes again
 probeBalance = function()
     if uiLock then return end
     uiLock = true
 
     local opened = false
     if not findUnbox() then
-        opened = reachBoxPage() ~= nil
+        local before = buttonSet()
+        local ev = clickFirst(CONFIG.EventKeywords)
+        if ev then
+            task.wait(jit(1.1))
+            opened = reachBoxPage(before) ~= nil
+        end
     end
 
     candySrc = findCandySource()
@@ -952,20 +933,20 @@ end
 mkBtn(6, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
     .MouseButton1Click:Connect(pickWallet)
 
-local PREV = {1, 2, 3, 4, 5, 6, 7, 8}
+local TABS = {1, 2, 3, 4, 5, 6, 7, 8}
 local tabBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
 local function refreshTab()
-    tabBtn.Text = string.format("Event preview tile #%d  (click to change)", CONFIG.EventPreviewIndex)
+    tabBtn.Text = string.format("Bottom tab #%d  (click to change)", CONFIG.BoxTabIndex)
 end
 tabBtn.MouseButton1Click:Connect(function()
     local idx = 1
-    for i, v in ipairs(PREV) do
-        if v == CONFIG.EventPreviewIndex then idx = i break end
+    for i, v in ipairs(TABS) do
+        if v == CONFIG.BoxTabIndex then idx = i break end
     end
-    idx = idx % #PREV + 1
-    CONFIG.EventPreviewIndex = PREV[idx]
+    idx = idx % #TABS + 1
+    CONFIG.BoxTabIndex = TABS[idx]
     refreshTab()
-    STATE.log = "preview tile #" .. CONFIG.EventPreviewIndex
+    STATE.log = "bottom tab #" .. CONFIG.BoxTabIndex
 end)
 refreshTab()
 
@@ -1096,11 +1077,11 @@ task.spawn(function()
                 math.floor((os.clock() - STATE.lastCheck) % 60))
             or "never"
         local txt = string.format(
-            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   tile #%d\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
+            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   steps: %d\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
             STATE.collected, STATE.skipped, STATE.hops,
             STATE.hops / math.max(run, 0.001),
             math.floor(run / 60), math.floor(run % 60),
-            STATE.boxes, CONFIG.EventPreviewIndex,
+            STATE.boxes, #CONFIG.Sequence,
             STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost, since,
             (STATE.walletName or "?"):sub(1, 28),
             (STATE.log or ""):sub(1, 30))
