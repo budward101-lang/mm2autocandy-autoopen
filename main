@@ -1,7 +1,51 @@
+One document, everything in it — notes at the top, full script below. Save as MM2_CandyFarm.txt and paste the whole thing into your executor.
+
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
---  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  Open flow: click SHOP (mid-left) -> click "Halloween Box '26" -> read/unbox
+--  Single-file build. Everything is in here.
+--=============================================================
+--
+--  KEYS
+--    RightShift = toggle UI panel
+--    F1         = toggle candy autofarm
+--    F2         = toggle auto-open box
+--    F3         = force open (ignore balance gate)
+--
+--  OPEN FLOW
+--    click SHOP (mid-left) -> click "Halloween Box '26" -> read balance -> unbox -> buy
+--
+--  WHAT THIS BUILD FIXES
+--    The old balance reader scored labels by whether their ancestor path
+--    contained words like "wallet"/"candy"/"total". In the Halloween shop UI
+--    the parents are generically named, so nothing matched and it latched onto
+--    a "Price" label instead (HUD showed the wrong number).
+--    v2 reader instead:
+--      1. reads the candy sprite off the "600" buy element  -> beacon asset id
+--      2. finds the visible label sitting next to that same sprite -> the balance
+--      3. backups: comma-formatted numbers (3,309), TextLabel over button,
+--         penalise anything equal to BoxCost, prefer the larger number
+--    readCandy strips commas so "3,309" parses as 3309.
+--
+--  HOW TO VERIFY IT TOOK
+--    Watch the HUD "balance" and "source" rows. You want e.g.
+--      balance : 3309/600
+--    and a source name that is NOT price/cost related.
+--
+--  IF IT STILL GRABS THE WRONG ELEMENT
+--    Open the shop and hit "PIN WALLET (click the candy total)", then click
+--    directly on the balance number. The pin overrides the auto-scorer.
+--    "PIN SHOP" does the same for the shop button if it misses that too.
+--
+--  NOTES
+--    - STATE.candy is decremented locally by BoxCost after each open and
+--      re-synced by the probe loop every 6-12s, so drift self-corrects.
+--    - Anti-kick humanizer is ON by default (F-key/UI toggle to disable).
+--    - Set CONFIG.BoxCost if the box price changes.
+--    - Set CONFIG.RequireBalance = false (or press F3) to ignore the gate.
+--
+--  KEYS FOR RECORDED MODE (optional)
+--    "ADD STEP" then click a button in-game to record its path, then flip
+--    "Open flow" to recorded. Prints a Sequence table to paste into CONFIG.
 --=============================================================
 
 local CONFIG = {
@@ -41,6 +85,7 @@ local CONFIG = {
     CycleCooldown = 3.0,
 
     --========== WALLET BALANCE ==========
+    -- (kept for reference; v2 reader below is icon-driven and no longer needs these)
     WalletKeywords  = {"wallet", "candy", "sweet", "balance", "currency",
                        "total", "amount", "owned", "count"},
     BalanceCheckMin = 6,
@@ -453,77 +498,82 @@ local function pathFromPg(o)
     return table.concat(parts, ".")
 end
 
---==================== WALLET READER ====================
+--==================== WALLET READER (v2) ====================
+-- Finds the candy counter by matching the candy sprite that sits next to the
+-- "600" buy element. Falls back to comma-formatted numbers, penalises
+-- buttons / the cost label so the 600 and the key counter can't win.
 
 local candySrc = nil
 
-local function walletPath(o)
-    local parts, n, pg, depth = {}, o, pgui(), 0
-    while n and n ~= pg and depth < 4 do
-        parts[#parts + 1] = n.Name
-        n = n.Parent
-        depth += 1
-    end
-    return table.concat(parts, " "):lower()
+local function stripNum(t)
+    if type(t) ~= "string" then return nil end
+    local d = t:gsub("[^%d]", "")
+    if #d == 0 or #d > 9 then return nil end
+    return tonumber(d)
 end
 
-local function matchesWallet(o)
-    local n = walletPath(o)
-    for _, kw in ipairs(CONFIG.WalletKeywords) do
-        if n:find(kw, 1, true) then return true end
+-- the little sprite sitting next to a label (candy / key / etc.)
+local function iconNear(o)
+    local p = o.Parent
+    if p then
+        for _, d in ipairs(p:GetChildren()) do
+            if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" then
+                return d.Image
+            end
+        end
     end
-    return false
+    local pp = p and p.Parent
+    if pp then
+        for _, d in ipairs(pp:GetChildren()) do
+            if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" then
+                return d.Image
+            end
+        end
+    end
+    return nil
 end
 
-local function scoreWallet(o)
-    local n = walletPath(o)
-    local s = 0
-    if n:find("wallet",  1, true) then s += 120 end
-    if n:find("balance", 1, true) then s += 60  end
-    if n:find("total",   1, true) then s += 60  end
-    if n:find("owned",   1, true) then s += 50  end
-    if n:find("candy",   1, true) then s += 40  end
-    if n:find("sweet",   1, true) then s += 25  end
-    if n:find("collect", 1, true) then s -= 30  end
-    if n:find("cost", 1, true) or n:find("price", 1, true) then s -= 40 end
-    if o:IsA("TextLabel") then s += 20 end
-    return s
+-- the icon on the "600" buy element IS the candy sprite -> use it as a beacon
+local function candyIconRef()
+    local pg = pgui(); if not pg then return nil end
+    local cost = tostring(CONFIG.BoxCost)
+    for _, o in ipairs(pg:GetDescendants()) do
+        if (o:IsA("TextLabel") or o:IsA("TextButton"))
+            and o.Visible and chainVisible(o.Parent) and not isOwnGui(o)
+            and o.Text:gsub("[^%d]", "") == cost then
+            local ic = iconNear(o)
+            if ic then return ic end
+        end
+    end
+    return nil
 end
 
 local function readCandy()
     local s = candySrc
     if not s or not s.Parent then return nil end
-    if s:IsA("TextLabel") or s:IsA("TextButton") then
-        local t = s.Text:gsub("[^%d]", "")
-        return #t > 0 and tonumber(t) or nil
-    end
+    if s:IsA("TextLabel") or s:IsA("TextButton") then return stripNum(s.Text) end
     return tonumber(s.Value)
 end
 
 local function findCandySource()
+    local pg = pgui(); if not pg then return nil end
+    local refIcon = candyIconRef()
     local best, bestScore = nil, -math.huge
-    local function consider(o, numeric)
-        if not numeric or not matchesWallet(o) then return end
-        if o:FindFirstAncestor(OWN_GUI_NAME) then return end
-        local s = scoreWallet(o)
-        if s > bestScore then best, bestScore = o, s end
-    end
 
-    local pg = pgui()
-    if pg then
-        for _, o in ipairs(pg:GetDescendants()) do
-            if o:IsA("TextLabel") and o.Visible and chainVisible(o.Parent) then
-                consider(o, #(o.Text:gsub("[^%d]", "")) > 0)
-            end
-        end
-    end
-
-    for _, root in ipairs({LP:FindFirstChild("leaderstats"), LP, RS}) do
-        if root then
-            for _, o in ipairs(root:GetDescendants()) do
-                if o:IsA("IntValue") or o:IsA("NumberValue") or o:IsA("StringValue") then
-                    consider(o, tonumber(o.Value) ~= nil)
-                end
+    for _, o in ipairs(pg:GetDescendants()) do
+        if (o:IsA("TextLabel") or o:IsA("TextButton"))
+            and o.Visible and not isOwnGui(o) and chainVisible(o.Parent) then
+            local v = stripNum(o.Text)
+            if v then
+                local s = 0
+                local ic = iconNear(o)
+                if refIcon and ic == refIcon then s += 300 end  -- same sprite as the cost = candy
+                if o.Text:find(",", 1, true) then s += 150 end  -- 3,309 style formatting
+                if o:IsA("TextLabel") then s += 90 else s -= 70 end
+                if o.Text:gsub("[^%d]", "") == tostring(CONFIG.BoxCost) then s -= 50 end
+                if ic then s += 25 end
+                s += math.min(v, 1e7) / 100000                 -- prefer the bigger number
+                if s > bestScore then best, bestScore = o, s end
             end
         end
     end
@@ -702,6 +752,7 @@ local function runBoxCycle()
         STATE.candy = bal
         STATE.checkedOnce = true
         STATE.lastCheck = os.clock()
+        if candySrc then STATE.walletName = candySrc.Name end
     end
 
     local unbox = waitForUnbox(2.0)
