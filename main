@@ -1,7 +1,7 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  Open flow: click SHOP tab -> click "Halloween Box '26" -> read/unbox
+--  Open flow: click SHOP (mid-left) -> click "Halloween Box '26" -> read/unbox
 --=============================================================
 
 local CONFIG = {
@@ -48,8 +48,9 @@ local CONFIG = {
 
     --========== BOX OPEN FLOW ==========
     OpenMode      = "builtin",
-    ShopKeywords    = {"shop"},                                -- bottom tab that opens the shop
+    ShopKeywords    = {"shop", "store"},                       -- mid-left shop button
     BoxNameKeywords = {"halloween box", "box '26", "box 26"},  -- shop entry to click
+    ShopMaxY        = 0.80,                                    -- above this = not the bottom tab strip
     UnboxKeywords = {"unbox", "open box", "hatch", "open"},
     BuyKeywords   = {"buy", "purchase", "confirm", "600"},
 
@@ -531,6 +532,8 @@ end
 
 --==================== SHOP / BOX FINDING ====================
 
+local shopPin = nil   -- full path to the shop button (set by PIN SHOP)
+
 local function viewportY()
     local cam = workspace.CurrentCamera
     return cam and cam.ViewportSize.Y or 1080
@@ -547,6 +550,28 @@ local function findIn(list, keywords)
         end
     end
     return nil
+end
+
+-- the SHOP button: left side, above the bottom tab strip (so it won't hit EVENT)
+local function findShopTab()
+    if shopPin then
+        local b = resolvePath(shopPin)
+        if b and b.Parent and b.Visible and chainVisible(b.Parent) then return b end
+    end
+
+    local vis = visibleButtons()
+    local vh = viewportY()
+    local fallback
+    for _, kw in ipairs(CONFIG.ShopKeywords) do
+        for _, b in ipairs(vis) do
+            if buttonLabel(b):lower():find(kw, 1, true) then
+                if not fallback then fallback = b end
+                -- shop lives mid-left, NOT in the bottom strip where EVENT sits
+                if b.AbsolutePosition.Y < vh * CONFIG.ShopMaxY then return b end
+            end
+        end
+    end
+    return fallback
 end
 
 -- find a clickable by its visible text (button first, then climb from a label)
@@ -632,10 +657,12 @@ local function clickFirst(keywords)
     return b
 end
 
--- the whole balance/unbox path: SHOP tab -> "Halloween Box '26"
+-- the whole balance/unbox path: SHOP (mid-left) -> "Halloween Box '26"
 local function openShopBox()
-    local shop = findIn(visibleButtons(), CONFIG.ShopKeywords)
+    local shop = findShopTab()
     if not shop then return nil, "no SHOP button" end
+    print(string.format("[MM2] shop target: %s  x=%d y=%d",
+        shop:GetFullName(), shop.AbsolutePosition.X, shop.AbsolutePosition.Y))
     fireButton(shop)
     STATE.log = "shop: " .. shop.Name
     task.wait(jit(1.0))
@@ -811,7 +838,7 @@ local gui = new("ScreenGui", {
 }, LP:WaitForChild("PlayerGui"))
 
 local main = new("Frame", {
-    Size = UDim2.new(0, 305, 0, 620), Position = UDim2.new(0, 20, 0, 55),
+    Size = UDim2.new(0, 305, 0, 660), Position = UDim2.new(0, 20, 0, 55),
     BackgroundColor3 = Color3.fromRGB(20, 16, 28), BorderSizePixel = 0, Active = true,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
@@ -910,8 +937,41 @@ end
 mkBtn(6, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
     .MouseButton1Click:Connect(pickWallet)
 
+-- pin the shop button exactly
+local shopPinning = false
+local function pickShop()
+    if shopPinning then return end
+    shopPinning = true
+    local conn
+    local function cleanup() shopPinning = false; if conn then conn:Disconnect() end end
+    task.delay(8, function() if shopPinning then cleanup(); STATE.log = "shop pick timed out" end end)
+
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not shopPinning or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        cleanup()
+        task.wait(0.05)
+        local pg = pgui()
+        local m = UIS:GetMouseLocation()
+        for _, y in ipairs({m.Y, m.Y - 36}) do
+            for _, o in ipairs(pg:GetGuiObjectsAtPosition(m.X, y)) do
+                if o:IsA("GuiButton") and o.Visible and chainVisible(o.Parent) and not isOwnGui(o) then
+                    shopPin = pathFromPg(o)
+                    STATE.log = "shop pinned: " .. o.Name
+                    return
+                end
+            end
+        end
+        STATE.log = "no button there"
+    end)
+end
+
+mkBtn(7, "PIN SHOP  (click the shop button)", Color3.fromRGB(35, 55, 70), 30)
+    .MouseButton1Click:Connect(pickShop)
+
 local BOXNAMES = {"halloween box", "box '26", "box 26", "halloween"}
-local boxBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
+local boxBtn = mkBtn(8, "", Color3.fromRGB(50, 42, 30))
 local function refreshBox()
     boxBtn.Text = "Shop -> '" .. (CONFIG.BoxNameKeywords[1] or "?") .. "'  (click to change)"
 end
@@ -927,7 +987,7 @@ boxBtn.MouseButton1Click:Connect(function()
 end)
 refreshBox()
 
-local modeBtn = mkBtn(8, "", Color3.fromRGB(45, 40, 55))
+local modeBtn = mkBtn(9, "", Color3.fromRGB(45, 40, 55))
 local function refreshMode()
     modeBtn.Text = "Open flow: " .. (CONFIG.OpenMode == "builtin" and "built-in" or "recorded")
         .. "  (click to change)"
@@ -940,7 +1000,7 @@ end)
 refreshMode()
 
 local DWELLS = {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0}
-local dwellBtn = mkBtn(9, "", Color3.fromRGB(50, 42, 30))
+local dwellBtn = mkBtn(10, "", Color3.fromRGB(50, 42, 30))
 local function refreshDwell()
     dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
 end
@@ -1012,10 +1072,10 @@ local function addStep()
     end)
 end
 
-mkBtn(10, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+mkBtn(11, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
     .MouseButton1Click:Connect(addStep)
 
-mkBtn(11, "Remove last step", Color3.fromRGB(55, 45, 35))
+mkBtn(12, "Remove last step", Color3.fromRGB(55, 45, 35))
     .MouseButton1Click:Connect(function()
         if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
         local removed = table.remove(CONFIG.Sequence)
