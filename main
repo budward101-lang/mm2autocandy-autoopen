@@ -1,11 +1,10 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026 — CANDY FARM + AUTO OPEN BOX
---  v8: left-column shop targeting (Inventory/Shop/Spectate stack),
---  arrow filtered out, learns slot from pin. Centred GUI.
+--  v16: only clicks SHOP, the BOX tile, and BUY. Nothing else.
 --  RightShift UI | F1 farm | F2 open | F3 force
 --=============================================================
 
-print("[MM2] v8 booting")
+print("[MM2] v16 booting")
 
 local Players = game:GetService("Players")
 local UIS     = game:GetService("UserInputService")
@@ -15,27 +14,23 @@ print("[MM2] services ok")
 
 local CFG = {
     Speed = 20, Dwell = 3.0, Retry = 2.0, MaxTry = 3, Tick = 0.1, Rescan = 3.0,
-    Cost = 600, Gate = true, BuyIfUnknown = false, TabFallback = false,
-    -- left sidebar: icons sit at ~5% from the left; shop is the 2nd one down
-    ShopBand = 0.15, ShopMin = 60, ShopIndex = 2,
-    ShopKW  = {"shop", "store"},
-    TileKW  = {"halloween box", "halloween", "mystery box", "mystery", "box"},
-    UnboxKW = {"unbox", "open box", "hatch", "open"},
-    BuyKW   = {"buy", "purchase", "confirm", "600"},
-    CloseKW = {"close", "exit", "back", "x"},
-    CloseNo = {"backpack", "bag", "shop", "store", "inventory", "spectate"},
-    PopupKW = {"ok", "claim", "collect", "continue", "next", "nice", "great"},
+    Cost = 600, Gate = true, BuyIfUnknown = true,
+    IgnoreEvent = true,
+    ShopBand = 0.15, ShopMin = 60,
+    TileKW  = {"halloween", "mystery", "box", "26"},
+    TileNo  = {"event", "radio", "modes", "settings", "backpack", "trade", "index", "codes"},
+    EventKW = {"event"},
+    BuyKW   = {"buy", "unbox", "open", "hatch", "purchase", "confirm"},
     BottomY = 0.70,
 }
 local S = {
     farm = true, open = true, force = false,
-    onBox = false, waiting = false, candy = nil,
-    boxes = 0, picked = 0, log = "boot", walletName = "?",
-    shopName = "NONE", shopHow = "-", busy = false,
+    waiting = false, candy = nil, boxes = 0, picked = 0,
+    log = "boot", lastClick = "-", tileName = "-", shopName = "NONE", busy = false,
 }
 print("[MM2] config ok")
 
-local OWN = "MM2FarmV8"
+local OWN = "MM2FarmV16"
 
 local function pgui()
     local p = LP:FindFirstChildOfClass("PlayerGui")
@@ -83,6 +78,12 @@ local function label(b)
     return b.Name
 end
 
+local function textOnly(b)
+    local t = b:IsA("TextButton") and b.Text or ""
+    if t == "" then t = b.Name end
+    return (t:lower():gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
 local function labelDeep(b)
     local s = label(b)
     local n = 0
@@ -114,38 +115,44 @@ local function inBottom(b)
     return b.AbsolutePosition.Y >= vpY() * CFG.BottomY
 end
 
-local function bodyButtons()
-    local out = {}
-    local all = buttons()
-    for i = 1, #all do
-        if not inBottom(all[i]) then out[#out + 1] = all[i] end
-    end
-    return out
+local function inSidebar(b)
+    return (b.AbsolutePosition.X + b.AbsoluteSize.X * 0.5) / vpX() < CFG.ShopBand
 end
 
-local function bottomRow()
+-- content area, minus the very bottom quick-bar
+local function actionButtons()
     local out = {}
     local all = buttons()
+    local lim = vpY() * 0.90
     for i = 1, #all do
-        if inBottom(all[i]) then out[#out + 1] = all[i] end
-    end
-    table.sort(out, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
-    return out
-end
-
-local function findKW(list, kws, deep)
-    for k = 1, #kws do
-        for i = 1, #list do
-            local s
-            if deep then s = labelDeep(list[i]) else s = label(list[i]) end
-            if s:lower():find(kws[k], 1, true) then return list[i] end
+        local b = all[i]
+        if not inSidebar(b) and b.AbsolutePosition.Y < lim then
+            out[#out + 1] = b
         end
+    end
+    return out
+end
+
+local function buttonAncestor(o)
+    local p = o
+    local d = 0
+    while p and d < 6 do
+        if p:IsA("GuiButton") then return p end
+        p = p.Parent
+        d = d + 1
     end
     return nil
 end
 
+local function validBtn(b)
+    return b and b.Parent and b.Visible and chainVis(b.Parent) and not own(b)
+end
+
+local lastClickBtn, lastClickAt = nil, 0
 local function click(b)
     if not b or not b.Parent then return false end
+    if b == lastClickBtn and os.clock() - lastClickAt < 0.35 then return true end
+    lastClickBtn, lastClickAt = b, os.clock()
     pcall(function() b.Active = true end)
     if getconnections then
         local done = false
@@ -169,27 +176,6 @@ local function click(b)
 end
 print("[MM2] helpers ok")
 
---==================== LEFT SIDEBAR ====================
-
--- the INVENTORY / SHOP / SPECTATE stack down the left edge.
--- the little "<" collapse arrow is excluded by the size floor.
-local function sidebar()
-    local out = {}
-    local all = buttons()
-    local vx = vpX()
-    for i = 1, #all do
-        local b = all[i]
-        local pos, sz = b.AbsolutePosition, b.AbsoluteSize
-        local cx = (pos.X + sz.X * 0.5) / vx
-        if cx < CFG.ShopBand and not inBottom(b)
-            and sz.X >= CFG.ShopMin and sz.Y >= CFG.ShopMin then
-            out[#out + 1] = b
-        end
-    end
-    table.sort(out, function(a, b) return a.AbsolutePosition.Y < b.AbsolutePosition.Y end)
-    return out
-end
-
 --==================== WALLET ====================
 
 local walletEl = nil
@@ -212,303 +198,244 @@ local function findWallet()
         if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Visible
             and chainVis(o.Parent) and not own(o) then
             local d = o.Text:gsub("[^%d]", "")
-            if #d > 0 then
+            if #d > 0 and #d <= 9 then
                 local path = ""
                 local n = o
                 local depth = 0
-                while n and n ~= pg and depth < 4 do
+                while n and n ~= pg and depth < 5 do
                     path = path .. " " .. n.Name
                     n = n.Parent
                     depth = depth + 1
                 end
                 path = path:lower()
                 local sc = 0
-                if path:find("wallet", 1, true) then sc = sc + 100 end
-                if path:find("balance", 1, true) then sc = sc + 60 end
-                if path:find("total", 1, true) then sc = sc + 60 end
-                if path:find("candy", 1, true) then sc = sc + 40 end
-                if path:find("owned", 1, true) then sc = sc + 40 end
-                if path:find("amount", 1, true) then sc = sc + 20 end
-                if path:find("cost", 1, true) then sc = sc - 40 end
-                if path:find("price", 1, true) then sc = sc - 40 end
+                if path:find("wallet", 1, true)    then sc = sc + 120 end
+                if path:find("balance", 1, true)   then sc = sc + 80 end
+                if path:find("total", 1, true)     then sc = sc + 80 end
+                if path:find("candy", 1, true)     then sc = sc + 60 end
+                if path:find("owned", 1, true)     then sc = sc + 50 end
+                if path:find("currency", 1, true)  then sc = sc + 50 end
+                if path:find("amount", 1, true)    then sc = sc + 25 end
+                if path:find("cost", 1, true)      then sc = sc - 45 end
+                if path:find("price", 1, true)     then sc = sc - 45 end
+                if o.Text:match("^[%d,]+$") then sc = sc + 35 end
                 if sc > bestScore then bestScore = sc; best = o end
             end
         end
     end
-    if best and bestScore > 0 then
-        S.walletName = best.Name
-        return best
-    end
+    if best and bestScore > 40 then return best end
     return nil
 end
 
-local function canBuy()
-    if S.force then return true end
-    if not CFG.Gate then return true end
+local function currentBalance()
     if not walletEl or not walletEl.Parent then walletEl = findWallet() end
     local bal = readCandy()
     if bal then S.candy = bal end
-    if not bal then bal = S.candy end
-    if bal == nil then return CFG.BuyIfUnknown end
-    return bal >= CFG.Cost
+    return bal or S.candy
 end
 print("[MM2] wallet ok")
 
---==================== NAV ====================
+--==================== THE ONLY THREE LOOKUPS ====================
 
 local shopPin, tilePin = nil, nil
+local baseBtns = {}
 
-local function textOf(o)
-    local t = o.Name
-    if o:IsA("TextLabel") or o:IsA("TextButton") then t = t .. " " .. o.Text end
-    return t
+local function snapshotBase()
+    baseBtns = {}
+    local all = buttons()
+    for i = 1, #all do
+        baseBtns[all[i]:GetFullName()] = true
+    end
 end
 
-local function buttonAncestor(o)
-    local p = o
-    local d = 0
-    while p and d < 6 do
-        if p:IsA("GuiButton") then return p end
+-- 1) SHOP button: sidebar button whose text says shop
+local function findShopBtn()
+    if validBtn(shopPin) then return shopPin end
+    local all = buttons()
+    local best, bs = nil, 0
+    for i = 1, #all do
+        local b = all[i]
+        if inSidebar(b) then
+            local t = textOnly(b)
+            local l = (b.Name .. " " .. t):lower()
+            local sc = 0
+            if t == "shop" then sc = sc + 200
+            elseif l:find("shop", 1, true) then sc = sc + 120 end
+            if l:find("store", 1, true) then sc = sc + 60 end
+            if sc > bs then bs = sc; best = b end
+        end
+    end
+    return best
+end
+
+-- 2) BOX tile: big square in the content area, halloween/mystery/box, no event
+local function isEventBtn(b)
+    local np = labelDeep(b):lower()
+    local p, d = b.Parent, 0
+    while p and d < 3 do
+        np = np .. " " .. p.Name
         p = p.Parent
         d = d + 1
     end
-    return nil
+    for k = 1, #CFG.EventKW do
+        if np:find(CFG.EventKW[k], 1, true) then return true end
+    end
+    return false
 end
 
-local function validBtn(b)
-    return b and b.Parent and b.Visible and chainVis(b.Parent) and not own(b)
-end
-
-local function findShop()
-    if validBtn(shopPin) then return shopPin, "pin" end
+local function findBoxBtn()
+    if validBtn(tilePin) then return tilePin end
 
     local pg = pgui()
-    if pg then
-        local kids = pg:GetDescendants()
-        local best, bestScore = nil, 0
-        for i = 1, #kids do
-            local o = kids[i]
-            if (o:IsA("TextLabel") or o:IsA("TextButton")
-                or o:IsA("ImageButton") or o:IsA("ImageLabel"))
-                and o.Visible and chainVis(o.Parent) and not own(o) then
-                local t = textOf(o):lower()
-                local sc = 0
-                if t:find("shop", 1, true) then sc = sc + 100 end
-                if t:find("store", 1, true) then sc = sc + 60 end
-                if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text:find("%$") then
-                    sc = sc + 45
-                end
-                if sc > 0 then
-                    local b = buttonAncestor(o)
-                    if validBtn(b) and not inBottom(b) then
-                        if sc > bestScore then bestScore = sc; best = b end
-                    end
-                end
-            end
-        end
-        if best then return best, "text" end
-    end
-
-    -- the left sidebar: slot #2 is SHOP (INVENTORY is #1, SPECTATE is #3)
-    local col = sidebar()
-    local cand = col[CFG.ShopIndex]
-    if validBtn(cand) then return cand, "column#" .. CFG.ShopIndex end
-
-    -- last resort: whitish button on the left half, above the tab row
+    if not pg then return nil end
     local vx, vy = vpX(), vpY()
-    local all = buttons()
-    for i = 1, #all do
-        local b = all[i]
-        if not inBottom(b) then
-            local pos, sz = b.AbsolutePosition, b.AbsoluteSize
-            local cx = (pos.X + sz.X * 0.5) / vx
-            local cy = (pos.Y + sz.Y * 0.5) / vy
-            local c = b.BackgroundColor3
-            local whitish = c.R > 0.65 and c.G > 0.65 and c.B > 0.65
-            if cx > 0.02 and cx < 0.4 and cy > 0.12 and cy < 0.85
-                and sz.X > 60 and sz.X < 200 and whitish then
-                return b, "geometry"
+    local best, bs = nil, 0
+    local kids = pg:GetDescendants()
+    for i = 1, #kids do
+        local o = kids[i]
+        if (o:IsA("TextLabel") or o:IsA("TextButton")
+            or o:IsA("ImageButton") or o:IsA("ImageLabel"))
+            and o.Visible and chainVis(o.Parent) and not own(o) then
+            local b = buttonAncestor(o)
+            if validBtn(b) and b ~= shopPin and not inBottom(b) and not inSidebar(b) then
+                local sz, pos = b.AbsoluteSize, b.AbsolutePosition
+                local cx = (pos.X + sz.X * 0.5) / vx
+                local cy = (pos.Y + sz.Y * 0.5) / vy
+                if sz.X > 100 and sz.Y > 100
+                    and cx > 0.16 and cx < 0.96 and cy > 0.10 and cy < 0.92
+                    and not isEventBtn(b) then
+                    local t = (o.Name .. " " .. (o:IsA("TextButton") and o.Text or "")):lower()
+                    local sc = 0
+                    if t:find("halloween", 1, true) then sc = sc + 130 end
+                    if t:find("mystery",   1, true) then sc = sc + 95  end
+                    if t:find("box",       1, true) then sc = sc + 60  end
+                    if t:find("26",        1, true) then sc = sc + 25  end
+                    if t:find("candy",     1, true) then sc = sc - 25  end
+                    if t:find("shop",      1, true) then sc = sc - 15  end
+                    if sc == 0 then sc = 5 end
+                    sc = sc + math.min(sz.X * sz.Y / 80000, 8)
+                    if sc > bs then bs = sc; best = b end
+                end
             end
         end
     end
-    return nil, "none"
+    return best
 end
 
-local function findTile()
-    if tilePin and tilePin.Parent and tilePin.Visible and chainVis(tilePin.Parent) then return tilePin end
-    return findKW(bodyButtons(), CFG.TileKW, true)
-end
-
-local function findUnbox()
-    return findKW(bodyButtons(), CFG.UnboxKW, false)
-end
-
-local function waitUnbox(t)
-    local t0 = os.clock()
-    while os.clock() - t0 < t do
-        local b = findUnbox()
-        if b then return b end
-        task.wait(0.15)
+-- 3) BUY button: short, content-area button that says buy/unbox/open
+local function findBuyBtn(exclude)
+    local body = actionButtons()
+    local best, bs = nil, 0
+    for i = 1, #body do
+        local b = body[i]
+        if b ~= exclude and b.AbsoluteSize.Y < 80 then
+            local t = textOnly(b)
+            local l = (b.Name .. " " .. t):lower()
+            local sc = 0
+            if t == "buy" or t == "unbox" or t == "open" or t == "hatch" then
+                sc = sc + 200
+            end
+            if l:find("unbox", 1, true)    then sc = sc + 110 end
+            if l:find("buy", 1, true)      then sc = sc + 100 end
+            if l:find("purchase", 1, true) then sc = sc + 100 end
+            if l:find("hatch", 1, true)    then sc = sc + 100 end
+            if l:find("confirm", 1, true)  then sc = sc + 80  end
+            if l:find("open", 1, true)     then sc = sc + 50  end
+            if l:find("unboxed", 1, true)  then sc = sc - 60  end
+            if b.AbsoluteSize.Y < 34 then sc = sc - 40 end
+            if sc > bs then bs = sc; best = b end
+        end
     end
+    if bs >= 90 then return best end
     return nil
 end
+print("[MM2] lookups ok")
 
-local function isClose(b)
-    local l = label(b):lower()
-    for i = 1, #CFG.CloseNo do
-        if l:find(CFG.CloseNo[i], 1, true) then return false end
-    end
-    for i = 1, #CFG.CloseKW do
-        local k = CFG.CloseKW[i]
-        if l == k then return true end
-        if #k > 2 and l:find(k, 1, true) then return true end
-    end
-    return false
-end
+--==================== THE STEP ====================
+-- one pass = at most one click, and only on shop / box / buy
 
-local function closeAll()
-    S.onBox = false
-    for _ = 1, 3 do
-        local vis = buttons()
-        local target = nil
-        for i = 1, #vis do
-            if isClose(vis[i]) then target = vis[i]; break end
-        end
-        if not target then return end
-        click(target)
-        task.wait(0.5)
-    end
-end
-
-local function dismissPopup()
-    if findUnbox() then return false end
-    local body = bodyButtons()
-    for k = 1, #CFG.PopupKW do
-        for i = 1, #body do
-            if label(body[i]):lower() == CFG.PopupKW[k] then
-                click(body[i])
-                task.wait(0.4)
-                return true
-            end
-        end
-    end
-    return false
-end
-
-local function reachBox()
-    local u = findUnbox()
-    if u then return u end
-    u = waitUnbox(1.2)
-    if u then return u end
-
-    local tile = findTile()
-    if tile then
-        click(tile)
-        S.log = "tile: " .. tile.Name
-        task.wait(0.8)
-        u = waitUnbox(2.5)
-        if u then return u end
-    end
-
-    if CFG.TabFallback then
-        local row = bottomRow()
-        for i = 1, #row do
-            click(row[i])
-            u = waitUnbox(1.2)
-            if u then
-                S.log = "tab fallback: " .. row[i].Name
-                return u
-            end
-        end
-    end
-    return nil
-end
-
-local function doBuy(u)
-    click(u)
-    task.wait(1.2)
-    local b = findKW(bodyButtons(), CFG.BuyKW, false)
-    if not b then b = findKW(buttons(), CFG.BuyKW, false) end
-    if b then
-        click(b)
-        S.log = "buy: " .. b.Name
-        task.wait(1.0)
-    end
-    local after = readCandy()
-    if after then
-        S.candy = after
-    elseif S.candy then
-        S.candy = math.max(0, S.candy - CFG.Cost)
-    end
-    S.boxes = S.boxes + 1
-end
-
-local function cycle()
-    S.busy = true
-
-    if S.onBox then
-        if not canBuy() then
-            S.waiting = true
-            S.log = "waiting " .. tostring(S.candy) .. "/" .. CFG.Cost
-            S.busy = false
-            return
-        end
-        local u = findUnbox()
-        if not u and dismissPopup() then u = waitUnbox(1.0) end
-        if u then
-            doBuy(u)
-            S.waiting = false
-            S.busy = false
-            return
-        end
-        S.onBox = false
-        S.log = "page gone - full cycle"
-    end
-
-    closeAll()
-    task.wait(0.3)
-
-    local shop, how = findShop()
-    S.shopName = shop and shop.Name or "NONE"
-    S.shopHow = how
-    if not shop then
-        S.log = "NO SHOP - use PIN SHOP"
-        S.busy = false
-        return
-    end
-    click(shop)
-    S.log = "shop (" .. how .. "): " .. shop.Name
-    task.wait(1.1)
-
-    local u = reachBox()
-    if not u then
-        S.log = "shop open, no unbox button"
-        S.busy = false
-        return
-    end
-
-    walletEl = findWallet()
-    local bal = readCandy()
-    if bal then S.candy = bal end
-
-    if not canBuy() then
-        S.log = "page open - need " .. CFG.Cost
+local function step()
+    -- broke? touch nothing at all
+    local bal = currentBalance()
+    if CFG.Gate and not S.force and bal ~= nil and bal < CFG.Cost then
         S.waiting = true
-        S.onBox = true
-        S.busy = false
+        S.log = "bal " .. bal .. " < " .. CFG.Cost .. " - holding"
+        return
+    end
+    S.waiting = false
+
+    -- already on a box menu? just buy
+    local buy = findBuyBtn(nil)
+    if buy then
+        click(buy)
+        S.lastClick = "buy " .. buy.Name
+        S.boxes = S.boxes + 1
+        task.wait(0.9)
+        local c = findBuyBtn(buy)
+        if c then
+            click(c)
+            S.lastClick = "confirm " .. c.Name
+            task.wait(0.6)
+        end
         return
     end
 
-    doBuy(u)
-    S.waiting = false
-    S.onBox = true
-    S.busy = false
+    -- box visible? click it, then buy
+    local box = findBoxBtn()
+    if box then
+        click(box)
+        S.lastClick = "box " .. box.Name
+        S.tileName = box.Name
+        local t0 = os.clock()
+        local b2 = nil
+        while os.clock() - t0 < 2.0 do
+            b2 = findBuyBtn(box)
+            if b2 then break end
+            task.wait(0.15)
+        end
+        if b2 then
+            local bal2 = currentBalance()
+            if (not CFG.Gate) or S.force or bal2 == nil or bal2 >= CFG.Cost then
+                click(b2)
+                S.lastClick = "buy " .. b2.Name
+                S.boxes = S.boxes + 1
+                task.wait(0.8)
+                local c = findBuyBtn(b2)
+                if c then
+                    click(c)
+                    S.lastClick = "confirm " .. c.Name
+                    task.wait(0.6)
+                end
+            end
+        else
+            S.log = "no buy button after box"
+        end
+        return
+    end
+
+    -- nothing else -> click shop
+    local shop = findShopBtn()
+    if shop then
+        click(shop)
+        S.lastClick = "shop " .. shop.Name
+        S.shopName = shop.Name
+        S.log = "clicked shop"
+        task.wait(1.0)
+    else
+        S.log = "no shop button"
+    end
 end
-print("[MM2] nav ok")
 
 task.spawn(function()
-    while task.wait(0.5) do
-        if S.open and not S.busy then cycle() end
+    task.wait(2)
+    snapshotBase()
+    while true do
+        task.wait(0.4)
+        if S.open and not S.busy then
+            S.busy = true
+            step()
+            S.busy = false
+        end
     end
 end)
 print("[MM2] open loop ok")
@@ -652,7 +579,7 @@ task.spawn(function()
 end)
 print("[MM2] farm loop ok")
 
---==================== UI (centred) ====================
+--==================== UI ====================
 
 local gui = Instance.new("ScreenGui")
 gui.Name = OWN
@@ -661,7 +588,7 @@ gui.IgnoreGuiInset = true
 gui.Parent = pgui()
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 310, 0, 500)
+frame.Size = UDim2.new(0, 320, 0, 520)
 frame.AnchorPoint = Vector2.new(0.5, 0.5)
 frame.Position = UDim2.new(0.5, 0, 0.5, 0)
 frame.BackgroundColor3 = Color3.fromRGB(18, 15, 26)
@@ -678,5 +605,236 @@ local head = Instance.new("TextLabel")
 head.Size = UDim2.new(1, 0, 0, 30)
 head.BackgroundColor3 = Color3.fromRGB(30, 22, 40)
 head.BorderSizePixel = 0
-head.Text = "  MM2 FARM v8  -  LOADED"
-head.TextColor3 = Color3.fromRGB(255, 175,
+head.Text = "  MM2 FARM v16  -  LOADED"
+head.TextColor3 = Color3.fromRGB(255, 175, 80)
+head.Font = Enum.Font.GothamBold
+head.TextSize = 14
+head.TextXAlignment = Enum.TextXAlignment.Left
+head.Parent = frame
+local hc = Instance.new("UICorner"); hc.CornerRadius = UDim.new(0, 10); hc.Parent = head
+
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, -16, 1, -40)
+body.Position = UDim2.new(0, 8, 0, 34)
+body.BackgroundTransparency = 1
+body.Parent = frame
+local lay = Instance.new("UIListLayout")
+lay.Padding = UDim.new(0, 5)
+lay.SortOrder = Enum.SortOrder.LayoutOrder
+lay.Parent = body
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, 0, 0, 100)
+status.LayoutOrder = 1
+status.BackgroundColor3 = Color3.fromRGB(26, 20, 34)
+status.BorderSizePixel = 0
+status.TextColor3 = Color3.fromRGB(205, 205, 215)
+status.Font = Enum.Font.Code
+status.TextSize = 11
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.Text = ""
+status.Parent = body
+local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(0, 6); sc.Parent = status
+local pad = Instance.new("UIPadding")
+pad.PaddingTop = UDim.new(0, 6)
+pad.PaddingLeft = UDim.new(0, 8)
+pad.Parent = status
+
+local order = 1
+local function mk(text, color, h)
+    order = order + 1
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, 0, 0, h or 26)
+    b.LayoutOrder = order
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(235, 235, 240)
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = 12
+    b.BorderSizePixel = 0
+    b.Parent = body
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = b
+    return b
+end
+
+local function toggle(text, get, set)
+    local txt = type(text) == "function" and text or function() return text end
+    local b = mk("", Color3.fromRGB(35, 28, 45))
+    local function refresh()
+        b.Text = txt() .. ": " .. (get() and "ON" or "OFF")
+        if get() then
+            b.TextColor3 = Color3.fromRGB(120, 255, 140)
+        else
+            b.TextColor3 = Color3.fromRGB(255, 110, 110)
+        end
+    end
+    b.MouseButton1Click:Connect(function() set(not get()); refresh() end)
+    b.__refresh = refresh
+    refresh()
+    return b
+end
+
+toggle("Candy farm", function() return S.farm end, function(v) S.farm = v end)
+toggle("Auto buy box", function() return S.open end, function(v) S.open = v end)
+local gateToggle = toggle(function() return "Buy only if >= " .. CFG.Cost end,
+    function() return CFG.Gate end,
+    function(v) CFG.Gate = v end)
+toggle("Ignore event buttons", function() return CFG.IgnoreEvent end, function(v) CFG.IgnoreEvent = v end)
+
+local function pickAt(mx, my)
+    local pg = pgui()
+    if not pg then return nil end
+    for _, y in ipairs({my, my - 36}) do
+        local objs = pg:GetGuiObjectsAtPosition(mx, y)
+        for i = 1, #objs do
+            local o = objs[i]
+            if o:IsA("GuiButton") and o.Visible and chainVis(o.Parent) and not own(o) then
+                return o
+            end
+        end
+    end
+    return nil
+end
+
+local function pin(what, assign)
+    S.log = "click the " .. what .. " now"
+    local conn
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        local m = UIS:GetMouseLocation()
+        local b = pickAt(m.X, m.Y)
+        conn:Disconnect()
+        if b then
+            assign(b)
+            S.log = "pinned " .. what .. ": " .. b.Name
+            print("[MM2] pinned " .. what .. ": " .. b:GetFullName())
+        else
+            S.log = "nothing there"
+        end
+    end)
+end
+
+mk("PIN SHOP (click the SHOP button)", Color3.fromRGB(35, 60, 80), 30)
+    .MouseButton1Click:Connect(function()
+        pin("SHOP button", function(b) shopPin = b end)
+    end)
+
+mk("PIN BOX (click the Halloween Box)", Color3.fromRGB(35, 60, 80), 30)
+    .MouseButton1Click:Connect(function() pin("box tile", function(b) tilePin = b end) end)
+
+mk("PIN WALLET (click candy total)", Color3.fromRGB(35, 55, 70), 30)
+    .MouseButton1Click:Connect(function()
+        pin("wallet total", function(b) walletEl = b; S.candy = readCandy() end)
+    end)
+
+mk("BUY 1 NOW", Color3.fromRGB(60, 50, 30), 30)
+    .MouseButton1Click:Connect(function()
+        if S.busy then return end
+        task.spawn(function()
+            S.busy = true
+            local was, saved = S.boxes, CFG.Gate
+            CFG.Gate = false
+            local t0 = os.clock()
+            while os.clock() - t0 < 10 and S.boxes == was do
+                step()
+                task.wait(0.3)
+            end
+            CFG.Gate = saved
+            S.log = "manual done"
+            S.busy = false
+        end)
+    end)
+
+mk("Dump buttons", Color3.fromRGB(45, 40, 55))
+    .MouseButton1Click:Connect(function()
+        local vis = buttons()
+        for i = 1, #vis do
+            print(string.format("   %-26s pos=(%d,%d) size=(%d,%d) label=%s",
+                vis[i].Name, math.floor(vis[i].AbsolutePosition.X),
+                math.floor(vis[i].AbsolutePosition.Y),
+                math.floor(vis[i].AbsoluteSize.X), math.floor(vis[i].AbsoluteSize.Y),
+                labelDeep(vis[i]):sub(1, 30)))
+        end
+    end)
+
+mk("Dump picks", Color3.fromRGB(45, 40, 55))
+    .MouseButton1Click:Connect(function()
+        local s = findShopBtn()
+        local x = findBoxBtn()
+        local b = findBuyBtn(nil)
+        print("[MM2] shop=" .. (s and s:GetFullName() or "nil"))
+        print("[MM2] box =" .. (x and x:GetFullName() or "nil"))
+        print("[MM2] buy =" .. (b and b:GetFullName() or "nil"))
+    end)
+
+mk("Clear pins", Color3.fromRGB(50, 42, 30))
+    .MouseButton1Click:Connect(function()
+        shopPin, tilePin, walletEl = nil, nil, nil
+        S.shopName, S.tileName = "NONE", "NONE"
+        S.log = "pins cleared"
+    end)
+
+do
+    local dragging, startPos, startInput
+    head.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            startInput = i.Position
+            startPos = frame.Position
+        end
+    end)
+    head.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+            or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - startInput
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+task.spawn(function()
+    local last = ""
+    while task.wait(0.5) do
+        if gateToggle and gateToggle.__refresh then gateToggle.__refresh() end
+        local gate
+        if S.force then gate = "FORCED"
+        elseif not CFG.Gate then gate = "off"
+        elseif S.waiting then gate = "HOLDING"
+        else gate = "armed" end
+        local txt = string.format(
+            "boxes  : %d   picked: %d\ngate   : %s\nbalance: %s / %d\nshop   : %s\nbox    : %s\nclick  : %s\nlog    : %s",
+            S.boxes, S.picked, gate,
+            S.candy and tostring(S.candy) or "?", CFG.Cost,
+            (S.shopName or "NONE"):sub(1, 20),
+            (S.tileName or "-"):sub(1, 20),
+            (S.lastClick or "-"):sub(1, 22),
+            (S.log or ""):sub(1, 30))
+        if txt ~= last then last = txt; status.Text = txt end
+    end
+end)
+
+UIS.InputBegan:Connect(function(i, gp)
+    if gp then return end
+    if i.KeyCode == Enum.KeyCode.RightShift then
+        frame.Visible = not frame.Visible
+    elseif i.KeyCode == Enum.KeyCode.F1 then
+        S.farm = not S.farm
+    elseif i.KeyCode == Enum.KeyCode.F2 then
+        S.open = not S.open
+    elseif i.KeyCode == Enum.KeyCode.F3 then
+        S.force = not S.force
+    end
+end)
+
+print("[MM2] === v16 LOAD COMPLETE ===")
