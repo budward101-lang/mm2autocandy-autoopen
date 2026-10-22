@@ -1,16 +1,16 @@
 --=====================================================================
---  MM2 Halloween | Candy Autofarm + Halloween Crate Opener
---  Noclip + TweenSpeed 25 | lands ON candies so Touched always fires
+--  MM2 Halloween | Candy Autofarm + Halloween Crate Opener  (hardened)
 --=====================================================================
+print("[Venice] 1/6 booting")
 
 local CONFIG = {
-	TweenSpeed      = 25,            -- studs / second
-	CandyID         = "Candy",       -- CoinID attribute value
-	TouchHold       = 0.10,          -- seconds parked on a candy
+	TweenSpeed      = 25,
+	CandyID         = "Candy",
+	TouchHold       = 0.10,
 	IdleWait        = 0.10,
 	AntiAFK         = true,
 	AutoResetOnFull = false,
-	Payment         = "Coins",       -- Coins | Diamonds | Key
+	Payment         = "Coins",
 	CrateName       = "Halloween Box",
 }
 
@@ -18,33 +18,46 @@ local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Tween      = game:GetService("TweenService")
 local RS         = game:GetService("ReplicatedStorage")
-local VU         = game:GetService("VirtualUser")
 local UIS        = game:GetService("UserInputService")
 
 local plr = Players.LocalPlayer
-local autofarm, noclipOn = false, true
+local autofarm = false
 local statusText
+
+print("[Venice] 2/6 services ok")
 
 --=====================================================
 --  GUI
 --=====================================================
 local function new(c, p, parent)
 	local o = Instance.new(c)
-	for k, v in pairs(p) do o[k] = v end
+	for k, v in pairs(p) do pcall(function() o[k] = v end) end
 	o.Parent = parent
 	return o
 end
 
 local gui = new("ScreenGui", {
-	Name = "VeniceMM2Halloween", ResetOnSpawn = false,
+	Name = "VeniceMM2Halloween",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	DisplayOrder = 999,
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, nil)
-pcall(function() gui.Parent = game:GetService("CoreGui") end)
-if not gui.Parent then gui.Parent = plr:WaitForChild("PlayerGui") end
+
+local parented = false
+if gethui then
+	parented = pcall(function() gui.Parent = gethui() end)
+end
+if not parented then
+	parented = pcall(function() gui.Parent = game:GetService("CoreGui") end)
+end
+if not parented or not gui.Parent then
+	gui.Parent = plr:WaitForChild("PlayerGui")
+end
+print("[Venice] 3/6 gui parented to:", gui.Parent and gui.Parent:GetFullName() or "NIL")
 
 local main = new("Frame", {
-	Size = UDim2.new(0, 250, 0, 0),
-	AutomaticSize = Enum.AutomaticSize.Y,
+	Size = UDim2.new(0, 250, 0, 292),
 	Position = UDim2.new(0, 20, 0, 90),
 	BackgroundColor3 = Color3.fromRGB(26, 18, 36),
 	BorderSizePixel = 0, Active = true,
@@ -59,9 +72,9 @@ new("UIPadding", {
 	PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
 }, main)
 
-local title = new("TextLabel", {
+new("TextLabel", {
 	Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
-	Font = Enum.Font.GothamBold, TextSize = 15,
+	Font = Enum.Font.GothamBold, TextSize = 15, LayoutOrder = 0,
 	TextColor3 = Color3.fromRGB(255, 140, 40),
 	Text = "MM2 Halloween  |  Venice",
 }, main)
@@ -72,28 +85,28 @@ local function makeBtn(text, order)
 		BackgroundColor3 = Color3.fromRGB(58, 36, 90),
 		BorderSizePixel = 0, Font = Enum.Font.GothamBold,
 		TextSize = 13, TextColor3 = Color3.fromRGB(255, 255, 255),
-		Text = text, AutoButtonColor = true,
+		Text = text,
 	}, main)
 	new("UICorner", {CornerRadius = UDim.new(0, 7)}, b)
 	return b
 end
 
-local farmBtn    = makeBtn("Auto Farm Candy: OFF", 1)
-local crateBtn   = makeBtn("Open Halloween Crate", 2)
-local payBtn     = makeBtn("Pay With: Coins", 3)
+local farmBtn      = makeBtn("Auto Farm Candy: OFF", 1)
+local crateBtn     = makeBtn("Open Halloween Crate", 2)
+local payBtn       = makeBtn("Pay With: Coins", 3)
 local crateNameBtn = makeBtn("Crate: " .. CONFIG.CrateName, 4)
-local scanBtn    = makeBtn("Scan Unbox Remotes", 5)
+local scanBtn      = makeBtn("Scan Unbox Remotes", 5)
 
 statusText = new("TextLabel", {
-	Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-	BackgroundTransparency = 1, Font = Enum.Font.Gotham,
-	TextSize = 11, TextWrapped = true, LayoutOrder = 6,
-	TextColor3 = Color3.fromRGB(190, 180, 210), Text = "Ready.",
+	Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true,
+	LayoutOrder = 6, TextColor3 = Color3.fromRGB(190, 180, 210),
+	Text = "Ready.", TextYAlignment = Enum.TextYAlignment.Top,
 }, main)
 
 local function setStatus(s) statusText.Text = s end
 
--- dragging
+-- drag + hide key
 do
 	local drag, start, startPos
 	main.InputBegan:Connect(function(i)
@@ -120,18 +133,16 @@ do
 		end
 	end)
 end
+print("[Venice] 4/6 gui built")
 
 --=====================================================
---  NOCLIP  (persistent, survives respawn)
+--  NOCLIP (persistent)
 --=====================================================
 RunService.Stepped:Connect(function()
-	if not noclipOn then return end
 	local char = plr.Character
 	if not char then return end
 	for _, d in ipairs(char:GetDescendants()) do
-		if d:IsA("BasePart") and d.CanCollide then
-			d.CanCollide = false
-		end
+		if d:IsA("BasePart") and d.CanCollide then d.CanCollide = false end
 	end
 end)
 
@@ -145,8 +156,7 @@ local function getContainer()
 			if c then return c end
 		end
 	end
-	local c = workspace:FindFirstChild("CoinContainer", true)
-	return c
+	return workspace:FindFirstChild("CoinContainer", true)
 end
 
 local function getCandies()
@@ -154,8 +164,7 @@ local function getCandies()
 	if not c then return list end
 	for _, v in ipairs(c:GetChildren()) do
 		local id = v:GetAttribute("CoinID")
-		local isCandy = (id == CONFIG.CandyID)
-			or (id == nil and v.Name:lower():find("candy"))
+		local isCandy = (id == CONFIG.CandyID) or (id == nil and v.Name:lower():find("candy"))
 		if isCandy and v:FindFirstChild("TouchInterest") then
 			table.insert(list, v)
 		end
@@ -168,8 +177,6 @@ local function hrp()
 	return ch and ch:FindFirstChild("HumanoidRootPart")
 end
 
--- tween straight onto the candy, park on it, then micro-nudge so the
--- TouchInterest definitely registers (noclip can't skip it this way)
 local function goTo(part)
 	local root = hrp()
 	if not root or not part.Parent then return end
@@ -193,9 +200,6 @@ local function goTo(part)
 	end
 end
 
---=====================================================
---  FARM LOOP
---=====================================================
 task.spawn(function()
 	while true do
 		if autofarm then
@@ -207,8 +211,7 @@ task.spawn(function()
 					local d = (c.Position - root.Position).Magnitude
 					if not bestD or d < bestD then best, bestD = c, d end
 				end
-				local ok, err = pcall(goTo, best)
-				if not ok then setStatus("Farm: " .. tostring(err)) end
+				pcall(goTo, best)
 			else
 				task.wait(CONFIG.IdleWait)
 			end
@@ -217,7 +220,6 @@ task.spawn(function()
 	end
 end)
 
--- bag full -> optional respawn
 pcall(function()
 	RS.Remotes.Gameplay.CoinCollected.OnClientEvent:Connect(function(kind, cur, max)
 		if CONFIG.AutoResetOnFull and kind == CONFIG.CandyID
@@ -229,34 +231,30 @@ pcall(function()
 end)
 
 --=====================================================
---  UNBOX REMOTE FINDER
+--  UNBOX
 --=====================================================
 local function findUnboxRemotes()
 	local out = {}
 	local paths = {
-		{"Remotes","Gameplay","Unbox"},
-		{"Remotes","Gameplay","UnboxItem"},
-		{"Remotes","Gameplay","UnboxBox"},
-		{"Remotes","Gameplay","OpenCrate"},
-		{"Remotes","Gameplay","CrateOpen"},
-		{"Remotes","Unbox"},
-		{"Remotes","Gameplay","Box"},
+		{"Remotes","Gameplay","Unbox"}, {"Remotes","Gameplay","UnboxItem"},
+		{"Remotes","Gameplay","UnboxBox"}, {"Remotes","Gameplay","OpenCrate"},
+		{"Remotes","Gameplay","CrateOpen"}, {"Remotes","Unbox"},
 	}
 	for _, p in ipairs(paths) do
 		local node, ok = RS, true
 		for _, seg in ipairs(p) do
 			node = node:FindFirstChild(seg)
-			if not node then ok = false break end
+			if not node then ok = false; break end
 		end
-		if ok and (node:IsA("RemoteEvent") or node:IsA("RemoteFunction")) then
+		if ok and node and (node:IsA("RemoteEvent") or node:IsA("RemoteFunction")) then
 			if not table.find(out, node) then table.insert(out, node) end
 		end
 	end
 	for _, d in ipairs(RS:GetDescendants()) do
 		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
 			local n = d.Name:lower()
-			if (n:find("unbox", 1, true) or n:find("crateopen", 1, true)
-			or n:find("openbox", 1, true) or n:find("open_crate", 1, true)) then
+			if n:find("unbox", 1, true) or n:find("crateopen", 1, true)
+			or n:find("openbox", 1, true) then
 				if not table.find(out, d) then table.insert(out, d) end
 			end
 		end
@@ -264,18 +262,13 @@ local function findUnboxRemotes()
 	return out
 end
 
--- halloween crate names living in ReplicatedStorage
 local crateOptions = { CONFIG.CrateName }
 do
 	local seen = { [CONFIG.CrateName] = true }
 	for _, d in ipairs(RS:GetDescendants()) do
 		local n = d.Name:lower()
-		if n:find("halloween", 1, true)
-		and (n:find("box") or n:find("crate") or n:find("egg")) then
-			if not seen[d.Name] then
-				seen[d.Name] = true
-				table.insert(crateOptions, d.Name)
-			end
+		if n:find("halloween", 1, true) and (n:find("box") or n:find("crate") or n:find("egg")) then
+			if not seen[d.Name] then seen[d.Name] = true; table.insert(crateOptions, d.Name) end
 		end
 	end
 end
@@ -286,7 +279,7 @@ local payments = { "Coins", "Diamonds", "Key" }
 local function openCrate()
 	local remotes = findUnboxRemotes()
 	if #remotes == 0 then
-		setStatus("No unbox remote found. Hit Scan and read the console.")
+		setStatus("No unbox remote. Hit Scan, read console.")
 		return
 	end
 	local r = remotes[1]
@@ -298,14 +291,11 @@ local function openCrate()
 				r:FireServer(CONFIG.CrateName, 1, CONFIG.Payment)
 			end
 		end)
-		setStatus(ok and ("Opened with " .. r.Name .. " (" .. CONFIG.CrateName .. ")")
-			or ("Unbox error: " .. tostring(err)))
+		setStatus(ok and ("Fired " .. r.Name .. " | " .. CONFIG.CrateName)
+			or ("Error: " .. tostring(err)))
 	end)
 end
 
---=====================================================
---  BUTTONS
---=====================================================
 farmBtn.MouseButton1Click:Connect(function()
 	autofarm = not autofarm
 	farmBtn.Text = "Auto Farm Candy: " .. (autofarm and "ON" or "OFF")
@@ -313,49 +303,53 @@ farmBtn.MouseButton1Click:Connect(function()
 		or Color3.fromRGB(58, 36, 90)
 	setStatus(autofarm and "Farming candies..." or "Farm stopped.")
 end)
-
 crateBtn.MouseButton1Click:Connect(openCrate)
-
 payBtn.MouseButton1Click:Connect(function()
 	payIndex = payIndex % #payments + 1
 	CONFIG.Payment = payments[payIndex]
 	payBtn.Text = "Pay With: " .. CONFIG.Payment
 end)
-
 crateNameBtn.MouseButton1Click:Connect(function()
 	crateIndex = crateIndex % #crateOptions + 1
 	CONFIG.CrateName = crateOptions[crateIndex]
 	crateNameBtn.Text = "Crate: " .. CONFIG.CrateName
 end)
-
 scanBtn.MouseButton1Click:Connect(function()
 	local remotes = findUnboxRemotes()
-	print("=== MM2 unbox remote candidates ===")
-	for i, r in ipairs(remotes) do
-		print(i, r:GetFullName(), r.ClassName)
-	end
+	print("=== unbox remote candidates ===")
+	for i, r in ipairs(remotes) do print(i, r:GetFullName(), r.ClassName) end
 	if #remotes == 0 then print("none found") end
 	print("=== halloween crate names ===")
 	for _, n in ipairs(crateOptions) do print(n) end
-	setStatus("Found " .. #remotes .. " remote(s) - check console.")
+	setStatus("Found " .. #remotes .. " remote(s). Check console.")
 end)
 
 --=====================================================
---  ANTI AFK
+--  ANTI AFK  (nil-safe)
 --=====================================================
 if CONFIG.AntiAFK then
-	local GC = getconnections or get_signal_cons
-	if GC then
-		for _, c in ipairs(GC(plr.Idled)) do
-			if c.Disable then c.Disable(c) elseif c.Disconnect then c.Disconnect(c) end
+	local handled = false
+	if getconnections then
+		local ok, cons = pcall(getconnections, plr.Idled)
+		if ok and cons and #cons > 0 then
+			for _, c in ipairs(cons) do
+				pcall(function()
+					if c.Disable then c.Disable(c) elseif c.Disconnect then c.Disconnect(c) end
+				end)
+			end
+			handled = true
 		end
-	else
-		plr.Idled:Connect(function()
-			VU:CaptureController()
-			VU:ClickButton2(Vector2.new())
+	end
+	if not handled then
+		pcall(function()
+			local VU = game:GetService("VirtualUser")
+			plr.Idled:Connect(function()
+				VU:CaptureController()
+				VU:ClickButton2(Vector2.new())
+			end)
 		end)
 	end
 end
 
-setStatus("RightShift hides the menu. Noclip is always on.")
-print("[Venice] MM2 Halloween autofarm loaded.")
+setStatus("RightShift hides menu. Noclip always on.")
+print("[Venice] 5/6 done - GUI should be visible")
