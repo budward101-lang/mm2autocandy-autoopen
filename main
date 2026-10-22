@@ -470,7 +470,7 @@ local function viewportY()
 end
 
 local function inBottomRow(b)
-    return b.AbsolutePosition.Y >= viewportY() * 0.80
+    return b.AbsolutePosition.Y >= viewportY() * 0.70
 end
 
 local function bottomRow(list)
@@ -551,17 +551,10 @@ local function clickFirst(keywords)
     return b
 end
 
--- find the horizontal row of event-preview tiles.
--- built two ways so it survives either structure, then scored so the
--- bottom tab strip cannot win over the actual preview row.
+-- find the horizontal row of event-preview tiles (5+ equal tiles in a row, lower half of screen)
 local function findPreviewTiles()
-    local vh = viewportY()
-    local vis = visibleButtons()
-    local rows = {}
-
-    -- (a) siblings under one parent (tiles are usually siblings)
     local byParent = {}
-    for _, b in ipairs(vis) do
+    for _, b in ipairs(visibleButtons()) do
         local p = b.Parent
         if p then
             local g = byParent[p]
@@ -569,55 +562,31 @@ local function findPreviewTiles()
             g[#g + 1] = b
         end
     end
+
+    local vh = viewportY()
+    local best, bestN = nil, 0
     for _, list in pairs(byParent) do
-        if #list >= CONFIG.EventPreviewIndex then
-            local refY = list[1].AbsolutePosition.Y
+        if #list >= 5 then
             local row = {}
+            local refY, refH, refW = list[1].AbsolutePosition.Y,
+                list[1].AbsoluteSize.Y, list[1].AbsoluteSize.X
             for _, b in ipairs(list) do
-                if math.abs(b.AbsolutePosition.Y - refY) < 30 then
+                if math.abs(b.AbsolutePosition.Y - refY) < 24
+                    and math.abs(b.AbsoluteSize.Y - refH) < 24
+                    and math.abs(b.AbsoluteSize.X - refW) < 24 then
                     row[#row + 1] = b
                 end
             end
-            if #row >= CONFIG.EventPreviewIndex then rows[#rows + 1] = row end
-        end
-    end
-
-    -- (b) fallback: cluster everything by Y
-    if #rows == 0 then
-        local sorted = {}
-        for _, b in ipairs(vis) do sorted[#sorted + 1] = b end
-        table.sort(sorted, function(a, b)
-            return a.AbsolutePosition.Y < b.AbsolutePosition.Y
-        end)
-        local cur
-        for _, b in ipairs(sorted) do
-            local y = b.AbsolutePosition.Y
-            if not cur or math.abs(cur.y - y) > 30 then
-                cur = { y = y, list = {} }
-                rows[#rows + 1] = cur
+            if #row >= 5 then
+                local avgY = 0
+                for _, b in ipairs(row) do avgY += b.AbsolutePosition.Y end
+                avgY /= #row
+                if avgY > vh * 0.5 and #row > bestN then
+                    best, bestN = row, #row
+                end
             end
-            cur.list[#cur.list + 1] = b
         end
     end
-
-    -- score: more tiles is better, above the bottom tab bar is better, chunky tiles are better
-    local best, bestScore = nil, -math.huge
-    for _, row in ipairs(rows) do
-        if #row >= CONFIG.EventPreviewIndex then
-            local avgY, avgA = 0, 0
-            for _, b in ipairs(row) do
-                avgY += b.AbsolutePosition.Y
-                avgA += b.AbsoluteSize.X * b.AbsoluteSize.Y
-            end
-            avgY /= #row
-            avgA /= #row
-            local s = #row * 10
-            if avgY < vh * 0.88 then s += 40 end
-            s += math.min(avgA, 200000) / 20000
-            if s > bestScore then best, bestScore = row, s end
-        end
-    end
-
     if not best then return {} end
     table.sort(best, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
     return best
@@ -671,7 +640,6 @@ local function runBoxCycle()
         STATE.candy = bal
         STATE.checkedOnce = true
         STATE.lastCheck = os.clock()
-        if candySrc then STATE.walletName = candySrc.Name end
     end
 
     if unbox ~= true then
@@ -799,42 +767,6 @@ local function scoreWallet(o)
     return s
 end
 
--- the little sprite sitting next to a label (candy / key / etc.)
-local function iconNear(o)
-    local p = o.Parent
-    if p then
-        for _, d in ipairs(p:GetChildren()) do
-            if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" then
-                return d.Image
-            end
-        end
-    end
-    local pp = p and p.Parent
-    if pp then
-        for _, d in ipairs(pp:GetChildren()) do
-            if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" then
-                return d.Image
-            end
-        end
-    end
-    return nil
-end
-
--- the sprite on the "600" buy element IS the candy icon -> use it as a beacon
-local function candyIconRef()
-    local pg = pgui(); if not pg then return nil end
-    local cost = tostring(CONFIG.BoxCost)
-    for _, o in ipairs(pg:GetDescendants()) do
-        if (o:IsA("TextLabel") or o:IsA("TextButton"))
-            and o.Visible and chainVisible(o.Parent) and not isOwnGui(o)
-            and o.Text:gsub("[^%d]", "") == cost then
-            local ic = iconNear(o)
-            if ic then return ic end
-        end
-    end
-    return nil
-end
-
 readCandy = function()
     local s = candySrc
     if not s or not s.Parent then return nil end
@@ -846,54 +778,28 @@ readCandy = function()
 end
 
 findCandySource = function()
-    local pg = pgui()
-    local refIcon = candyIconRef()
     local best, bestScore = nil, -math.huge
+    local function consider(o, numeric)
+        if not numeric or not matchesWallet(o) then return end
+        if o:FindFirstAncestor(OWN_GUI_NAME) then return end
+        local s = scoreWallet(o)
+        if s > bestScore then best, bestScore = o, s end
+    end
 
-    -- 1) sprite match: the label wearing the same candy icon as the 600 buy element
-    if refIcon and pg then
+    local pg = pgui()
+    if pg then
         for _, o in ipairs(pg:GetDescendants()) do
-            if o:IsA("TextLabel") and o.Visible and not isOwnGui(o)
-                and chainVisible(o.Parent) then
-                local t = o.Text:gsub("[^%d]", "")
-                if #t > 0 and #t <= 9 then
-                    local v = tonumber(t)
-                    local s = 0
-                    local ic = iconNear(o)
-                    if ic == refIcon then s += 300 end
-                    if o.Text:find(",", 1, true) then s += 150 end
-                    if t == tostring(CONFIG.BoxCost) then s -= 60 end
-                    if ic then s += 25 end
-                    s += math.min(v, 10000000) / 100000
-                    if s > bestScore then best, bestScore = o, s end
-                end
+            if o:IsA("TextLabel") and o.Visible and chainVisible(o.Parent) then
+                consider(o, #(o.Text:gsub("[^%d]", "")) > 0)
             end
         end
     end
 
-    -- 2) keyword heuristic, used if the sprite pass found nothing
-    if not best then
-        local function consider(o, numeric)
-            if not numeric or not matchesWallet(o) then return end
-            if o:FindFirstAncestor(OWN_GUI_NAME) then return end
-            local s = scoreWallet(o)
-            if s > bestScore then best, bestScore = o, s end
-        end
-
-        if pg then
-            for _, o in ipairs(pg:GetDescendants()) do
-                if o:IsA("TextLabel") and o.Visible and chainVisible(o.Parent) then
-                    consider(o, #(o.Text:gsub("[^%d]", "")) > 0)
-                end
-            end
-        end
-
-        for _, root in ipairs({LP:FindFirstChild("leaderstats"), LP, RS}) do
-            if root then
-                for _, o in ipairs(root:GetDescendants()) do
-                    if o:IsA("IntValue") or o:IsA("NumberValue") or o:IsA("StringValue") then
-                        consider(o, tonumber(o.Value) ~= nil)
-                    end
+    for _, root in ipairs({LP:FindFirstChild("leaderstats"), LP, RS}) do
+        if root then
+            for _, o in ipairs(root:GetDescendants()) do
+                if o:IsA("IntValue") or o:IsA("NumberValue") or o:IsA("StringValue") then
+                    consider(o, tonumber(o.Value) ~= nil)
                 end
             end
         end
@@ -939,15 +845,6 @@ local function new(class, props, parent)
     for k, v in pairs(props) do o[k] = v end
     o.Parent = parent
     return o
-end
-
--- wipe any leftover panel from an earlier run so you are not clicking a dead one
-do
-    local pg = LP:FindFirstChildOfClass("PlayerGui")
-    if pg then
-        local old = pg:FindFirstChild(OWN_GUI_NAME)
-        if old then old:Destroy() end
-    end
 end
 
 local gui = new("ScreenGui", {
