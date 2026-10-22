@@ -1,7 +1,8 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  Open flow: click SHOP (mid-left) -> click "Halloween Box '26" -> read/unbox
+--  Open flow: EVENT tab -> Nth preview tile -> unbox
+--  Balance is read from the event/box page (account wallet).
 --=============================================================
 
 local CONFIG = {
@@ -48,9 +49,8 @@ local CONFIG = {
 
     --========== BOX OPEN FLOW ==========
     OpenMode      = "builtin",
-    ShopKeywords    = {"shop", "store"},                       -- mid-left shop button
-    BoxNameKeywords = {"halloween box", "box '26", "box 26"},  -- shop entry to click
-    ShopMaxY        = 0.80,                                    -- above this = not the bottom tab strip
+    EventTabKeywords  = {"event"},   -- bottom tab that opens the event preview
+    EventPreviewIndex = 4,           -- 4th tile in the event preview = the box
     UnboxKeywords = {"unbox", "open box", "hatch", "open"},
     BuyKeywords   = {"buy", "purchase", "confirm", "600"},
 
@@ -72,7 +72,6 @@ local UIS     = game:GetService("UserInputService")
 local LP      = Players.LocalPlayer
 
 local OWN_GUI_NAME = "MM2CandyFarm"
-local uiLock = false
 
 local LOWFILTER = {}
 for i, f in ipairs(CONFIG.NameFilter) do LOWFILTER[i] = f:lower() end
@@ -90,6 +89,10 @@ local STATE = {
 }
 local attempts, claimed = {}, {}
 print("[MM2] boot")
+
+--==================== WALLET BALANCE (impl lives after the box flow) ====================
+local candySrc, readCandy, findCandySource, probeBalance
+local uiLock = false     -- true while any UI navigation (probe or open cycle) is running
 
 --==================== HELPERS ====================
 
@@ -412,6 +415,12 @@ local function sigOf(list)
     return table.concat(parts, ",")
 end
 
+local function buttonSet()
+    local s = {}
+    for _, b in ipairs(visibleButtons()) do s[b] = true end
+    return s
+end
+
 local function fireButton(b)
     if not b or not b.Parent then return false end
     pcall(function() b.Active = true end)
@@ -453,148 +462,7 @@ local function pathFromPg(o)
     return table.concat(parts, ".")
 end
 
---==================== WALLET READER ====================
-
-local candySrc = nil
-
-local function walletPath(o)
-    local parts, n, pg, depth = {}, o, pgui(), 0
-    while n and n ~= pg and depth < 4 do
-        parts[#parts + 1] = n.Name
-        n = n.Parent
-        depth += 1
-    end
-    return table.concat(parts, " "):lower()
-end
-
-local function matchesWallet(o)
-    local n = walletPath(o)
-    for _, kw in ipairs(CONFIG.WalletKeywords) do
-        if n:find(kw, 1, true) then return true end
-    end
-    return false
-end
-
-local function scoreWallet(o)
-    local n = walletPath(o)
-    local s = 0
-    if n:find("wallet",  1, true) then s += 120 end
-    if n:find("balance", 1, true) then s += 60  end
-    if n:find("total",   1, true) then s += 60  end
-    if n:find("owned",   1, true) then s += 50  end
-    if n:find("candy",   1, true) then s += 40  end
-    if n:find("sweet",   1, true) then s += 25  end
-    if n:find("collect", 1, true) then s -= 30  end
-    if n:find("cost", 1, true) or n:find("price", 1, true) then s -= 40 end
-    if o:IsA("TextLabel") then s += 20 end
-    return s
-end
-
-local function readCandy()
-    local s = candySrc
-    if not s or not s.Parent then return nil end
-    if s:IsA("TextLabel") or s:IsA("TextButton") then
-        local t = s.Text:gsub("[^%d]", "")
-        return #t > 0 and tonumber(t) or nil
-    end
-    return tonumber(s.Value)
-end
-
--- the little sprite sitting next to a label (candy / key / etc.)
-local function iconNear(o)
-    local p = o.Parent
-    if p then
-        for _, d in ipairs(p:GetChildren()) do
-            if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" then
-                return d.Image
-            end
-        end
-    end
-    local pp = p and p.Parent
-    if pp then
-        for _, d in ipairs(pp:GetChildren()) do
-            if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" then
-                return d.Image
-            end
-        end
-    end
-    return nil
-end
-
--- the sprite on the "600" buy element IS the candy icon -> use it as a beacon
-local function candyIconRef()
-    local pg = pgui(); if not pg then return nil end
-    local cost = tostring(CONFIG.BoxCost)
-    for _, o in ipairs(pg:GetDescendants()) do
-        if (o:IsA("TextLabel") or o:IsA("TextButton"))
-            and o.Visible and chainVisible(o.Parent) and not isOwnGui(o)
-            and o.Text:gsub("[^%d]", "") == cost then
-            local ic = iconNear(o)
-            if ic then return ic end
-        end
-    end
-    return nil
-end
-
-local function findCandySource()
-    local pg = pgui()
-    local refIcon = candyIconRef()
-    local best, bestScore = nil, -math.huge
-
-    -- 1) sprite match: the label wearing the same icon as the 600 buy element
-    if pg then
-        for _, o in ipairs(pg:GetDescendants()) do
-            if o:IsA("TextLabel") and o.Visible and not isOwnGui(o)
-                and chainVisible(o.Parent) then
-                local t = o.Text:gsub("[^%d]", "")
-                if #t > 0 and #t <= 9 then
-                    local v = tonumber(t)
-                    local s = 0
-                    local ic = iconNear(o)
-                    if refIcon and ic == refIcon then s += 300 end
-                    if o.Text:find(",", 1, true) then s += 150 end
-                    if t == tostring(CONFIG.BoxCost) then s -= 60 end
-                    if ic then s += 25 end
-                    s += math.min(v, 10000000) / 100000
-                    if s > bestScore then best, bestScore = o, s end
-                end
-            end
-        end
-    end
-
-    -- 2) your original keyword heuristic, used only if the sprite pass found nothing
-    if not best then
-        local function consider(o, numeric)
-            if not numeric or not matchesWallet(o) then return end
-            if o:FindFirstAncestor(OWN_GUI_NAME) then return end
-            local s = scoreWallet(o)
-            if s > bestScore then best, bestScore = o, s end
-        end
-
-        if pg then
-            for _, o in ipairs(pg:GetDescendants()) do
-                if o:IsA("TextLabel") and o.Visible and chainVisible(o.Parent) then
-                    consider(o, #(o.Text:gsub("[^%d]", "")) > 0)
-                end
-            end
-        end
-
-        for _, root in ipairs({LP:FindFirstChild("leaderstats"), LP, RS}) do
-            if root then
-                for _, o in ipairs(root:GetDescendants()) do
-                    if o:IsA("IntValue") or o:IsA("NumberValue") or o:IsA("StringValue") then
-                        consider(o, tonumber(o.Value) ~= nil)
-                    end
-                end
-            end
-        end
-    end
-    return best
-end
-
---==================== SHOP / BOX FINDING ====================
-
-local shopPin = nil   -- full path to the shop button (set by PIN SHOP)
+--==================== BOTTOM TAB ROW ====================
 
 local function viewportY()
     local cam = workspace.CurrentCamera
@@ -605,59 +473,19 @@ local function inBottomRow(b)
     return b.AbsolutePosition.Y >= viewportY() * 0.80
 end
 
+local function bottomRow(list)
+    local out = {}
+    for _, b in ipairs(list) do
+        if inBottomRow(b) then out[#out + 1] = b end
+    end
+    table.sort(out, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
+    return out
+end
+
 local function findIn(list, keywords)
     for _, kw in ipairs(keywords) do
         for _, b in ipairs(list) do
             if buttonLabel(b):lower():find(kw, 1, true) then return b end
-        end
-    end
-    return nil
-end
-
--- the SHOP button: left side, above the bottom tab strip (so it won't hit EVENT)
-local function findShopTab()
-    if shopPin then
-        local b = resolvePath(shopPin)
-        if b and b.Parent and b.Visible and chainVisible(b.Parent) then return b end
-    end
-
-    local vis = visibleButtons()
-    local vh = viewportY()
-    local fallback
-    for _, kw in ipairs(CONFIG.ShopKeywords) do
-        for _, b in ipairs(vis) do
-            if buttonLabel(b):lower():find(kw, 1, true) then
-                if not fallback then fallback = b end
-                -- shop lives mid-left, NOT in the bottom strip where EVENT sits
-                if b.AbsolutePosition.Y < vh * CONFIG.ShopMaxY then return b end
-            end
-        end
-    end
-    return fallback
-end
-
--- find a clickable by its visible text (button first, then climb from a label)
-local function findByName(keywords)
-    local vis = visibleButtons()
-    for _, kw in ipairs(keywords) do
-        for _, b in ipairs(vis) do
-            if buttonLabel(b):lower():find(kw, 1, true) then return b end
-        end
-    end
-
-    local pg = pgui()
-    if pg then
-        for _, kw in ipairs(keywords) do
-            for _, o in ipairs(pg:GetDescendants()) do
-                if (o:IsA("TextLabel") or o:IsA("TextButton"))
-                    and o.Visible and not isOwnGui(o)
-                    and chainVisible(o.Parent)
-                    and o.Text:lower():find(kw, 1, true) then
-                    local b = o
-                    while b and not b:IsA("GuiButton") do b = b.Parent end
-                    if b and b.Visible then return b end
-                end
-            end
         end
     end
     return nil
@@ -701,14 +529,18 @@ local function isCloseButton(b)
 end
 
 local function closeAll()
-    for _, b in ipairs(visibleButtons()) do
-        if isCloseButton(b) then
-            fireButton(b)
-            task.wait(jit(0.5))
-            return true
+    for _ = 1, 3 do
+        local vis = visibleButtons()
+        local before = sigOf(vis)
+        local found
+        for _, b in ipairs(vis) do
+            if isCloseButton(b) then found = b break end
         end
+        if not found then return end
+        fireButton(found)
+        task.wait(jit(0.5))
+        if sigOf(visibleButtons()) == before then return end
     end
-    return false
 end
 
 --==================== BOX OPEN FLOW ====================
@@ -719,31 +551,104 @@ local function clickFirst(keywords)
     return b
 end
 
--- the whole balance/unbox path: SHOP (mid-left) -> "Halloween Box '26"
-local function openShopBox()
-    local shop = findShopTab()
-    if not shop then return nil, "no SHOP button" end
-    print(string.format("[MM2] shop target: %s  x=%d y=%d",
-        shop:GetFullName(), shop.AbsolutePosition.X, shop.AbsolutePosition.Y))
-    fireButton(shop)
-    STATE.log = "shop: " .. shop.Name
-    task.wait(jit(1.0))
+-- find the horizontal row of event-preview tiles.
+-- built two ways so it survives either structure, then scored so the
+-- bottom tab strip cannot win over the actual preview row.
+local function findPreviewTiles()
+    local vh = viewportY()
+    local vis = visibleButtons()
+    local rows = {}
 
-    local t0 = os.clock()
-    local box
-    repeat
-        box = findByName(CONFIG.BoxNameKeywords)
-        if box then break end
-        task.wait(0.15)
-    until os.clock() - t0 > 3
-
-    if not box then
-        return nil, "no '" .. (CONFIG.BoxNameKeywords[1] or "?") .. "' in shop"
+    -- (a) siblings under one parent (tiles are usually siblings)
+    local byParent = {}
+    for _, b in ipairs(vis) do
+        local p = b.Parent
+        if p then
+            local g = byParent[p]
+            if not g then g = {}; byParent[p] = g end
+            g[#g + 1] = b
+        end
     end
-    fireButton(box)
-    STATE.log = "box: " .. buttonLabel(box):sub(1, 24)
-    task.wait(jit(1.0))
-    return box
+    for _, list in pairs(byParent) do
+        if #list >= CONFIG.EventPreviewIndex then
+            local refY = list[1].AbsolutePosition.Y
+            local row = {}
+            for _, b in ipairs(list) do
+                if math.abs(b.AbsolutePosition.Y - refY) < 30 then
+                    row[#row + 1] = b
+                end
+            end
+            if #row >= CONFIG.EventPreviewIndex then rows[#rows + 1] = row end
+        end
+    end
+
+    -- (b) fallback: cluster everything by Y
+    if #rows == 0 then
+        local sorted = {}
+        for _, b in ipairs(vis) do sorted[#sorted + 1] = b end
+        table.sort(sorted, function(a, b)
+            return a.AbsolutePosition.Y < b.AbsolutePosition.Y
+        end)
+        local cur
+        for _, b in ipairs(sorted) do
+            local y = b.AbsolutePosition.Y
+            if not cur or math.abs(cur.y - y) > 30 then
+                cur = { y = y, list = {} }
+                rows[#rows + 1] = cur
+            end
+            cur.list[#cur.list + 1] = b
+        end
+    end
+
+    -- score: more tiles is better, above the bottom tab bar is better, chunky tiles are better
+    local best, bestScore = nil, -math.huge
+    for _, row in ipairs(rows) do
+        if #row >= CONFIG.EventPreviewIndex then
+            local avgY, avgA = 0, 0
+            for _, b in ipairs(row) do
+                avgY += b.AbsolutePosition.Y
+                avgA += b.AbsoluteSize.X * b.AbsoluteSize.Y
+            end
+            avgY /= #row
+            avgA /= #row
+            local s = #row * 10
+            if avgY < vh * 0.88 then s += 40 end
+            s += math.min(avgA, 200000) / 20000
+            if s > bestScore then best, bestScore = row, s end
+        end
+    end
+
+    if not best then return {} end
+    table.sort(best, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
+    return best
+end
+
+-- open the EVENT tab -> click the Nth preview tile -> return the unbox button if one appears
+local function reachBoxPage()
+    -- 1) open the event preview
+    local tiles = findPreviewTiles()
+    if #tiles < CONFIG.EventPreviewIndex then
+        local ev = findIn(visibleButtons(), CONFIG.EventTabKeywords)
+        if not ev then return nil, "no EVENT tab" end
+        fireButton(ev)
+        STATE.log = "event tab: " .. ev.Name
+        local t0 = os.clock()
+        repeat
+            task.wait(0.15)
+            tiles = findPreviewTiles()
+        until #tiles >= CONFIG.EventPreviewIndex or os.clock() - t0 > 3
+    end
+
+    if #tiles < CONFIG.EventPreviewIndex then
+        return nil, "event preview not found (" .. #tiles .. " tiles)"
+    end
+
+    -- 2) click the configured tile (the box)
+    local tile = tiles[CONFIG.EventPreviewIndex]
+    fireButton(tile)
+    STATE.log = "preview tile #" .. CONFIG.EventPreviewIndex .. ": " .. tile.Name
+
+    return waitForUnbox(2.0) or true
 end
 
 local function runBoxCycle()
@@ -751,13 +656,15 @@ local function runBoxCycle()
     if CONFIG.CloseBeforeCycle then closeAll() end
     task.wait(jit(0.3))
 
-    local box, err = openShopBox()
-    if not box then
-        STATE.log = err
+    local unbox, err = reachBoxPage()
+    if not unbox then
+        STATE.log = err or "box page not reached"
         uiLock = false
         return false
     end
+    task.wait(jit(1.0))
 
+    -- the account total is on this page: grab it while it's open
     candySrc = findCandySource()
     local bal = readCandy()
     if bal then
@@ -767,8 +674,7 @@ local function runBoxCycle()
         if candySrc then STATE.walletName = candySrc.Name end
     end
 
-    local unbox = waitForUnbox(2.0)
-    if unbox then
+    if unbox ~= true then
         fireButton(unbox)
         STATE.log = "unbox: " .. unbox.Name
         task.wait(jit(1.3))
@@ -782,4 +688,538 @@ local function runBoxCycle()
 
     STATE.boxes += 1
     if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
-    uiLock =
+    uiLock = false
+    return true
+end
+
+--==================== RECORDED SEQUENCE (optional) ====================
+
+local function waitForButton(path, timeout)
+    local t0 = os.clock()
+    repeat
+        local b = resolvePath(path)
+        if b and b.Visible and chainVisible(b.Parent) then return b end
+        task.wait(0.08)
+    until os.clock() - t0 > timeout
+    return nil
+end
+
+local function replaySequence()
+    local before = STATE.candy
+    local sigBefore = sigOf(visibleButtons())
+    local timedOut = 0
+
+    for i, path in ipairs(CONFIG.Sequence) do
+        local b = waitForButton(path, CONFIG.StepTimeout)
+        if b then
+            fireButton(b)
+            STATE.log = "step " .. i .. "/" .. #CONFIG.Sequence .. "  " .. b.Name
+        else
+            timedOut += 1
+            STATE.log = "step " .. i .. " TIMEOUT  " .. path:sub(-20)
+        end
+        task.wait(jit(CONFIG.SequenceDelay))
+    end
+
+    task.wait(jit(1.2))
+    local after = readCandy()
+    if before and after and after < before then
+        STATE.boxes += 1
+        if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
+        STATE.log = "OPENED"
+    elseif timedOut > 0 then
+        STATE.log = timedOut .. " step(s) never appeared"
+    elseif sigOf(visibleButtons()) == sigBefore then
+        STATE.log = "no UI change - wrong step order?"
+    end
+    if after then STATE.candy = after end
+end
+
+--==================== AUTO OPEN LOOP ====================
+
+task.spawn(function()
+    local lastCycle = 0
+    while task.wait(0.5) do
+        if not STATE.open then continue end
+        if uiLock then continue end
+        if os.clock() - lastCycle < jit(CONFIG.CycleCooldown) then continue end
+
+        if CONFIG.RequireBalance and not STATE.force then
+            if not STATE.checkedOnce then continue end
+            local c = STATE.candy
+            if c and c < CONFIG.BoxCost then
+                STATE.log = string.format("balance %d/%d - waiting", c, CONFIG.BoxCost)
+                continue
+            end
+        end
+
+        if CONFIG.OpenMode == "recorded" and #CONFIG.Sequence > 0 then
+            if CONFIG.CloseBeforeCycle then closeAll() end
+            replaySequence()
+        else
+            runBoxCycle()
+        end
+        lastCycle = os.clock()
+    end
+end)
+print("[MM2] open loop ok")
+
+--==================== WALLET BALANCE (read off the event/box page) ====================
+
+local function walletPath(o)
+    local parts, n, pg, depth = {}, o, pgui(), 0
+    while n and n ~= pg and depth < 4 do
+        parts[#parts + 1] = n.Name
+        n = n.Parent
+        depth += 1
+    end
+    return table.concat(parts, " "):lower()
+end
+
+local function matchesWallet(o)
+    local n = walletPath(o)
+    for _, kw in ipairs(CONFIG.WalletKeywords) do
+        if n:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
+local function scoreWallet(o)
+    local n = walletPath(o)
+    local s = 0
+    if n:find("wallet",  1, true) then s += 120 end
+    if n:find("balance", 1, true) then s += 60  end
+    if n:find("total",   1, true) then s += 60  end
+    if n:find("owned",   1, true) then s += 50  end
+    if n:find("candy",   1, true) then s += 40  end
+    if n:find("sweet",   1, true) then s += 25  end
+    if n:find("collect", 1, true) then s -= 30  end
+    if n:find("cost", 1, true) or n:find("price", 1, true) then s -= 40 end
+    if o:IsA("TextLabel") then s += 20 end
+    return s
+end
+
+-- the little sprite sitting next to a label (candy / key / etc.)
+local function iconNear(o)
+    local p = o.Parent
+    if p then
+        for _, d in ipairs(p:GetChildren()) do
+            if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" then
+                return d.Image
+            end
+        end
+    end
+    local pp = p and p.Parent
+    if pp then
+        for _, d in ipairs(pp:GetChildren()) do
+            if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" then
+                return d.Image
+            end
+        end
+    end
+    return nil
+end
+
+-- the sprite on the "600" buy element IS the candy icon -> use it as a beacon
+local function candyIconRef()
+    local pg = pgui(); if not pg then return nil end
+    local cost = tostring(CONFIG.BoxCost)
+    for _, o in ipairs(pg:GetDescendants()) do
+        if (o:IsA("TextLabel") or o:IsA("TextButton"))
+            and o.Visible and chainVisible(o.Parent) and not isOwnGui(o)
+            and o.Text:gsub("[^%d]", "") == cost then
+            local ic = iconNear(o)
+            if ic then return ic end
+        end
+    end
+    return nil
+end
+
+readCandy = function()
+    local s = candySrc
+    if not s or not s.Parent then return nil end
+    if s:IsA("TextLabel") or s:IsA("TextButton") then
+        local t = s.Text:gsub("[^%d]", "")
+        return #t > 0 and tonumber(t) or nil
+    end
+    return tonumber(s.Value)
+end
+
+findCandySource = function()
+    local pg = pgui()
+    local refIcon = candyIconRef()
+    local best, bestScore = nil, -math.huge
+
+    -- 1) sprite match: the label wearing the same candy icon as the 600 buy element
+    if refIcon and pg then
+        for _, o in ipairs(pg:GetDescendants()) do
+            if o:IsA("TextLabel") and o.Visible and not isOwnGui(o)
+                and chainVisible(o.Parent) then
+                local t = o.Text:gsub("[^%d]", "")
+                if #t > 0 and #t <= 9 then
+                    local v = tonumber(t)
+                    local s = 0
+                    local ic = iconNear(o)
+                    if ic == refIcon then s += 300 end
+                    if o.Text:find(",", 1, true) then s += 150 end
+                    if t == tostring(CONFIG.BoxCost) then s -= 60 end
+                    if ic then s += 25 end
+                    s += math.min(v, 10000000) / 100000
+                    if s > bestScore then best, bestScore = o, s end
+                end
+            end
+        end
+    end
+
+    -- 2) keyword heuristic, used if the sprite pass found nothing
+    if not best then
+        local function consider(o, numeric)
+            if not numeric or not matchesWallet(o) then return end
+            if o:FindFirstAncestor(OWN_GUI_NAME) then return end
+            local s = scoreWallet(o)
+            if s > bestScore then best, bestScore = o, s end
+        end
+
+        if pg then
+            for _, o in ipairs(pg:GetDescendants()) do
+                if o:IsA("TextLabel") and o.Visible and chainVisible(o.Parent) then
+                    consider(o, #(o.Text:gsub("[^%d]", "")) > 0)
+                end
+            end
+        end
+
+        for _, root in ipairs({LP:FindFirstChild("leaderstats"), LP, RS}) do
+            if root then
+                for _, o in ipairs(root:GetDescendants()) do
+                    if o:IsA("IntValue") or o:IsA("NumberValue") or o:IsA("StringValue") then
+                        consider(o, tonumber(o.Value) ~= nil)
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- opens the event preview (view only, no cost), reads the total, closes again
+probeBalance = function()
+    if uiLock then return end
+    uiLock = true
+
+    local opened = false
+    if not findUnbox() then
+        opened = reachBoxPage() ~= nil
+    end
+
+    candySrc = findCandySource()
+    local v = readCandy()
+    if v then STATE.candy = v end
+    if candySrc then STATE.walletName = candySrc.Name end
+    STATE.checkedOnce = true
+    STATE.lastCheck = os.clock()
+    STATE.log = "wallet: " .. (STATE.candy and tostring(STATE.candy) or "?") .. "/" .. CONFIG.BoxCost
+
+    if opened and CONFIG.CloseBeforeCycle then closeAll() end
+    uiLock = false
+end
+
+task.spawn(function()
+    task.wait(4)
+    while true do
+        probeBalance()
+        task.wait(CONFIG.BalanceCheckMin
+            + math.random() * (CONFIG.BalanceCheckMax - CONFIG.BalanceCheckMin))
+    end
+end)
+
+--==================== UI ====================
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+
+-- wipe any leftover panel from an earlier run so you are not clicking a dead one
+do
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        local old = pg:FindFirstChild(OWN_GUI_NAME)
+        if old then old:Destroy() end
+    end
+end
+
+local gui = new("ScreenGui", {
+    Name = OWN_GUI_NAME, ResetOnSpawn = false, IgnoreGuiInset = true,
+}, LP:WaitForChild("PlayerGui"))
+
+local main = new("Frame", {
+    Size = UDim2.new(0, 305, 0, 620), Position = UDim2.new(0, 20, 0, 55),
+    BackgroundColor3 = Color3.fromRGB(20, 16, 28), BorderSizePixel = 0, Active = true,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+new("UIStroke", { Color = Color3.fromRGB(255, 140, 40), Thickness = 1.5 }, main)
+
+local header = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Color3.fromRGB(32, 22, 42),
+    Text = "  MM2 CANDY FARM", TextColor3 = Color3.fromRGB(255, 170, 70),
+    Font = Enum.Font.GothamBold, TextSize = 15,
+    TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, header)
+
+local body = new("Frame", {
+    Size = UDim2.new(1, -20, 1, -42), Position = UDim2.new(0, 10, 0, 38),
+    BackgroundTransparency = 1,
+}, main)
+new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+
+local stats = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 104), LayoutOrder = 1,
+    BackgroundColor3 = Color3.fromRGB(28, 22, 36), BorderSizePixel = 0,
+    TextColor3 = Color3.fromRGB(200, 200, 210), Font = Enum.Font.Code,
+    TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Text = "",
+}, body)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, stats)
+new("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 8) }, stats)
+
+local function mkBtn(order, text, color, h)
+    local b = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, h or 26), LayoutOrder = order,
+        BackgroundColor3 = color, Text = text,
+        TextColor3 = Color3.fromRGB(230, 230, 235),
+        Font = Enum.Font.GothamMedium, TextSize = 12, BorderSizePixel = 0,
+    }, body)
+    new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+    return b
+end
+
+local function makeToggle(order, text, getter, setter)
+    local b = mkBtn(order, "", Color3.fromRGB(35, 28, 45))
+    local function refresh()
+        b.Text = text .. ": " .. (getter() and "ON" or "OFF")
+        b.TextColor3 = getter() and Color3.fromRGB(120, 255, 140) or Color3.fromRGB(255, 110, 110)
+    end
+    b.MouseButton1Click:Connect(function() setter(not getter()); refresh() end)
+    refresh()
+end
+
+makeToggle(2, "Candy Autofarm", function() return STATE.farm end, function(v) STATE.farm = v end)
+makeToggle(3, "Auto Open Box", function() return STATE.open end, function(v) STATE.open = v end)
+makeToggle(4, "Anti-kick (humanize)",
+    function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
+
+mkBtn(5, "Check balance now", Color3.fromRGB(40, 60, 45))
+    .MouseButton1Click:Connect(function() probeBalance() end)
+
+-- pin the wallet element by clicking it (fallback if auto-detect grabs the wrong thing)
+local pinning = false
+local function pickWallet()
+    if pinning then return end
+    pinning = true
+    local conn
+    local function cleanup() pinning = false; if conn then conn:Disconnect() end end
+    task.delay(8, function() if pinning then cleanup(); STATE.log = "wallet pick timed out" end end)
+
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not pinning or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        cleanup()
+        task.wait(0.05)
+        local pg = pgui()
+        local m = UIS:GetMouseLocation()
+        local found
+        for _, y in ipairs({m.Y, m.Y - 36}) do
+            for _, o in ipairs(pg:GetGuiObjectsAtPosition(m.X, y)) do
+                if (o:IsA("TextLabel") or o:IsA("TextButton"))
+                    and o.Visible and chainVisible(o.Parent)
+                    and #(o.Text:gsub("[^%d]", "")) > 0 then
+                    found = o; break
+                end
+            end
+            if found then break end
+        end
+        if not found then STATE.log = "no number label there"; return end
+        candySrc = found
+        STATE.candy = readCandy()
+        STATE.checkedOnce = true
+        STATE.walletName = found.Name
+        STATE.lastCheck = os.clock()
+        STATE.log = "wallet pinned: " .. found.Name
+    end)
+end
+
+mkBtn(6, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
+    .MouseButton1Click:Connect(pickWallet)
+
+local PREV = {1, 2, 3, 4, 5, 6, 7, 8}
+local tabBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
+local function refreshTab()
+    tabBtn.Text = string.format("Event preview tile #%d  (click to change)", CONFIG.EventPreviewIndex)
+end
+tabBtn.MouseButton1Click:Connect(function()
+    local idx = 1
+    for i, v in ipairs(PREV) do
+        if v == CONFIG.EventPreviewIndex then idx = i break end
+    end
+    idx = idx % #PREV + 1
+    CONFIG.EventPreviewIndex = PREV[idx]
+    refreshTab()
+    STATE.log = "preview tile #" .. CONFIG.EventPreviewIndex
+end)
+refreshTab()
+
+local modeBtn = mkBtn(8, "", Color3.fromRGB(45, 40, 55))
+local function refreshMode()
+    modeBtn.Text = "Open flow: " .. (CONFIG.OpenMode == "builtin" and "built-in" or "recorded")
+        .. "  (click to change)"
+end
+modeBtn.MouseButton1Click:Connect(function()
+    CONFIG.OpenMode = CONFIG.OpenMode == "builtin" and "recorded" or "builtin"
+    refreshMode()
+    STATE.log = "open flow: " .. CONFIG.OpenMode
+end)
+refreshMode()
+
+local DWELLS = {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0}
+local dwellBtn = mkBtn(9, "", Color3.fromRGB(50, 42, 30))
+local function refreshDwell()
+    dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
+end
+dwellBtn.MouseButton1Click:Connect(function()
+    local idx = 1
+    for i, v in ipairs(DWELLS) do
+        if math.abs(v - CONFIG.DwellTime) < 0.01 then idx = i break end
+    end
+    idx = idx % #DWELLS + 1
+    CONFIG.DwellTime = DWELLS[idx]
+    CONFIG.ReInteractAt = math.min(CONFIG.DwellTime * 0.3, 0.6)
+    refreshDwell()
+    STATE.log = "dwell " .. CONFIG.DwellTime .. "s"
+end)
+refreshDwell()
+
+--==================== STEP RECORDER ====================
+
+local picking = false
+
+local function pickTopButton()
+    local pg = pgui()
+    local m = UIS:GetMouseLocation()
+    local fallback
+    for _, y in ipairs({m.Y, m.Y - 36}) do
+        for _, o in ipairs(pg:GetGuiObjectsAtPosition(m.X, y)) do
+            if o:IsA("GuiButton") and o.Visible and chainVisible(o.Parent) then
+                if not fallback then fallback = o end
+                if getconnections and #getconnections(o.MouseButton1Click) > 0 then
+                    return o
+                end
+            end
+        end
+    end
+    return fallback
+end
+
+local function printSteps()
+    print("===== RECORDED STEPS (" .. #CONFIG.Sequence .. ") =====")
+    for i, p in ipairs(CONFIG.Sequence) do print("  " .. i .. ") " .. p) end
+    print("    Sequence = {")
+    for _, p in ipairs(CONFIG.Sequence) do print('        "' .. p .. '",') end
+    print("    },")
+end
+
+local function addStep()
+    if picking then return end
+    picking = true
+    local conn
+    local function cleanup()
+        picking = false
+        if conn then conn:Disconnect() end
+    end
+    task.delay(8, function()
+        if picking then cleanup(); STATE.log = "pick timed out" end
+    end)
+
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not picking or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        cleanup()
+        task.wait(0.05)
+        local b = pickTopButton()
+        if not b then STATE.log = "no button there"; return end
+        CONFIG.Sequence[#CONFIG.Sequence + 1] = pathFromPg(b)
+        STATE.log = "step " .. #CONFIG.Sequence .. ": " .. b.Name
+        printSteps()
+    end)
+end
+
+mkBtn(10, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+    .MouseButton1Click:Connect(addStep)
+
+mkBtn(11, "Remove last step", Color3.fromRGB(55, 45, 35))
+    .MouseButton1Click:Connect(function()
+        if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
+        local removed = table.remove(CONFIG.Sequence)
+        STATE.log = "removed: " .. removed:sub(-22)
+        printSteps()
+    end)
+
+do
+    local dragging, startPos, startInput
+    header.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; startInput = i.Position; startPos = main.Position
+        end
+    end)
+    header.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+            or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - startInput
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+task.spawn(function()
+    local lastText = ""
+    while task.wait(0.5) do
+        local run = os.clock() - STATE.started
+        local since = STATE.lastCheck > 0
+            and string.format("%dm%02ds", math.floor((os.clock() - STATE.lastCheck) / 60),
+                math.floor((os.clock() - STATE.lastCheck) % 60))
+            or "never"
+        local txt = string.format(
+            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   tile #%d\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
+            STATE.collected, STATE.skipped, STATE.hops,
+            STATE.hops / math.max(run, 0.001),
+            math.floor(run / 60), math.floor(run % 60),
+            STATE.boxes, CONFIG.EventPreviewIndex,
+            STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost, since,
+            (STATE.walletName or "?"):sub(1, 28),
+            (STATE.log or ""):sub(1, 30))
+        if txt ~= lastText then
+            lastText = txt
+            stats.Text = txt
+        end
+    end
+end)
+
+UIS.InputBegan:Connect(function(i, gp)
+    if gp then return end
+    if i.KeyCode == CONFIG.Keybinds.UI then main.Visible = not main.Visible
+    elseif i.KeyCode == CONFIG.Keybinds.Farm then STATE.farm = not STATE.farm
+    elseif i.KeyCode == CONFIG.Keybinds.Open then STATE.open = not STATE.open
+    elseif i.KeyCode == CONFIG.Keybinds.Force then STATE.force = not STATE.force end
+end)
+
+print("[MM2 Candy Farm] loaded — RightShift UI | F1 farm | F2 open | F3 force")
