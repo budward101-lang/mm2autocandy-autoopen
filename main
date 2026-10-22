@@ -2,6 +2,7 @@
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
 --  Fixed 20 studs/s + bottom-tab-row navigation (box = 4th icon)
+--  Balance is read from the Halloween box page (account wallet).
 --=============================================================
 
 local CONFIG = {
@@ -39,8 +40,12 @@ local CONFIG = {
     BoxCost       = 600,
     RequireBalance = true,
     CycleCooldown = 3.0,
-    BalanceCheckMin = 300,
-    BalanceCheckMax = 600,
+
+    --========== WALLET BALANCE ==========
+    WalletKeywords  = {"wallet", "candy", "sweet", "balance", "currency",
+                       "total", "amount", "owned", "count"},
+    BalanceCheckMin = 6,
+    BalanceCheckMax = 12,
 
     --========== BOX OPEN FLOW ==========
     OpenMode      = "builtin",
@@ -81,10 +86,14 @@ local STATE = {
     farm = CONFIG.AutoFarm, open = CONFIG.AutoOpen, force = false,
     collected = 0, hops = 0, boxes = 0, skipped = 0,
     started = os.clock(), candy = nil, checkedOnce = false,
-    lastCheck = 0, log = "starting...",
+    lastCheck = 0, log = "starting...", walletName = "?",
 }
 local attempts, claimed = {}, {}
 print("[MM2] boot")
+
+--==================== WALLET BALANCE (impl lives after the box flow) ====================
+local candySrc, readCandy, findCandySource, probeBalance
+local uiLock = false     -- true while any UI navigation (probe or open cycle) is running
 
 --==================== HELPERS ====================
 
@@ -360,64 +369,6 @@ task.spawn(function()
 end)
 print("[MM2] farm loop ok")
 
---==================== CANDY BALANCE (slow poll) ====================
-
-local candySrc = nil
-
-local function findCandySource()
-    for _, src in ipairs({LP, RS}) do
-        for _, v in ipairs(src:GetDescendants()) do
-            if (v:IsA("IntValue") or v:IsA("NumberValue") or v:IsA("StringValue"))
-                and v.Name:lower():find("candy", 1, true) then
-                if tonumber(v.Value) then return v end
-            end
-        end
-    end
-    local pg = pgui()
-    if pg then
-        for _, l in ipairs(pg:GetDescendants()) do
-            if l:IsA("TextLabel") and l.Visible then
-                local a = l
-                while a and a ~= pg do
-                    if a.Name:lower():find("candy", 1, true) then
-                        if tonumber((l.Text:gsub("[^%d]", ""))) then return l end
-                        break
-                    end
-                    a = a.Parent
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function readCandy()
-    local s = candySrc
-    if not s or not s.Parent then return nil end
-    if s:IsA("TextLabel") then
-        return tonumber((s.Text:gsub("[^%d]", "")))
-    end
-    return tonumber(s.Value)
-end
-
-local function doBalanceCheck()
-    candySrc = findCandySource()
-    STATE.candy = readCandy()
-    STATE.checkedOnce = true
-    STATE.lastCheck = os.clock()
-    STATE.log = "balance: " .. (STATE.candy and tostring(STATE.candy) or "?") .. "/" .. CONFIG.BoxCost
-end
-
-task.spawn(function()
-    task.wait(4)
-    while true do
-        doBalanceCheck()
-        local wait = CONFIG.BalanceCheckMin
-            + math.random() * (CONFIG.BalanceCheckMax - CONFIG.BalanceCheckMin)
-        task.wait(wait)
-    end
-end)
-
 --==================== UI HELPERS ====================
 
 local function isOwnGui(o)
@@ -643,19 +594,30 @@ local function reachBoxPage(beforeSet)
 end
 
 local function runBoxCycle()
+    uiLock = true
     if CONFIG.CloseBeforeCycle then closeAll() end
     task.wait(jit(0.3))
 
     local before = buttonSet()
     local ev = clickFirst(CONFIG.EventKeywords)
-    if not ev then STATE.log = "no event button"; return false end
+    if not ev then STATE.log = "no event button"; uiLock = false; return false end
     STATE.log = "event: " .. ev.Name
     task.wait(jit(1.1))
 
     local unbox = reachBoxPage(before)
     if not unbox then
         STATE.log = "box page not reached"
+        uiLock = false
         return false
+    end
+
+    -- the account total is on this page: grab it while it's open
+    candySrc = findCandySource()
+    local bal = readCandy()
+    if bal then
+        STATE.candy = bal
+        STATE.checkedOnce = true
+        STATE.lastCheck = os.clock()
     end
 
     fireButton(unbox)
@@ -670,6 +632,7 @@ local function runBoxCycle()
 
     STATE.boxes += 1
     if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
+    uiLock = false
     return true
 end
 
@@ -722,6 +685,7 @@ task.spawn(function()
     local lastCycle = 0
     while task.wait(0.5) do
         if not STATE.open then continue end
+        if uiLock then continue end
         if os.clock() - lastCycle < jit(CONFIG.CycleCooldown) then continue end
 
         if CONFIG.RequireBalance and not STATE.force then
@@ -744,6 +708,117 @@ task.spawn(function()
 end)
 print("[MM2] open loop ok")
 
+--==================== WALLET BALANCE (read off the Halloween box page) ====================
+
+local function walletPath(o)
+    local parts, n, pg, depth = {}, o, pgui(), 0
+    while n and n ~= pg and depth < 4 do
+        parts[#parts + 1] = n.Name
+        n = n.Parent
+        depth += 1
+    end
+    return table.concat(parts, " "):lower()
+end
+
+local function matchesWallet(o)
+    local n = walletPath(o)
+    for _, kw in ipairs(CONFIG.WalletKeywords) do
+        if n:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
+local function scoreWallet(o)
+    local n = walletPath(o)
+    local s = 0
+    if n:find("wallet",  1, true) then s += 120 end
+    if n:find("balance", 1, true) then s += 60  end
+    if n:find("total",   1, true) then s += 60  end
+    if n:find("owned",   1, true) then s += 50  end
+    if n:find("candy",   1, true) then s += 40  end
+    if n:find("sweet",   1, true) then s += 25  end
+    if n:find("collect", 1, true) then s -= 30  end
+    if n:find("cost", 1, true) or n:find("price", 1, true) then s -= 40 end
+    if o:IsA("TextLabel") then s += 20 end
+    return s
+end
+
+readCandy = function()
+    local s = candySrc
+    if not s or not s.Parent then return nil end
+    if s:IsA("TextLabel") or s:IsA("TextButton") then
+        local t = s.Text:gsub("[^%d]", "")
+        return #t > 0 and tonumber(t) or nil
+    end
+    return tonumber(s.Value)
+end
+
+findCandySource = function()
+    local best, bestScore = nil, -math.huge
+    local function consider(o, numeric)
+        if not numeric or not matchesWallet(o) then return end
+        if o:FindFirstAncestor(OWN_GUI_NAME) then return end
+        local s = scoreWallet(o)
+        if s > bestScore then best, bestScore = o, s end
+    end
+
+    local pg = pgui()
+    if pg then
+        for _, o in ipairs(pg:GetDescendants()) do
+            if o:IsA("TextLabel") and o.Visible and chainVisible(o.Parent) then
+                consider(o, #(o.Text:gsub("[^%d]", "")) > 0)
+            end
+        end
+    end
+
+    for _, root in ipairs({LP:FindFirstChild("leaderstats"), LP, RS}) do
+        if root then
+            for _, o in ipairs(root:GetDescendants()) do
+                if o:IsA("IntValue") or o:IsA("NumberValue") or o:IsA("StringValue") then
+                    consider(o, tonumber(o.Value) ~= nil)
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- opens the Halloween box page (view only, no cost), reads the total, closes again
+probeBalance = function()
+    if uiLock then return end
+    uiLock = true
+
+    local opened = false
+    if not findUnbox() then
+        local before = buttonSet()
+        local ev = clickFirst(CONFIG.EventKeywords)
+        if ev then
+            task.wait(jit(1.1))
+            opened = reachBoxPage(before) ~= nil
+        end
+    end
+
+    candySrc = findCandySource()
+    local v = readCandy()
+    if v then STATE.candy = v end
+    if candySrc then STATE.walletName = candySrc.Name end
+    STATE.checkedOnce = true
+    STATE.lastCheck = os.clock()
+    STATE.log = "wallet: " .. (STATE.candy and tostring(STATE.candy) or "?") .. "/" .. CONFIG.BoxCost
+
+    if opened and CONFIG.CloseBeforeCycle then closeAll() end
+    uiLock = false
+end
+
+task.spawn(function()
+    task.wait(4)
+    while true do
+        probeBalance()
+        task.wait(CONFIG.BalanceCheckMin
+            + math.random() * (CONFIG.BalanceCheckMax - CONFIG.BalanceCheckMin))
+    end
+end)
+
 --==================== UI ====================
 
 local function new(class, props, parent)
@@ -758,7 +833,7 @@ local gui = new("ScreenGui", {
 }, LP:WaitForChild("PlayerGui"))
 
 local main = new("Frame", {
-    Size = UDim2.new(0, 305, 0, 610), Position = UDim2.new(0, 20, 0, 55),
+    Size = UDim2.new(0, 305, 0, 620), Position = UDim2.new(0, 20, 0, 55),
     BackgroundColor3 = Color3.fromRGB(20, 16, 28), BorderSizePixel = 0, Active = true,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
@@ -779,7 +854,7 @@ local body = new("Frame", {
 new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, body)
 
 local stats = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 92), LayoutOrder = 1,
+    Size = UDim2.new(1, 0, 0, 104), LayoutOrder = 1,
     BackgroundColor3 = Color3.fromRGB(28, 22, 36), BorderSizePixel = 0,
     TextColor3 = Color3.fromRGB(200, 200, 210), Font = Enum.Font.Code,
     TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
@@ -815,10 +890,51 @@ makeToggle(4, "Anti-kick (humanize)",
     function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
 
 mkBtn(5, "Check balance now", Color3.fromRGB(40, 60, 45))
-    .MouseButton1Click:Connect(function() doBalanceCheck() end)
+    .MouseButton1Click:Connect(function() probeBalance() end)
+
+-- pin the wallet element by clicking it (fallback if auto-detect grabs the wrong thing)
+local pinning = false
+local function pickWallet()
+    if pinning then return end
+    pinning = true
+    local conn
+    local function cleanup() pinning = false; if conn then conn:Disconnect() end end
+    task.delay(8, function() if pinning then cleanup(); STATE.log = "wallet pick timed out" end end)
+
+    conn = UIS.InputBegan:Connect(function(i, gp)
+        if not pinning or gp then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+            and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        cleanup()
+        task.wait(0.05)
+        local pg = pgui()
+        local m = UIS:GetMouseLocation()
+        local found
+        for _, y in ipairs({m.Y, m.Y - 36}) do
+            for _, o in ipairs(pg:GetGuiObjectsAtPosition(m.X, y)) do
+                if (o:IsA("TextLabel") or o:IsA("TextButton"))
+                    and o.Visible and chainVisible(o.Parent)
+                    and #(o.Text:gsub("[^%d]", "")) > 0 then
+                    found = o; break
+                end
+            end
+            if found then break end
+        end
+        if not found then STATE.log = "no number label there"; return end
+        candySrc = found
+        STATE.candy = readCandy()
+        STATE.checkedOnce = true
+        STATE.walletName = found.Name
+        STATE.lastCheck = os.clock()
+        STATE.log = "wallet pinned: " .. found.Name
+    end)
+end
+
+mkBtn(6, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
+    .MouseButton1Click:Connect(pickWallet)
 
 local TABS = {1, 2, 3, 4, 5, 6, 7, 8}
-local tabBtn = mkBtn(6, "", Color3.fromRGB(50, 42, 30))
+local tabBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
 local function refreshTab()
     tabBtn.Text = string.format("Bottom tab #%d  (click to change)", CONFIG.BoxTabIndex)
 end
@@ -834,7 +950,7 @@ tabBtn.MouseButton1Click:Connect(function()
 end)
 refreshTab()
 
-local modeBtn = mkBtn(7, "", Color3.fromRGB(45, 40, 55))
+local modeBtn = mkBtn(8, "", Color3.fromRGB(45, 40, 55))
 local function refreshMode()
     modeBtn.Text = "Open flow: " .. (CONFIG.OpenMode == "builtin" and "built-in" or "recorded")
         .. "  (click to change)"
@@ -847,7 +963,7 @@ end)
 refreshMode()
 
 local DWELLS = {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0}
-local dwellBtn = mkBtn(8, "", Color3.fromRGB(50, 42, 30))
+local dwellBtn = mkBtn(9, "", Color3.fromRGB(50, 42, 30))
 local function refreshDwell()
     dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
 end
@@ -919,10 +1035,10 @@ local function addStep()
     end)
 end
 
-mkBtn(9, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+mkBtn(10, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
     .MouseButton1Click:Connect(addStep)
 
-mkBtn(10, "Remove last step", Color3.fromRGB(55, 45, 35))
+mkBtn(11, "Remove last step", Color3.fromRGB(55, 45, 35))
     .MouseButton1Click:Connect(function()
         if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
         local removed = table.remove(CONFIG.Sequence)
@@ -961,13 +1077,13 @@ task.spawn(function()
                 math.floor((os.clock() - STATE.lastCheck) % 60))
             or "never"
         local txt = string.format(
-            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   steps: %d\nbalance : %s (checked %s ago)\nflow    : %s   tab #%d\nlog     : %s",
+            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   steps: %d\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
             STATE.collected, STATE.skipped, STATE.hops,
             STATE.hops / math.max(run, 0.001),
             math.floor(run / 60), math.floor(run % 60),
             STATE.boxes, #CONFIG.Sequence,
-            STATE.candy and tostring(STATE.candy) or "?", since,
-            CONFIG.OpenMode, CONFIG.BoxTabIndex,
+            STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost, since,
+            (STATE.walletName or "?"):sub(1, 28),
             (STATE.log or ""):sub(1, 30))
         if txt ~= lastText then
             lastText = txt
