@@ -1,7 +1,7 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  Open flow: click EVENT tab -> click 4th event icon (chest) -> read/unbox
+--  Open flow: click SHOP tab -> click "Halloween Box '26" -> read/unbox
 --=============================================================
 
 local CONFIG = {
@@ -48,8 +48,8 @@ local CONFIG = {
 
     --========== BOX OPEN FLOW ==========
     OpenMode      = "builtin",
-    EventTabKeywords  = {"event"},   -- bottom tab that opens the event page
-    EventPreviewIndex = 4,           -- 4th icon on the event page = the chest
+    ShopKeywords    = {"shop"},                                -- bottom tab that opens the shop
+    BoxNameKeywords = {"halloween box", "box '26", "box 26"},  -- shop entry to click
     UnboxKeywords = {"unbox", "open box", "hatch", "open"},
     BuyKeywords   = {"buy", "purchase", "confirm", "600"},
 
@@ -529,7 +529,7 @@ local function findCandySource()
     return best
 end
 
---==================== TAB / ICON FINDING ====================
+--==================== SHOP / BOX FINDING ====================
 
 local function viewportY()
     local cam = workspace.CurrentCamera
@@ -549,57 +549,31 @@ local function findIn(list, keywords)
     return nil
 end
 
--- the EVENT tab: prefer a bottom-bar button whose label says "event"
-local function findEventTab()
+-- find a clickable by its visible text (button first, then climb from a label)
+local function findByName(keywords)
     local vis = visibleButtons()
-    for _, kw in ipairs(CONFIG.EventTabKeywords) do
+    for _, kw in ipairs(keywords) do
         for _, b in ipairs(vis) do
-            if inBottomRow(b) and buttonLabel(b):lower():find(kw, 1, true) then return b end
-        end
-    end
-    return findIn(vis, CONFIG.EventTabKeywords)
-end
-
--- the row of event icons (equal buttons in a row, lower half, above the tab strip)
-local function eventIcons()
-    local byParent = {}
-    for _, b in ipairs(visibleButtons()) do
-        local p = b.Parent
-        if p then
-            local g = byParent[p]
-            if not g then g = {}; byParent[p] = g end
-            g[#g + 1] = b
+            if buttonLabel(b):lower():find(kw, 1, true) then return b end
         end
     end
 
-    local vh = viewportY()
-    local best, bestN = nil, 0
-    for _, list in pairs(byParent) do
-        if #list >= CONFIG.EventPreviewIndex then
-            local row = {}
-            local refY = list[1].AbsolutePosition.Y
-            local refH = list[1].AbsoluteSize.Y
-            local refW = list[1].AbsoluteSize.X
-            for _, b in ipairs(list) do
-                if math.abs(b.AbsolutePosition.Y - refY) < 24
-                    and math.abs(b.AbsoluteSize.Y - refH) < 24
-                    and math.abs(b.AbsoluteSize.X - refW) < 24 then
-                    row[#row + 1] = b
-                end
-            end
-            if #row >= CONFIG.EventPreviewIndex then
-                local avgY = 0
-                for _, b in ipairs(row) do avgY += b.AbsolutePosition.Y end
-                avgY /= #row
-                if avgY > vh * 0.40 and avgY < vh * 0.92 and #row > bestN then
-                    best, bestN = row, #row
+    local pg = pgui()
+    if pg then
+        for _, kw in ipairs(keywords) do
+            for _, o in ipairs(pg:GetDescendants()) do
+                if (o:IsA("TextLabel") or o:IsA("TextButton"))
+                    and o.Visible and not isOwnGui(o)
+                    and chainVisible(o.Parent)
+                    and o.Text:lower():find(kw, 1, true) then
+                    local b = o
+                    while b and not b:IsA("GuiButton") do b = b.Parent end
+                    if b and b.Visible then return b end
                 end
             end
         end
     end
-    if not best then return {} end
-    table.sort(best, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
-    return best
+    return nil
 end
 
 -- an unbox/open button lives in the page body, NOT in the tab bar
@@ -658,24 +632,29 @@ local function clickFirst(keywords)
     return b
 end
 
--- the whole balance/unbox path: EVENT tab -> 4th event icon (chest)
-local function openEventChest()
-    local ev = findEventTab()
-    if not ev then return nil, "no EVENT button" end
-    fireButton(ev)
-    STATE.log = "event tab: " .. ev.Name
+-- the whole balance/unbox path: SHOP tab -> "Halloween Box '26"
+local function openShopBox()
+    local shop = findIn(visibleButtons(), CONFIG.ShopKeywords)
+    if not shop then return nil, "no SHOP button" end
+    fireButton(shop)
+    STATE.log = "shop: " .. shop.Name
     task.wait(jit(1.0))
 
-    local icons = eventIcons()
-    if #icons < CONFIG.EventPreviewIndex then
-        return nil, "event icons not found (" .. #icons .. ")"
+    local t0 = os.clock()
+    local box
+    repeat
+        box = findByName(CONFIG.BoxNameKeywords)
+        if box then break end
+        task.wait(0.15)
+    until os.clock() - t0 > 3
+
+    if not box then
+        return nil, "no '" .. (CONFIG.BoxNameKeywords[1] or "?") .. "' in shop"
     end
-
-    local icon = icons[CONFIG.EventPreviewIndex]
-    fireButton(icon)
-    STATE.log = "chest icon #" .. CONFIG.EventPreviewIndex .. ": " .. icon.Name
+    fireButton(box)
+    STATE.log = "box: " .. buttonLabel(box):sub(1, 24)
     task.wait(jit(1.0))
-    return icon
+    return box
 end
 
 local function runBoxCycle()
@@ -683,8 +662,8 @@ local function runBoxCycle()
     if CONFIG.CloseBeforeCycle then closeAll() end
     task.wait(jit(0.3))
 
-    local icon, err = openEventChest()
-    if not icon then
+    local box, err = openShopBox()
+    if not box then
         STATE.log = err
         uiLock = false
         return false
@@ -789,13 +768,13 @@ task.spawn(function()
 end)
 print("[MM2] open loop ok")
 
---==================== BALANCE PROBE (click EVENT -> chest -> read) ====================
+--==================== BALANCE PROBE (click SHOP -> box -> read) ====================
 
 local function probeBalance()
     if uiLock then return end
     uiLock = true
 
-    openEventChest()
+    openShopBox()
     task.wait(jit(0.6))
 
     candySrc = findCandySource()
@@ -931,22 +910,22 @@ end
 mkBtn(6, "PIN WALLET  (click the candy total)", Color3.fromRGB(35, 55, 70), 30)
     .MouseButton1Click:Connect(pickWallet)
 
-local PREV = {1, 2, 3, 4, 5, 6, 7, 8}
-local tabBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
-local function refreshTab()
-    tabBtn.Text = string.format("Event icon #%d (chest)  (click to change)", CONFIG.EventPreviewIndex)
+local BOXNAMES = {"halloween box", "box '26", "box 26", "halloween"}
+local boxBtn = mkBtn(7, "", Color3.fromRGB(50, 42, 30))
+local function refreshBox()
+    boxBtn.Text = "Shop -> '" .. (CONFIG.BoxNameKeywords[1] or "?") .. "'  (click to change)"
 end
-tabBtn.MouseButton1Click:Connect(function()
+boxBtn.MouseButton1Click:Connect(function()
     local idx = 1
-    for i, v in ipairs(PREV) do
-        if v == CONFIG.EventPreviewIndex then idx = i break end
+    for i, v in ipairs(BOXNAMES) do
+        if v == CONFIG.BoxNameKeywords[1] then idx = i break end
     end
-    idx = idx % #PREV + 1
-    CONFIG.EventPreviewIndex = PREV[idx]
-    refreshTab()
-    STATE.log = "event icon #" .. CONFIG.EventPreviewIndex
+    idx = idx % #BOXNAMES + 1
+    CONFIG.BoxNameKeywords = { BOXNAMES[idx] }
+    refreshBox()
+    STATE.log = "target: " .. BOXNAMES[idx]
 end)
-refreshTab()
+refreshBox()
 
 local modeBtn = mkBtn(8, "", Color3.fromRGB(45, 40, 55))
 local function refreshMode()
@@ -1075,11 +1054,11 @@ task.spawn(function()
                 math.floor((os.clock() - STATE.lastCheck) % 60))
             or "never"
         local txt = string.format(
-            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   icon #%d\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
+            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   -> %s\nbalance : %s/%d  (%s ago)\nsource  : %s\nlog     : %s",
             STATE.collected, STATE.skipped, STATE.hops,
             STATE.hops / math.max(run, 0.001),
             math.floor(run / 60), math.floor(run % 60),
-            STATE.boxes, CONFIG.EventPreviewIndex,
+            STATE.boxes, (CONFIG.BoxNameKeywords[1] or "?"):sub(1, 16),
             STATE.candy and tostring(STATE.candy) or "?", CONFIG.BoxCost, since,
             (STATE.walletName or "?"):sub(1, 28),
             (STATE.log or ""):sub(1, 30))
