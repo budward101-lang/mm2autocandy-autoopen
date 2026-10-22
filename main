@@ -1,21 +1,24 @@
 --=============================================================
 --  MM2 • HALLOWEEN 2026  —  CANDY AUTOFARM + AUTO OPEN BOX
 --  Keys: RightShift = UI | F1 = Farm | F2 = Auto-Open | F3 = Force
---  NOCLIP GLIDE (unanchored so Touched actually fires)
+--  OPTIMIZED + slow balance check + explicit box-page navigation
 --=============================================================
 
 local CONFIG = {
     --========== MOVEMENT ==========
-    TweenSpeed    = 18,      -- studs/sec glide speed (through walls)
+    TweenSpeed    = 18,
     SettleDelay   = 0.15,
-    DwellTime     = 3.0,     -- long grab window on each candy
-    ReInteractAt  = 0.5,     -- re-fire grab every 0.5s during dwell
+    DwellTime     = 3.0,
+    ReInteractAt  = 0.5,
     RetryDwell    = 2.0,
     RetryOnMiss   = true,
     MaxAttempts   = 3,
     ClaimCooldown = 5.0,
     HopInterval   = 0.25,
-    RescanTime    = 1.0,
+    RescanTime    = 3.0,
+    ValidateTime  = 0.25,
+    PruneTime     = 0.5,
+    TickRate      = 0.1,
     NearestFirst  = true,
 
     --========== ANTI-KICK / HUMANIZER ==========
@@ -35,20 +38,27 @@ local CONFIG = {
     AutoOpen      = true,
     BoxCost       = 600,
     RequireBalance = true,
+    CycleCooldown = 3.0,
 
-    Sequence      = {},
-    SequenceDelay = 0.6,
-    StepTimeout   = 3.0,
-    CycleCooldown = 1.0,
+    -- balance only checked every 5-10 minutes
+    BalanceCheckMin = 300,
+    BalanceCheckMax = 600,
+
+    --========== BOX OPEN FLOW ==========
+    OpenMode      = "builtin",              -- "builtin" or "recorded"
+    EventKeywords = {"halloween", "event"}, -- opens the event page
+    BoxTabIndex   = 4,                      -- 4th button on the event page = box page
+    UnboxKeywords = {"unbox", "open box", "hatch", "open"},
+    BuyKeywords   = {"buy", "purchase", "confirm", "600"},
+
     CloseBeforeCycle = true,
     CloseKeywords = {"close", "exit", "back", "x"},
     CloseNever    = {"backpack", "bag", "shop", "store"},
 
-    AutoOpenSteps = {
-        { label = "open/unbox", any = {"unbox", "open box", "hatch", "open"}, delay = 1.2 },
-        { label = "buy",        any = {"buy", "purchase", "600"},             delay = 1.0 },
-        { label = "panel",      any = {"halloween", "event", "crate", "box"}, delay = 1.0 },
-    },
+    -- optional recorded override
+    Sequence      = {},
+    SequenceDelay = 0.6,
+    StepTimeout   = 3.0,
 
     Keybinds = { UI = Enum.KeyCode.RightShift, Farm = Enum.KeyCode.F1,
                  Open = Enum.KeyCode.F2, Force = Enum.KeyCode.F3 },
@@ -59,7 +69,8 @@ local RS      = game:GetService("ReplicatedStorage")
 local UIS     = game:GetService("UserInputService")
 local LP      = Players.LocalPlayer
 
---==================== HUMANIZER ====================
+local LOWFILTER = {}
+for i, f in ipairs(CONFIG.NameFilter) do LOWFILTER[i] = f:lower() end
 
 local function jit(t)
     if not CONFIG.Humanize then return t end
@@ -69,7 +80,8 @@ end
 local STATE = {
     farm = CONFIG.AutoFarm, open = CONFIG.AutoOpen, force = false,
     collected = 0, hops = 0, boxes = 0, skipped = 0,
-    started = os.clock(), candy = nil, candyPath = "?", log = "starting...",
+    started = os.clock(), candy = nil, checkedOnce = false,
+    lastCheck = 0, log = "starting...",
 }
 local attempts, claimed = {}, {}
 print("[MM2] boot")
@@ -87,28 +99,25 @@ local function getChar()
     return c, h, r
 end
 
-local function nameMatches(name, list)
-    name = name:lower()
-    for _, f in ipairs(list) do
-        if name:find(f, 1, true) then return true end
-    end
-    return false
-end
-
 local function isCandy(p)
     if not p:IsA("BasePart") then return false end
+    local n = p.Name:lower()
+    local ok = false
+    for i = 1, #LOWFILTER do
+        if n:find(LOWFILTER[i], 1, true) then ok = true break end
+    end
+    if not ok then return false end
     local s = p.Size
     if math.max(s.X, s.Y, s.Z) > CONFIG.MaxSize then return false end
-    if not nameMatches(p.Name, CONFIG.NameFilter) then return false end
     local m = p:FindFirstAncestorOfClass("Model")
     if m and Players:GetPlayerFromCharacter(m) then return false end
     return true
 end
 
 local function stillThere(p)
-    if not p or not p.Parent or not p:IsDescendantOf(workspace) then return false end
+    if not p or not p.Parent then return false end
     if p.Transparency >= 1 then return false end
-    return true
+    return p:IsDescendantOf(workspace)
 end
 
 local function promptDead(p)
@@ -127,23 +136,39 @@ local function prune(now)
     end
 end
 
+--==================== CACHED CANDY TRACKING ====================
+
+local candyList, candySet = {}, {}
+
+local function rebuildCandyList()
+    local out, set = {}, {}
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if isCandy(d) then out[#out + 1] = d; set[d] = true end
+    end
+    candyList, candySet = out, set
+end
+
+workspace.DescendantAdded:Connect(function(d)
+    if not STATE.farm or candySet[d] then return end
+    if d:IsA("BasePart") and isCandy(d) then
+        candySet[d] = true
+        candyList[#candyList + 1] = d
+    end
+end)
+
+workspace.DescendantRemoving:Connect(function(d)
+    if candySet[d] then candySet[d] = nil end
+end)
+
 local function validTarget(p, now)
-    if not stillThere(p) or not isCandy(p) then return false end
+    if not stillThere(p) then return false end
     local c = claimed[p]
     if c and now < c then return false end
     if (attempts[p] or 0) >= CONFIG.MaxAttempts then return false end
     return true
 end
 
-local function scanCandies()
-    local out = {}
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if isCandy(d) then out[#out + 1] = d end
-    end
-    return out
-end
-
---==================== NOCLIP (no anchor!) ====================
+--==================== NOCLIP ====================
 
 local function applyNoclip(char)
     if not char then return end
@@ -175,7 +200,6 @@ local function interact(part)
     end
 end
 
--- poke the candy's own Touched handlers so collection can't be missed
 local function forceTouch(target, char)
     if not getconnections or not target.Parent then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -193,23 +217,18 @@ end
 
 local function glideTo(pos, char, hrp)
     if not char.Parent or not hrp.Parent then return end
-
     local startPos = hrp.Position
     local delta = pos - startPos
     local dist = delta.Magnitude
     if dist < 0.1 then return end
 
     local flat = Vector3.new(delta.X, 0, delta.Z)
-    local rot
-    if flat.Magnitude > 1 then
-        rot = CFrame.lookAt(Vector3.zero, flat.Unit)
-    else
-        rot = hrp.CFrame - hrp.CFrame.Position
-    end
+    local rot = flat.Magnitude > 1
+        and CFrame.lookAt(Vector3.zero, flat.Unit)
+        or (hrp.CFrame - hrp.CFrame.Position)
 
     local duration = dist / math.max(CONFIG.TweenSpeed, 1)
     local t0 = os.clock()
-
     while true do
         if not char.Parent or not hrp.Parent then return end
         local a = (os.clock() - t0) / duration
@@ -225,18 +244,14 @@ end
 local function goGrab(target, char, hrp, holdFor)
     glideTo(target.Position, char, hrp)
 
-    -- hold position ourselves: with no collision the character would fall
     local rot  = hrp.CFrame - hrp.CFrame.Position
     local base = target.Position
-
     local t0 = os.clock()
     local nextRefire = CONFIG.ReInteractAt
     local firstDone = false
 
     while os.clock() - t0 < holdFor do
         if not stillThere(target) then break end
-
-        -- gentle bob so touch overlap keeps re-triggering
         local bob = math.sin((os.clock() - t0) * 6) * 0.4
         hrp.CFrame = CFrame.new(base + Vector3.new(0, bob, 0)) * rot
         hrp.AssemblyLinearVelocity = Vector3.zero
@@ -244,69 +259,68 @@ local function goGrab(target, char, hrp, holdFor)
 
         if not firstDone then
             firstDone = true
-            interact(target)
-            forceTouch(target, char)
+            interact(target); forceTouch(target, char)
         elseif (os.clock() - t0) >= nextRefire then
             nextRefire = nextRefire + CONFIG.ReInteractAt
-            interact(target)
-            forceTouch(target, char)
+            interact(target); forceTouch(target, char)
         end
-
         task.wait(0.04)
     end
-
-    if stillThere(target) then
-        interact(target)
-        forceTouch(target, char)
-    end
+    if stillThere(target) then interact(target); forceTouch(target, char) end
 end
 
 --==================== FARM LOOP ====================
 
-local function pickNearest(list, hrp)
-    if not CONFIG.NearestFirst then return list[1] end
-    local best, bestD = nil, math.huge
-    for i = 1, #list do
-        local d = (list[i].Position - hrp.Position).Magnitude
-        if d < bestD then best, bestD = list[i], d end
+local function pickNearest(now, hrp)
+    local best, bestD
+    for i = 1, #candyList do
+        local p = candyList[i]
+        if validTarget(p, now) then
+            local d = (p.Position - hrp.Position).Magnitude
+            if not bestD or d < bestD then best, bestD = p, d end
+        end
     end
     return best
 end
 
 task.spawn(function()
-    local list, lastScan, nextHop = {}, 0, 0
+    local lastScan, lastValidate, lastPrune, nextHop = 0, 0, 0, 0
     local hopsSinceRest = 0
     local restTarget = math.random(CONFIG.RestAfterMin, CONFIG.RestAfterMax)
     local noclipChar = nil
 
-    while task.wait() do
+    while task.wait(CONFIG.TickRate) do
         local char, _, hrp = getChar()
 
         if STATE.farm and char then
-            if char ~= noclipChar then
-                applyNoclip(char)
-                noclipChar = char
-            end
+            if char ~= noclipChar then applyNoclip(char); noclipChar = char end
         elseif not STATE.farm and noclipChar then
-            clearNoclip(noclipChar)
-            noclipChar = nil
+            clearNoclip(noclipChar); noclipChar = nil
         end
 
-        if not STATE.farm then task.wait(0.05) continue end
-        if not char then task.wait(0.1) continue end
+        if not STATE.farm or not char then continue end
 
         local now = os.clock()
-        if now - lastScan > jit(CONFIG.RescanTime) then
+        if now - lastScan > CONFIG.RescanTime then
             lastScan = now
-            list = scanCandies()
+            rebuildCandyList()
         end
-        prune(now)
-        for i = #list, 1, -1 do
-            if not validTarget(list[i], now) then table.remove(list, i) end
+        if now - lastPrune > CONFIG.PruneTime then
+            lastPrune = now
+            prune(now)
+        end
+        if now - lastValidate > CONFIG.ValidateTime then
+            lastValidate = now
+            for i = #candyList, 1, -1 do
+                if not stillThere(candyList[i]) then
+                    candySet[candyList[i]] = nil
+                    table.remove(candyList, i)
+                end
+            end
         end
 
         if now >= nextHop then
-            local target = pickNearest(list, hrp)
+            local target = pickNearest(now, hrp)
             if target then
                 local hopStart = os.clock()
                 attempts[target] = (attempts[target] or 0) + 1
@@ -346,15 +360,16 @@ task.spawn(function()
 end)
 print("[MM2] farm loop ok")
 
---==================== CANDY BALANCE ====================
+--==================== CANDY BALANCE (slow poll) ====================
 
-local function getCandyCount()
+local candySrc = nil
+
+local function findCandySource()
     for _, src in ipairs({LP, RS}) do
         for _, v in ipairs(src:GetDescendants()) do
             if (v:IsA("IntValue") or v:IsA("NumberValue") or v:IsA("StringValue"))
                 and v.Name:lower():find("candy", 1, true) then
-                local n = tonumber(v.Value)
-                if n then return n, v:GetFullName() end
+                if tonumber(v.Value) then return v end
             end
         end
     end
@@ -362,25 +377,44 @@ local function getCandyCount()
     if pg then
         for _, l in ipairs(pg:GetDescendants()) do
             if l:IsA("TextLabel") and l.Visible then
-                local n = tonumber((l.Text:gsub("[^%d]", "")))
-                if n then
-                    local a = l
-                    while a and a ~= pg do
-                        if a.Name:lower():find("candy", 1, true) then
-                            return n, l:GetFullName()
-                        end
-                        a = a.Parent
+                local a = l
+                while a and a ~= pg do
+                    if a.Name:lower():find("candy", 1, true) then
+                        if tonumber((l.Text:gsub("[^%d]", ""))) then return l end
+                        break
                     end
+                    a = a.Parent
                 end
             end
         end
     end
-    return nil, "not found"
+    return nil
+end
+
+local function readCandy()
+    local s = candySrc
+    if not s or not s.Parent then return nil end
+    if s:IsA("TextLabel") then
+        return tonumber((s.Text:gsub("[^%d]", "")))
+    end
+    return tonumber(s.Value)
+end
+
+local function doBalanceCheck()
+    candySrc = findCandySource()
+    STATE.candy = readCandy()
+    STATE.checkedOnce = true
+    STATE.lastCheck = os.clock()
+    STATE.log = "balance: " .. (STATE.candy and tostring(STATE.candy) or "?") .. "/" .. CONFIG.BoxCost
 end
 
 task.spawn(function()
-    while task.wait(1) do
-        STATE.candy, STATE.candyPath = getCandyCount()
+    task.wait(4)
+    while true do
+        doBalanceCheck()
+        local wait = CONFIG.BalanceCheckMin
+            + math.random() * (CONFIG.BalanceCheckMax - CONFIG.BalanceCheckMin)
+        task.wait(wait)
     end
 end)
 
@@ -401,7 +435,8 @@ local function visibleButtons()
     local pg = pgui(); if not pg then return out end
     for _, d in ipairs(pg:GetDescendants()) do
         if (d:IsA("TextButton") or d:IsA("ImageButton"))
-            and d.Visible and chainVisible(d.Parent) then
+            and d.Visible and d.AbsoluteSize.X > 0 and d.AbsoluteSize.Y > 0
+            and chainVisible(d.Parent) then
             out[#out + 1] = d
         end
     end
@@ -412,6 +447,18 @@ local function buttonLabel(b)
     local t = b.Name
     if b:IsA("TextButton") then t = t .. " " .. b.Text end
     return t
+end
+
+local function sigOf(list)
+    local parts = {}
+    for i = 1, #list do parts[i] = list[i]:GetFullName() end
+    return table.concat(parts, ",")
+end
+
+local function buttonSet()
+    local s = {}
+    for _, b in ipairs(visibleButtons()) do s[b] = true end
+    return s
 end
 
 local function fireButton(b)
@@ -436,20 +483,18 @@ local function fireButton(b)
     return pcall(function() b:Activate() end)
 end
 
-local function uiSignature()
-    local parts = {}
-    for _, b in ipairs(visibleButtons()) do
-        parts[#parts + 1] = b:GetFullName()
+-- click the first visible button matching a keyword, in keyword priority order
+local function clickFirst(keywords)
+    local vis = visibleButtons()
+    for _, kw in ipairs(keywords) do
+        for _, b in ipairs(vis) do
+            if buttonLabel(b):lower():find(kw, 1, true) then
+                fireButton(b)
+                return b
+            end
+        end
     end
-    return #parts .. ":" .. table.concat(parts, ",")
-end
-
-local function findButtons(anyKw)
-    local out = {}
-    for _, b in ipairs(visibleButtons()) do
-        if nameMatches(buttonLabel(b), anyKw) then out[#out + 1] = b end
-    end
-    return out
+    return nil
 end
 
 local function resolvePath(path)
@@ -486,19 +531,79 @@ end
 
 local function closeAll()
     for _ = 1, 3 do
-        local before = uiSignature()
+        local vis = visibleButtons()
+        local before = sigOf(vis)
         local found
-        for _, b in ipairs(visibleButtons()) do
+        for _, b in ipairs(vis) do
             if isCloseButton(b) then found = b break end
         end
         if not found then return end
         fireButton(found)
         task.wait(jit(0.5))
-        if uiSignature() == before then return end
+        if sigOf(visibleButtons()) == before then return end
     end
 end
 
---==================== SEQUENCE ====================
+--==================== BOX OPEN FLOW ====================
+
+-- buttons that appeared after a click, ordered top-to-bottom / left-to-right
+local function newButtonsSince(prevSet)
+    local out = {}
+    for _, b in ipairs(visibleButtons()) do
+        if not prevSet[b] then out[#out + 1] = b end
+    end
+    table.sort(out, function(a, b)
+        local pa, pb = a.AbsolutePosition, b.AbsolutePosition
+        if math.abs(pa.Y - pb.Y) > 24 then return pa.Y < pb.Y end
+        return pa.X < pb.X
+    end)
+    return out
+end
+
+local function runBoxCycle()
+    if CONFIG.CloseBeforeCycle then closeAll() end
+    task.wait(jit(0.3))
+
+    -- 1) open the event page
+    local before = buttonSet()
+    local ev = clickFirst(CONFIG.EventKeywords)
+    if not ev then STATE.log = "no event button"; return false end
+    STATE.log = "event page: " .. ev.Name
+    task.wait(jit(1.0))
+
+    -- 2) the Nth button on that page is the box page tab
+    local fresh = newButtonsSince(before)
+    local tab = fresh[CONFIG.BoxTabIndex]
+    if tab then
+        fireButton(tab)
+        STATE.log = "box tab #" .. CONFIG.BoxTabIndex .. ": " .. tab.Name
+        task.wait(jit(0.9))
+    else
+        STATE.log = "no box tab #" .. CONFIG.BoxTabIndex .. " (" .. #fresh .. " found)"
+    end
+
+    -- 3) unbox
+    local unbox = clickFirst(CONFIG.UnboxKeywords)
+    if unbox then
+        STATE.log = "unbox: " .. unbox.Name
+        task.wait(jit(1.0))
+    end
+
+    -- 4) buy / confirm
+    local buy = clickFirst(CONFIG.BuyKeywords)
+    if buy then
+        STATE.log = "buy: " .. buy.Name
+        task.wait(jit(1.2))
+        STATE.boxes += 1
+        if STATE.candy then
+            STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost)
+        end
+        return true
+    end
+    return false
+end
+
+--==================== RECORDED SEQUENCE (optional) ====================
 
 local function waitForButton(path, timeout)
     local t0 = os.clock()
@@ -511,8 +616,8 @@ local function waitForButton(path, timeout)
 end
 
 local function replaySequence()
-    local before = getCandyCount()
-    local sigBefore = uiSignature()
+    local before = STATE.candy
+    local sigBefore = sigOf(visibleButtons())
     local timedOut = 0
 
     for i, path in ipairs(CONFIG.Sequence) do
@@ -528,55 +633,44 @@ local function replaySequence()
     end
 
     task.wait(jit(1.2))
-    local after = getCandyCount()
+    local after = readCandy()
     if before and after and after < before then
         STATE.boxes += 1
-        STATE.log = "OPENED  (-" .. (before - after) .. " candy)"
+        if STATE.candy then STATE.candy = math.max(0, STATE.candy - CONFIG.BoxCost) end
+        STATE.log = "OPENED"
     elseif timedOut > 0 then
         STATE.log = timedOut .. " step(s) never appeared"
-    elseif uiSignature() == sigBefore then
+    elseif sigOf(visibleButtons()) == sigBefore then
         STATE.log = "no UI change - wrong step order?"
     end
-    STATE.candy = after
+    if after then STATE.candy = after end
 end
 
 --==================== AUTO OPEN LOOP ====================
 
 task.spawn(function()
-    local lastCycle, lastPress = 0, 0
-    while task.wait(0.2) do
+    local lastCycle = 0
+    while task.wait(0.5) do
         if not STATE.open then continue end
+        if os.clock() - lastCycle < jit(CONFIG.CycleCooldown) then continue end
 
-        if #CONFIG.Sequence > 0 then
-            if os.clock() - lastCycle < jit(CONFIG.CycleCooldown) then continue end
+        -- hard gate: only open once the (slow-polled) balance covers the box
+        if CONFIG.RequireBalance and not STATE.force then
+            if not STATE.checkedOnce then continue end
             local c = STATE.candy
-            if CONFIG.RequireBalance and not STATE.force and c and c < CONFIG.BoxCost then
-                STATE.log = "waiting " .. c .. "/" .. CONFIG.BoxCost
+            if c and c < CONFIG.BoxCost then
+                STATE.log = string.format("balance %d/%d - waiting", c, CONFIG.BoxCost)
                 continue
             end
-            if CONFIG.CloseBeforeCycle then closeAll() end
-            replaySequence()
-            lastCycle = os.clock()
-            continue
         end
 
-        if os.clock() - lastPress < 1.2 then continue end
-        local progressed = false
-        for _, step in ipairs(CONFIG.AutoOpenSteps) do
-            for _, b in ipairs(findButtons(step.any)) do
-                local before = uiSignature()
-                fireButton(b)
-                lastPress = os.clock()
-                task.wait(jit(step.delay))
-                if uiSignature() ~= before then
-                    STATE.log = "pressed [" .. step.label .. "] " .. b.Name
-                    progressed = true
-                    break
-                end
-            end
-            if progressed then break end
+        if CONFIG.OpenMode == "recorded" and #CONFIG.Sequence > 0 then
+            if CONFIG.CloseBeforeCycle then closeAll() end
+            replaySequence()
+        else
+            runBoxCycle()
         end
-        if not progressed then STATE.log = "no matching button" end
+        lastCycle = os.clock()
     end
 end)
 print("[MM2] open loop ok")
@@ -595,7 +689,7 @@ local gui = new("ScreenGui", {
 }, LP:WaitForChild("PlayerGui"))
 
 local main = new("Frame", {
-    Size = UDim2.new(0, 305, 0, 610), Position = UDim2.new(0, 20, 0, 60),
+    Size = UDim2.new(0, 305, 0, 660), Position = UDim2.new(0, 20, 0, 50),
     BackgroundColor3 = Color3.fromRGB(20, 16, 28), BorderSizePixel = 0, Active = true,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
@@ -648,13 +742,45 @@ end
 
 makeToggle(2, "Candy Autofarm", function() return STATE.farm end, function(v) STATE.farm = v end)
 makeToggle(3, "Auto Open Box", function() return STATE.open end, function(v) STATE.open = v end)
-makeToggle(4, "Close page before each cycle",
-    function() return CONFIG.CloseBeforeCycle end, function(v) CONFIG.CloseBeforeCycle = v end)
-makeToggle(5, "Anti-kick (humanize)",
+makeToggle(4, "Anti-kick (humanize)",
     function() return CONFIG.Humanize end, function(v) CONFIG.Humanize = v end)
 
+mkBtn(5, "Check balance now", Color3.fromRGB(40, 60, 45))
+    .MouseButton1Click:Connect(function()
+        doBalanceCheck()
+    end)
+
+local TABS = {2, 3, 4, 5, 6, 7, 8}
+local tabBtn = mkBtn(6, "", Color3.fromRGB(50, 42, 30))
+local function refreshTab()
+    tabBtn.Text = string.format("Box tab on event page: #%d  (click to change)", CONFIG.BoxTabIndex)
+end
+tabBtn.MouseButton1Click:Connect(function()
+    local idx = 1
+    for i, v in ipairs(TABS) do
+        if v == CONFIG.BoxTabIndex then idx = i break end
+    end
+    idx = idx % #TABS + 1
+    CONFIG.BoxTabIndex = TABS[idx]
+    refreshTab()
+    STATE.log = "box tab #" .. CONFIG.BoxTabIndex
+end)
+refreshTab()
+
+local modeBtn = mkBtn(7, "", Color3.fromRGB(45, 40, 55))
+local function refreshMode()
+    modeBtn.Text = "Open flow: " .. (CONFIG.OpenMode == "builtin" and "built-in" or "recorded")
+        .. "  (click to change)"
+end
+modeBtn.MouseButton1Click:Connect(function()
+    CONFIG.OpenMode = CONFIG.OpenMode == "builtin" and "recorded" or "builtin"
+    refreshMode()
+    STATE.log = "open flow: " .. CONFIG.OpenMode
+end)
+refreshMode()
+
 local DWELLS = {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0}
-local dwellBtn = mkBtn(6, "", Color3.fromRGB(50, 42, 30))
+local dwellBtn = mkBtn(8, "", Color3.fromRGB(50, 42, 30))
 local function refreshDwell()
     dwellBtn.Text = string.format("Stand on candy: %.1fs  (click to change)", CONFIG.DwellTime)
 end
@@ -672,7 +798,7 @@ end)
 refreshDwell()
 
 local SPEEDS = {6, 10, 14, 18, 24, 30, 40, 55}
-local speedBtn = mkBtn(7, "", Color3.fromRGB(45, 40, 55))
+local speedBtn = mkBtn(9, "", Color3.fromRGB(45, 40, 55))
 local function refreshSpeed()
     speedBtn.Text = string.format("Glide speed: %d studs/s  (click to change)", CONFIG.TweenSpeed)
 end
@@ -720,20 +846,21 @@ end
 local function addStep()
     if picking then return end
     picking = true
-    STATE.log = "CLICK the next button in game (8s)"
+    local conn
+    local function cleanup()
+        picking = false
+        if conn then conn:Disconnect() end
+    end
     task.delay(8, function()
-        if picking then picking = false; STATE.log = "pick timed out" end
+        if picking then cleanup(); STATE.log = "pick timed out" end
     end)
 
-    local conn
     conn = UIS.InputBegan:Connect(function(i, gp)
         if not picking or gp then return end
         if i.UserInputType ~= Enum.UserInputType.MouseButton1
             and i.UserInputType ~= Enum.UserInputType.Touch then return end
-        picking = false
-        conn:Disconnect()
+        cleanup()
         task.wait(0.05)
-
         local b = pickTopButton()
         if not b then STATE.log = "no button there"; return end
         CONFIG.Sequence[#CONFIG.Sequence + 1] = pathFromPg(b)
@@ -742,10 +869,10 @@ local function addStep()
     end)
 end
 
-mkBtn(8, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
+mkBtn(10, "ADD STEP  (click button in game)", Color3.fromRGB(30, 65, 40), 30)
     .MouseButton1Click:Connect(addStep)
 
-mkBtn(9, "Remove last step", Color3.fromRGB(55, 45, 35))
+mkBtn(11, "Remove last step", Color3.fromRGB(55, 45, 35))
     .MouseButton1Click:Connect(function()
         if #CONFIG.Sequence == 0 then STATE.log = "nothing to remove"; return end
         local removed = table.remove(CONFIG.Sequence)
@@ -776,17 +903,26 @@ do
 end
 
 task.spawn(function()
-    while task.wait(0.3) do
+    local lastText = ""
+    while task.wait(0.5) do
         local run = os.clock() - STATE.started
-        stats.Text = string.format(
-            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d\nsteps   : %d   stand: %.1fs\nspeed   : %d  balance: %s\nlog     : %s",
+        local since = STATE.lastCheck > 0
+            and string.format("%dm%02ds", math.floor((os.clock() - STATE.lastCheck) / 60),
+                math.floor((os.clock() - STATE.lastCheck) % 60))
+            or "never"
+        local txt = string.format(
+            "picked  : %d   skipped: %d\nhops    : %d  (%.2f/s)\ntime    : %02d:%02d\nboxes   : %d   steps: %d\nbalance : %s (checked %s ago)\nflow    : %s   tab #%d\nlog     : %s",
             STATE.collected, STATE.skipped, STATE.hops,
             STATE.hops / math.max(run, 0.001),
             math.floor(run / 60), math.floor(run % 60),
-            STATE.boxes, #CONFIG.Sequence, CONFIG.DwellTime,
-            CONFIG.TweenSpeed,
-            STATE.candy and tostring(STATE.candy) or "unknown",
-            (STATE.log or ""):sub(1, 32))
+            STATE.boxes, #CONFIG.Sequence,
+            STATE.candy and tostring(STATE.candy) or "?", since,
+            CONFIG.OpenMode, CONFIG.BoxTabIndex,
+            (STATE.log or ""):sub(1, 30))
+        if txt ~= lastText then
+            lastText = txt
+            stats.Text = txt
+        end
     end
 end)
 
