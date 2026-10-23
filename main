@@ -7,10 +7,11 @@
 local CFG = {
 	Tween      = 25,     -- studs per second glide
 	Hold       = 0.02,   -- settle on arrival (touch needs a frame)
-	Revisit    = 3,      -- secs before a candy can be targeted again
+	Revisit    = 2.5,    -- secs before a candy can be targeted again
 	Radius     = 120,    -- "near it" = random pick within this range
 	MaxSize    = 8,      -- ignore map parts bigger than this
 	RoundGrace = 3,      -- secs with no candies before going idle again
+	Debug      = false,  -- true = print every target + result
 	AntiAFK    = true,
 	Mode       = "Remote",           -- Remote | GUI
 	Crate      = "Halloween2026Box", -- arg 1 (captured from OpenCrate)
@@ -28,15 +29,14 @@ local lp  = P.LocalPlayer
 
 print("[MM2] boot")
 
-local armed       = true            -- master switch (F1)
-local roundActive = false           -- true only while a round is live
-local lastSeen    = os.clock()      -- last time a candy was visible
+local armed       = true
+local roundActive = false
+local lastSeen    = os.clock()
 local lastScan    = 0
 local picked, boxes = 0, 0
 local started     = os.clock()
 local status
 
--- resolved once, hardcoded path (findRemotes() order is not stable)
 local Shop      = RS:WaitForChild("Remotes"):WaitForChild("Shop")
 local OpenCrate = Shop:WaitForChild("OpenCrate")
 
@@ -150,8 +150,6 @@ do
 end
 
 --==================== NOCLIP ====================
--- Velocity wiped every frame so the free-fall from no ground contact never
--- builds up and flings you into a kick.
 RUN.Stepped:Connect(function()
 	local ch = lp.Character
 	if not ch then return end
@@ -170,6 +168,12 @@ end)
 --==================== CANDY ====================
 local function isCandy(d)
 	if not d:IsA("BasePart") then return false end
+
+	-- the game can leave a collected candy sitting there: invisible or
+	-- untouchable. either way it is already gone, so don't target it.
+	if d.Transparency >= 0.99 then return false end
+	if d.CanTouch == false then return false end
+
 	local id = d:GetAttribute("CoinID")
 	if id then return id == "Candy" end
 	local n = d.Name:lower()
@@ -190,11 +194,9 @@ local function findCandy()
 	return out
 end
 
--- weak keys so destroyed candies drop out on their own
 local failed  = setmetatable({}, { __mode = "k" })
 local visited = setmetatable({}, { __mode = "k" })
 
--- straight-line glide, constant 25 studs/sec, passes through walls (noclip)
 local function moveTo(part, hrp)
 	local dist = (part.Position - hrp.Position).Magnitude
 	local dur = dist / CFG.Tween
@@ -253,48 +255,53 @@ local function step()
 		print("[MM2] round live - farming")
 	end
 
-	-- pick a random candy near us that we have NOT just landed on
-	local near, best, bd = {}, nil, nil
+	-- STRICT: only candies that are off cooldown qualify. if nothing
+	-- qualifies we wait, rather than forcing the candy under our feet.
+	local near = {}
 	for _, c in ipairs(list) do
 		local f = failed[c]
 		local v = visited[c]
 		local cooling = (f and f.until > now) or (v and (now - v) < CFG.Revisit)
-
 		if not cooling then
 			local d = (c.Position - hrp.Position).Magnitude
 			if d <= CFG.Radius then near[#near + 1] = c end
-			if not bd or d < bd then best, bd = c, d end
 		end
 	end
 
+	-- nothing in range off cooldown: fall back to nearest off-cooldown
 	local target
 	if #near > 0 then
 		target = near[math.random(1, #near)]
-	elseif best then
-		target = best
 	else
-		-- everything is cooling down; just take the closest so we never stall
-		local bd2
+		local bd
 		for _, c in ipairs(list) do
-			local d = (c.Position - hrp.Position).Magnitude
-			if not bd2 or d < bd2 then target, bd2 = c, d end
+			local f = failed[c]
+			local v = visited[c]
+			local cooling = (f and f.until > now) or (v and (now - v) < CFG.Revisit)
+			if not cooling then
+				local d = (c.Position - hrp.Position).Magnitude
+				if not bd or d < bd then target, bd = c, d end
+			end
 		end
 	end
-	if not target then return end
+
+	if not target then return end   -- everything cooling, just wait
 
 	moveTo(target, hrp)
 
-	-- mark it so the very next pick cannot be this same candy
+	-- lock it out immediately. this is the bit that stops the re-grab.
 	visited[target] = os.clock()
 
 	if target.Parent == nil then
 		picked = picked + 1
 		failed[target] = nil
+		if CFG.Debug then print("[MM2] collected, left:", #list - 1) end
 	else
 		local f = failed[target] or { count = 0, until = 0 }
 		f.count = f.count + 1
-		if f.count >= 3 then f.until = os.clock() + 8; f.count = 0 end
+		if f.count >= 2 then f.until = os.clock() + 6; f.count = 0 end
 		failed[target] = f
+		if CFG.Debug then print("[MM2] still there, strikes:", f.count) end
 	end
 end
 
