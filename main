@@ -32,11 +32,11 @@ local CFG = {
     RoundGrace = 3, -- secs of no candies before a round counts as over
     Stall = 10, -- secs of no grabs = clear targets and retarget
     TweenSlack = 1.5, -- extra secs before a glide is declared stuck
-    PickupWait = 0.8, -- max secs to wait for a pickup to register
+    PickupWait = 0.6, -- max secs to wait for a pickup to register
 
     -- PERF TUNING
     CandyTTL = 0.12, -- reuse a candy scan this long (secs)
-    BagTTL = 0.15, -- reuse a bag read this long (secs)
+    SourceScan = 1.5, -- how often to re-scan candidate counter sources
     ContainerRetry = 1.0, -- min secs between CoinContainer re-searches
 }
 
@@ -374,14 +374,19 @@ local spawnedAt = os.clock() - 10
 local lastGrabAt = os.clock()
 local ticks, stalls = 0, 0
 
--- two independent signals; displayed value is the larger of the two
-local selfCount = 0    -- pickups we confirmed ourselves
-local bagDelta = 0     -- credited from the game value rising
-local balance = 0      -- raw game value (display only)
-local bagSrcLabel = "-"
+local selfCount = 0    -- fallback: pickups confirmed ourselves
+local bagDelta = 0     -- exact: credited from a source that actually moves
+local balance = 0
+local bagConfirmed = false
+local activeName
+local bagSrcLabel = "none"
 
-local function bumpCount()
-    picked = math.max(selfCount, bagDelta)
+local function shownCount()
+    return bagConfirmed and bagDelta or selfCount
+end
+
+local function syncPicked()
+    picked = shownCount()
 end
 
 --==================== NOCLIP ====================
@@ -455,7 +460,8 @@ local function isCandy(d)
     return true
 end
 
-local function wasCollected(part)
+-- a candy is "gone from us" once it stops being a live candy
+local function isDead(part)
     if not part or not part.Parent then return true end
     if part.Transparency >= 0.99 then return true end
     if part.CanTouch == false then return true end
@@ -483,8 +489,9 @@ local function findCandy(force)
     return out
 end
 
+-- returns "collected" (ours) | "gone" (someone beat us / it was already dead) | "ok" (failed)
 local function grab(part, hrp)
-    if not part or not part.Parent or not hrp or not hrp.Parent then return "collected" end
+    if not part or not part.Parent or not hrp or not hrp.Parent then return "gone" end
 
     local dist = (part.Position - hrp.Position).Magnitude
     local dur = math.max(dist / CFG.Tween, 0.02)
@@ -506,11 +513,13 @@ local function grab(part, hrp)
     pcall(function() conn:Disconnect() end)
     if not done then pcall(function() tw:Cancel() end) end
 
-    if not part.Parent then return "collected" end
+    -- vanished while we were flying over = another player took it, not us
+    if isDead(part) then return "gone" end
 
     task.wait(CFG.Hold)
+    if isDead(part) then return "gone" end
 
-    -- fire everything that could register the pickup
+    -- we are on it: fire everything that could register the pickup
     for _, x in ipairs(part:GetDescendants()) do
         if x:IsA("ProximityPrompt") then
             pcall(function()
@@ -525,12 +534,11 @@ local function grab(part, hrp)
         end
     end
 
-    -- give the game a beat to register it, polling so a real pickup
-    -- returns fast and only a genuine failure burns the full window
+    -- it dying AFTER we fired is a real pickup by us
     local t1 = os.clock()
     while (os.clock() - t1) < CFG.PickupWait do
-        if wasCollected(part) then return "collected" end
-        task.wait(0.05)
+        if isDead(part) then return "collected" end
+        task.wait(0.04)
     end
 
     return "ok"
@@ -555,15 +563,15 @@ safeLoop("round", function()
     end
 end)
 
---==================== INTERNAL CANDY READING ====================
+--==================== SOURCE TRACKER ====================
+-- every source that could be the candy counter is watched. the first one
+-- that actually MOVES becomes the active source; deltas come from it only.
 local learnedMax
-local bagSource = "none"
 local fullStreak = 0
 local lastFullReason = "-"
 
--- locked source: once found, stick to ONE object so the read is stable
-local lockedKind, lockedRef
-local lastBagVal
+local cands = {}
+local candNextScan = 0
 
 local function isOurs(d)
     return d:IsDescendantOf(gui)
@@ -588,86 +596,30 @@ local function extractCount(text)
     return nil
 end
 
--- read the exact object we locked onto; nil means it went away
-local function readLocked()
-    if not lockedKind then return nil end
+local function scanCands()
+    local out = {}
 
-    if lockedKind == "attr" then
-        local ch = lp.Character
-        if ch then
-            local v = ch:GetAttribute(lockedRef)
-            if type(v) == "number" then return v, nil, "attr:" .. lockedRef end
-        end
-        local v = lp:GetAttribute(lockedRef)
-        if type(v) == "number" then return v, nil, "attr:" .. lockedRef end
-
-    elseif lockedKind == "val" then
-        if lockedRef and lockedRef.Parent then
-            local v = tonumber(lockedRef.Value)
-            if v then return v, nil, "val:" .. lockedRef.Name end
-        end
-
-    elseif lockedKind == "stats" then
-        if lockedRef and lockedRef.Parent then
-            local v = tonumber(lockedRef.Value)
-            if v then return v, nil, "stats:" .. lockedRef.Name end
-        end
-
-    elseif lockedKind == "gui" then
-        if lockedRef and lockedRef.Parent then
-            local a, b = extractCount(lockedRef.Text)
-            if a then return a, b, "gui:" .. lockedRef.Name end
-        end
-    end
-    return nil
-end
-
-local function readBagRaw()
-    -- 1) prefer the locked source
-    local c, m, s = readLocked()
-    if c then return c, m, s end
-
-    -- 2) otherwise scan for the best candidate and lock it
-    local best, bestScore, bestKind, bestRef
-
-    local function consider(cur, max, src, score, kind, ref)
-        if cur == nil then return end
-        if not bestScore or score > bestScore then
-            best, bestScore, bestKind, bestRef = { cur, max, src }, score, kind, ref
-        end
-    end
-
-    local holders = { { lp, "player" } }
-    if lp.Character then holders[#holders + 1] = { lp.Character, "char" } end
+    local holders = { lp }
+    if lp.Character then holders[#holders + 1] = lp.Character end
     for _, h in ipairs(holders) do
-        for k, v in pairs(h[1]:GetAttributes()) do
-            if type(v) == "number" then
-                local sc = candyScore(k)
-                if sc > 0 then consider(v, nil, "attr:" .. k, sc, "attr", k) end
+        for k, v in pairs(h:GetAttributes()) do
+            if type(v) == "number" and candyScore(k) > 0 then
+                out[#out + 1] = { kind = "attr", ref = k, name = "attr:" .. k, score = candyScore(k) }
             end
         end
     end
 
-    for _, c2 in ipairs(lp:GetDescendants()) do
-        if c2:IsA("ValueBase") then
-            local sc = candyScore(c2.Name)
-            if sc > 0 then
-                local v = tonumber(c2.Value)
-                if not v and c2:IsA("StringValue") then v = extractCount(c2.Value) end
-                if v then consider(v, nil, "val:" .. c2.Name, sc, "val", c2) end
-            end
+    for _, c in ipairs(lp:GetDescendants()) do
+        if c:IsA("ValueBase") and candyScore(c.Name) > 0 then
+            out[#out + 1] = { kind = "val", ref = c, name = "val:" .. c.Name, score = candyScore(c.Name) }
         end
     end
 
     local ls = lp:FindFirstChild("leaderstats")
     if ls then
-        for _, c2 in ipairs(ls:GetChildren()) do
-            if c2:IsA("ValueBase") then
-                local sc = candyScore(c2.Name)
-                if sc > 0 then
-                    local v = tonumber(c2.Value)
-                    if v then consider(v, nil, "stats:" .. c2.Name, sc + 5, "stats", c2) end
-                end
+        for _, c in ipairs(ls:GetChildren()) do
+            if c:IsA("ValueBase") and candyScore(c.Name) > 0 then
+                out[#out + 1] = { kind = "stats", ref = c, name = "stats:" .. c.Name, score = candyScore(c.Name) + 5 }
             end
         end
     end
@@ -678,27 +630,54 @@ local function readBagRaw()
             if sc > 0 then
                 local a, b = extractCount(d.Text)
                 if a and (not b or b >= CFG.MinCap) then
-                    consider(a, b, "gui:" .. d.Name, sc, "gui", d)
+                    out[#out + 1] = { kind = "gui", ref = d, name = "gui:" .. d.Name, score = sc, max = b }
                 end
             end
         end
     end
 
-    if best then
-        lockedKind, lockedRef = bestKind, bestRef
-        return best[1], best[2], best[3]
-    end
-    return nil
+    return out
 end
 
-local bagCur, bagMax, bagSrc, bagCacheAt = nil, nil, nil, 0
-local function readBag()
-    local now = os.clock()
-    if (now - bagCacheAt) >= CFG.BagTTL then
-        bagCacheAt = now
-        bagCur, bagMax, bagSrc = readBagRaw()
+local function readCand(c)
+    if c.kind == "attr" then
+        local h = lp.Character
+        if h then
+            local v = h:GetAttribute(c.ref)
+            if type(v) == "number" then return v end
+        end
+        local v = lp:GetAttribute(c.ref)
+        if type(v) == "number" then return v end
+        return nil
+    elseif c.kind == "val" or c.kind == "stats" then
+        if c.ref and c.ref.Parent then return tonumber(c.ref.Value) end
+        return nil
+    elseif c.kind == "gui" then
+        if c.ref and c.ref.Parent then
+            local a = extractCount(c.ref.Text)
+            return a
+        end
+        return nil
     end
-    return bagCur, bagMax, bagSrc
+end
+
+-- what bagIsFull uses for the cap
+local function readBag()
+    local pick
+    if activeName then
+        for _, c in ipairs(cands) do
+            if c.name == activeName then pick = c break end
+        end
+    end
+    if not pick then
+        for _, c in ipairs(cands) do
+            if not pick or c.score > pick.score then pick = c end
+        end
+    end
+    if not pick then return nil end
+    local v = pick.cur
+    if v == nil then v = readCand(pick) end
+    return v, pick.max, pick.name
 end
 
 local function bagBanner()
@@ -730,7 +709,6 @@ local function bagIsFull()
     if not reason and CFG.UseBagGui then
         local cur, max, src = readBag()
         if cur then
-            bagSource = src or "?"
             if max then
                 learnedMax = max
                 if cur >= max then reason = ("%d/%d via %s"):format(cur, max, src) end
@@ -759,35 +737,62 @@ local function bagIsFull()
     return false
 end
 
--- credit only RISES. locked source keeps this stable, and a rebaseline
--- only happens if the source genuinely disappears and re-locks elsewhere.
 safeLoop("candywatch", function()
     task.wait(0.2)
+    local now = os.clock()
 
-    local cur, max, src = readBag()
-    if not cur then return end
+    if now >= candNextScan then
+        candNextScan = now + CFG.SourceScan
+        local fresh = scanCands()
+        local prevByName = {}
+        for _, c in ipairs(cands) do prevByName[c.name] = c.prev end
+        for _, c in ipairs(fresh) do c.prev = prevByName[c.name] end
+        cands = fresh
 
-    balance = cur
-
-    if not lastBagVal then
-        lastBagVal = cur
-        bagSrcLabel = src or "?"
-        print("[MM2] candy counter locked:", src, "baseline:", cur)
-        return
+        -- active source vanished? allow a re-pick
+        if activeName then
+            local found = false
+            for _, c in ipairs(cands) do
+                if c.name == activeName then found = true break end
+            end
+            if not found then
+                print("[MM2] active source lost:", activeName)
+                activeName = nil
+            end
+        end
     end
 
-    if src ~= bagSrcLabel then
-        bagSrcLabel = src or "?"
-        lastBagVal = cur
-        print("[MM2] candy source changed ->", src, "rebaseline:", cur)
-        return
+    for _, c in ipairs(cands) do
+        c.cur = readCand(c)
+        if c.cur ~= nil then balance = c.cur end
     end
 
-    if cur > lastBagVal then
-        bagDelta = bagDelta + (cur - lastBagVal)
-        bumpCount()
+    -- lock onto the first source that actually increases
+    if not activeName then
+        for _, c in ipairs(cands) do
+            if c.cur and c.prev and c.cur > c.prev then
+                activeName = c.name
+                bagConfirmed = true
+                bagSrcLabel = c.name
+                print("[MM2] candy counter active:", c.name)
+                break
+            end
+        end
     end
-    lastBagVal = cur
+
+    -- credit only the active source, only on a rise
+    if activeName then
+        for _, c in ipairs(cands) do
+            if c.name == activeName and c.cur and c.prev and c.cur > c.prev then
+                bagDelta = bagDelta + (c.cur - c.prev)
+                syncPicked()
+            end
+        end
+    end
+
+    for _, c in ipairs(cands) do
+        if c.cur ~= nil then c.prev = c.cur end
+    end
 end)
 
 --==================== DEATH / SPAWN ====================
@@ -911,7 +916,7 @@ local function farmStep()
 
     if res == "collected" then
         selfCount = selfCount + 1
-        bumpCount()
+        syncPicked()
         failStreak = 0
     elseif res == "ok" then
         failStreak = failStreak + 1
@@ -1142,7 +1147,12 @@ task.spawn(function()
 
             heroNum.Text = tostring(picked)
             heroBoxes.Text = tostring(boxes)
-            heroSub.Text = ("self %d  bag %d  bal %d  %s"):format(selfCount, bagDelta, balance, bagSrcLabel)
+
+            if bagConfirmed then
+                heroSub.Text = ("exact  bal %d  %s"):format(balance, bagSrcLabel)
+            else
+                heroSub.Text = ("est %d  bal %d  finding source"):format(selfCount, balance)
+            end
 
             TS:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(frac, 0, 1, 0) }):Play()
 
