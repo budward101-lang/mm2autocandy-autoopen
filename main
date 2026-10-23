@@ -6,7 +6,8 @@
 
 local CFG = {
 	Tween      = 25,     -- studs per second glide
-	Hold       = 0.05,   -- settle on arrival (touch needs a frame)
+	Hold       = 0.02,   -- settle on arrival (touch needs a frame)
+	Revisit    = 3,      -- secs before a candy can be targeted again
 	Radius     = 120,    -- "near it" = random pick within this range
 	MaxSize    = 8,      -- ignore map parts bigger than this
 	RoundGrace = 3,      -- secs with no candies before going idle again
@@ -148,9 +149,9 @@ do
 	end)
 end
 
---==================== NOCLIP + HOVER ====================
--- Always on, same shape as your original. Velocity is wiped every frame so
--- the free-fall from having no ground contact never builds up and flings you.
+--==================== NOCLIP ====================
+-- Velocity wiped every frame so the free-fall from no ground contact never
+-- builds up and flings you into a kick.
 RUN.Stepped:Connect(function()
 	local ch = lp.Character
 	if not ch then return end
@@ -189,9 +190,11 @@ local function findCandy()
 	return out
 end
 
-local failed = {}
+-- weak keys so destroyed candies drop out on their own
+local failed  = setmetatable({}, { __mode = "k" })
+local visited = setmetatable({}, { __mode = "k" })
 
--- straight-line glide. constant 25 studs/sec, passes through walls (noclip).
+-- straight-line glide, constant 25 studs/sec, passes through walls (noclip)
 local function moveTo(part, hrp)
 	local dist = (part.Position - hrp.Position).Magnitude
 	local dur = dist / CFG.Tween
@@ -222,8 +225,6 @@ local function moveTo(part, hrp)
 end
 
 --==================== ROUND STATE MACHINE ====================
--- no candies  -> idle, do nothing
--- candies     -> round is live, start working
 local function step()
 	local now = os.clock()
 
@@ -252,11 +253,14 @@ local function step()
 		print("[MM2] round live - farming")
 	end
 
-	-- pick a RANDOM candy near us, fall back to nearest if none in range
+	-- pick a random candy near us that we have NOT just landed on
 	local near, best, bd = {}, nil, nil
 	for _, c in ipairs(list) do
 		local f = failed[c]
-		if not (f and f.until > now) then
+		local v = visited[c]
+		local cooling = (f and f.until > now) or (v and (now - v) < CFG.Revisit)
+
+		if not cooling then
 			local d = (c.Position - hrp.Position).Magnitude
 			if d <= CFG.Radius then near[#near + 1] = c end
 			if not bd or d < bd then best, bd = c, d end
@@ -266,12 +270,22 @@ local function step()
 	local target
 	if #near > 0 then
 		target = near[math.random(1, #near)]
-	else
+	elseif best then
 		target = best
+	else
+		-- everything is cooling down; just take the closest so we never stall
+		local bd2
+		for _, c in ipairs(list) do
+			local d = (c.Position - hrp.Position).Magnitude
+			if not bd2 or d < bd2 then target, bd2 = c, d end
+		end
 	end
 	if not target then return end
 
 	moveTo(target, hrp)
+
+	-- mark it so the very next pick cannot be this same candy
+	visited[target] = os.clock()
 
 	if target.Parent == nil then
 		picked = picked + 1
@@ -296,9 +310,6 @@ task.spawn(function()
 end)
 
 --==================== BOX ====================
--- Real opener: ReplicatedStorage.Remotes.Shop.OpenCrate (RemoteFunction)
--- Args captured from the live game: (crate, boxType, currency)
-
 local function visibleButtons()
 	local out = {}
 	local p = lp:FindFirstChildOfClass("PlayerGui")
@@ -347,7 +358,6 @@ local function openBox()
 			return "opened - rarity: " .. tostring(result.Rarity or "?")
 		end
 
-		-- nil / non-table return = server refused the roll (usually not enough Candies2026)
 		return "returned " .. tostring(result) .. " (nil = open failed, check Candies2026)"
 	else
 		local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
@@ -423,4 +433,4 @@ if CFG.AntiAFK then
 	end)
 end
 
-print("[MM2] loaded - RightShift UI | F1 arm | F2 box")
+print("[MM2] Halloween loaded")
