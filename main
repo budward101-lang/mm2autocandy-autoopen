@@ -5,12 +5,12 @@
 --============================================================
 
 local CFG = {
-    Tween = 25, -- studs per second
-    Hold = 0.05, -- settle on a candy
+    Tween = 25, -- studs per second (raise toward 25 if you want to go faster)
+    Hold = 0, -- extra settle after landing (0 = none)
     Revisit = 2.5, -- secs before a candy can be picked again
     Radius = 120, -- outer pick range
     BandMin = 20, -- preferred pick band: min studs
-    BandMax = 40, -- preferred pick band: max studs
+    BandMax = 25, -- preferred pick band: max studs
     MaxSize = 8, -- ignore map parts bigger than this
     AntiAFK = true,
     Mode = "Remote", -- Remote | GUI
@@ -32,7 +32,7 @@ local CFG = {
     RoundGrace = 3, -- secs of no candies before a round counts as over
     Stall = 10, -- secs of no grabs = clear targets and retarget
     TweenSlack = 1.5, -- extra secs before a glide is declared stuck
-    PickupWait = 0.6, -- max secs to wait for a pickup to register
+    PickupWait = 0.6, -- secs before an unconfirmed pickup counts as a miss
 
     -- PERF TUNING
     CandyTTL = 0.12, -- reuse a candy scan this long (secs)
@@ -407,6 +407,7 @@ local roundActive = false
 local lastSeen = 0
 
 local visited = {}
+local pending = {}   -- pickups fired, awaiting confirmation
 local firstGrab = true
 local resetting, resets, failStreak, pickedAtReset = false, 0, 0, 0
 local resetStart = 0
@@ -531,55 +532,88 @@ local function findCandy(force)
     return out
 end
 
+-- fly to the candy, fire the pickup, and get out. No settle, no confirmation
+-- wait: the pickup is resolved later by settlePending.
 local function grab(part, hrp)
     if not part or not part.Parent or not hrp or not hrp.Parent then return "gone" end
 
     local dist = (part.Position - hrp.Position).Magnitude
     local dur = math.max(dist / CFG.Tween, 0.02)
+
     local tw = TS:Create(hrp,
         TweenInfo.new(dur, Enum.EasingStyle.Linear),
         { CFrame = CFrame.new(part.Position) })
-
-    local done = false
-    local conn = tw.Completed:Connect(function() done = true end)
     tw:Play()
 
-    local t0 = os.clock()
-    while not done and (os.clock() - t0) < (dur + CFG.TweenSlack) do
-        if not hrp.Parent or not part.Parent then break end
-        local cur = lp.Character
-        if not cur or cur:FindFirstChild("HumanoidRootPart") ~= hrp then break end
-        task.wait(0.03)
+    -- one long wait for the glide, then at most 3 frames to be certain we
+    -- are actually on top of it (a tween can step a frame late)
+    task.wait(dur)
+    local guard = 0
+    while guard < 3
+        and hrp.Parent and lp.Character == hrp.Parent
+        and (hrp.Position - part.Position).Magnitude > 1 do
+        guard = guard + 1
+        task.wait()
     end
-    pcall(function() conn:Disconnect() end)
-    if not done then pcall(function() tw:Cancel() end) end
+    pcall(function() tw:Cancel() end)
 
-    if isDead(part) then return "gone" end
+    -- most coins die from the touch on arrival
+    if not part.Parent or isDead(part) then return "hit" end
 
-    task.wait(CFG.Hold)
-    if isDead(part) then return "gone" end
+    if CFG.Hold > 0 then
+        task.wait(CFG.Hold)
+        if not part.Parent or isDead(part) then return "hit" end
+    end
 
-    for _, x in ipairs(part:GetDescendants()) do
-        if x:IsA("ProximityPrompt") then
-            pcall(function()
-                if fireproximityprompt then
-                    fireproximityprompt(x)
-                else
-                    x:InputHoldBegin(); task.wait(x.HoldDuration); x:InputHoldEnd()
-                end
-            end)
-        elseif x:IsA("ClickDetector") and fireclickdetector then
-            pcall(fireclickdetector, x)
+    -- prompt / click fallback for coins that need an input
+    local prompt = part:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if prompt then
+        pcall(function()
+            if fireproximityprompt then
+                fireproximityprompt(prompt)
+            else
+                prompt:InputHoldBegin(); task.wait(prompt.HoldDuration); prompt:InputHoldEnd()
+            end
+        end)
+    else
+        local cd = part:FindFirstChildWhichIsA("ClickDetector", true)
+        if cd and fireclickdetector then pcall(fireclickdetector, cd) end
+    end
+
+    return "fired"
+end
+
+--==================== PENDING RESOLVER ====================
+-- non-blocking: confirms fired pickups, times out the ones that never landed
+local function settlePending()
+    local n = #pending
+    if n == 0 then return end
+
+    local now = os.clock()
+    local i = 1
+    while i <= n do
+        local p = pending[i]
+        if isDead(p.part) then
+            selfCount = selfCount + 1
+            attempts = attempts + 1
+            failStreak = 0
+            syncPicked()
+            table.remove(pending, i)
+            n = n - 1
+        elseif (now - p.at) > CFG.PickupWait then
+            attempts = attempts + 1
+            failStreak = failStreak + 1
+            table.remove(pending, i)
+            n = n - 1
+        else
+            i = i + 1
         end
     end
 
-    local t1 = os.clock()
-    while (os.clock() - t1) < CFG.PickupWait do
-        if isDead(part) then return "collected" end
-        task.wait(0.04)
+    if failStreak >= CFG.FailLimit
+    and (picked - pickedAtReset) >= CFG.MinPicks then
+        doReset(failStreak .. " dead picks")
     end
-
-    return "ok"
 end
 
 --==================== ROUND WATCHER ====================
@@ -983,6 +1017,7 @@ end)
 local function onDied()
     alive = false
     visited = {}
+    pending = {}
     failStreak = 0
     fullStreak = 0
     say(roundActive and "dead in round - idling" or "dead - idling")
@@ -991,6 +1026,7 @@ end
 local function onSpawned(ch)
     spawnedAt = os.clock()
     fullStreak = 0
+    pending = {}
     rebuildNoc(ch)
     task.spawn(function()
         local hum = ch:FindFirstChildOfClass("Humanoid") or ch:WaitForChild("Humanoid", 6)
@@ -1036,6 +1072,10 @@ end
 local function farmStep()
     if not farmOn then task.wait(0.25) return end
     if resetting or not alive then task.wait(0.25) return end
+
+    settlePending()
+    if resetting or not alive then task.wait(0.25) return end
+
     if not roundActive then task.wait(0.25) return end
 
     local ch = lp.Character
@@ -1098,18 +1138,15 @@ local function farmStep()
         return
     end
 
-    if res == "collected" then
+    if res == "hit" then
+        -- died on arrival: the touch did it
         selfCount = selfCount + 1
         attempts = attempts + 1
         syncPicked()
         failStreak = 0
-    elseif res == "ok" then
-        attempts = attempts + 1
-        failStreak = failStreak + 1
-        if failStreak >= CFG.FailLimit
-        and (picked - pickedAtReset) >= CFG.MinPicks then
-            doReset(failStreak .. " dead picks")
-        end
+    elseif res == "fired" then
+        -- fired an input; confirm in the background so we can leave now
+        pending[#pending + 1] = { part = target, at = os.clock() }
     end
 end
 
@@ -1133,6 +1170,7 @@ safeLoop("watch", function()
             alive = true
             resetting = false
             visited = {}
+            pending = {}
             failStreak = 0
             fullStreak = 0
             firstGrab = true
