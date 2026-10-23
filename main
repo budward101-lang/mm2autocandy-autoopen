@@ -1,12 +1,12 @@
 --============================================================
---  MM2 HALLOWEEN  ·  v3
+--  MM2 HALLOWEEN  ·  v4
 --  Noclip float farm (constant tween 25) + Box Opener
 --  RightShift = hide UI | F1 = farm | F2 = open box
 --============================================================
 
 local CFG = {
-	Tween    = 25,     -- CONSTANT glide speed (studs/sec) - no hopping
-	Hold     = 0.03,   -- frames parked on contact point (tiny, not a hop)
+	Tween    = 25,     -- constant glide speed, no hopping
+	Hold     = 0.03,
 	MaxSize  = 8,
 	AntiAFK  = true,
 
@@ -30,10 +30,9 @@ local lastRarity = "-"
 local started = os.clock()
 local status
 
-local Shop      = RS:WaitForChild("Remotes"):WaitForChild("Shop")
-local OpenCrate = Shop:WaitForChild("OpenCrate")
+print("[MM2] boot")
 
---==================== THEME + HELPERS ====================
+--==================== HELPERS ====================
 local C = {
 	bg      = Color3.fromRGB(15, 11, 23),
 	panel   = Color3.fromRGB(25, 18, 37),
@@ -49,13 +48,15 @@ local C = {
 
 local function new(class, props, parent)
 	local o = Instance.new(class)
-	for k, v in pairs(props) do pcall(function() o[k] = v end) end
+	if props then
+		for k, v in pairs(props) do pcall(function() o[k] = v end) end
+	end
 	if parent then o.Parent = parent end
 	return o
 end
 
-local function grad(parent, c1, c2, rot)
-	return new("UIGradient", { Color = ColorSequence.new(c1, c2), Rotation = rot or 90 }, parent)
+local function grad(parent, c1, c2)
+	return new("UIGradient", { Color = ColorSequence.new(c1, c2), Rotation = 90 }, parent)
 end
 
 local function sheen(parent)
@@ -70,12 +71,12 @@ local function lighten(c, amt)
 end
 
 --==================== BUILD UI (centered) ====================
-local pg = lp:WaitForChild("PlayerGui")
+local pg  = lp:WaitForChild("PlayerGui")
 local gui = new("ScreenGui", {
 	Name = "MM2Halloween", ResetOnSpawn = false,
 	IgnoreGuiInset = true, DisplayOrder = 99,
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-}, pg)
+})  -- parented at the very end
 
 local win = new("Frame", {
 	Size = UDim2.fromOffset(276, 394),
@@ -85,7 +86,7 @@ local win = new("Frame", {
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(0, 14) }, win)
 new("UIStroke", { Color = C.stroke, Thickness = 1.4, Transparency = 0.25 }, win)
-grad(win, Color3.fromRGB(23, 16, 35), Color3.fromRGB(13, 9, 20), 90)
+grad(win, Color3.fromRGB(23, 16, 35), Color3.fromRGB(13, 9, 20))
 
 local sc = new("UIScale", { Scale = 0.92 }, win)
 TS:Create(sc, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
@@ -96,7 +97,7 @@ local head = new("Frame", {
 new("UICorner", { CornerRadius = UDim.new(0, 14) }, head)
 new("Frame", { Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 1, -16),
 	BackgroundColor3 = C.panelHi, BorderSizePixel = 0 }, head)
-grad(head, Color3.fromRGB(45, 30, 68), Color3.fromRGB(30, 21, 45), 90)
+grad(head, Color3.fromRGB(45, 30, 68), Color3.fromRGB(30, 21, 45))
 new("Frame", { Size = UDim2.new(1, -28, 0, 2), Position = UDim2.new(0, 14, 1, -2),
 	BackgroundColor3 = C.accent, BorderSizePixel = 0 }, head)
 
@@ -110,16 +111,16 @@ new("TextLabel", { Size = UDim2.new(1, -70, 0, 16), Position = UDim2.new(0, 32, 
 	BackgroundTransparency = 1, Text = "MM2 HALLOWEEN", TextColor3 = C.accent,
 	Font = Enum.Font.GothamBold, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left }, head)
 new("TextLabel", { Size = UDim2.new(1, -70, 0, 14), Position = UDim2.new(0, 32, 0, 27),
-	BackgroundTransparency = 1, Text = "noclip float · box opener", TextColor3 = C.dim,
+	BackgroundTransparency = 1, Text = "noclip float / box opener", TextColor3 = C.dim,
 	Font = Enum.Font.Gotham, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, head)
 
 local hideBtn = new("TextButton", {
 	Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, -32, 0, 12),
-	BackgroundColor3 = C.row, Text = "—", TextColor3 = C.text,
+	BackgroundColor3 = C.row, Text = "-", TextColor3 = C.text,
 	Font = Enum.Font.GothamBold, TextSize = 14, BorderSizePixel = 0, AutoButtonColor = false,
 }, head)
 new("UICorner", { CornerRadius = UDim.new(0, 7) }, hideBtn)
-hideBtn.UIStroke = new("UIStroke", { Color = C.stroke, Thickness = 1, Transparency = 0.6 }, hideBtn)
+new("UIStroke", { Color = C.stroke, Thickness = 1, Transparency = 0.6 }, hideBtn)
 
 local body = new("Frame", {
 	Size = UDim2.new(1, -24, 1, -68), Position = UDim2.new(0, 12, 0, 56),
@@ -135,7 +136,7 @@ new("UICorner", { CornerRadius = UDim.new(0, 10) }, statsWrap)
 new("UIStroke", { Color = C.stroke, Thickness = 1, Transparency = 0.7 }, statsWrap)
 new("UIPadding", { PaddingTop = UDim.new(0, 7), PaddingBottom = UDim.new(0, 7),
 	PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7) }, statsWrap)
-new("UIGridLayout", { CellSize = UDim2.new(0.5, -4, 0, 30), CellPadding = UDim.new(0, 6, 0, 6) }, statsWrap)
+new("UIGridLayout", { CellSize = UDim2.new(0.5, -4, 0, 30), CellPadding = UDim2.new(0, 6, 0, 6) }, statsWrap)
 
 local function cell(label, order)
 	local f = new("Frame", { BackgroundColor3 = C.panelHi, BorderSizePixel = 0, LayoutOrder = order }, statsWrap)
@@ -143,58 +144,58 @@ local function cell(label, order)
 	new("TextLabel", { Size = UDim2.new(1, 0, 0, 13), Position = UDim2.new(0, 0, 0, 2),
 		BackgroundTransparency = 1, Text = label, TextColor3 = C.dim,
 		Font = Enum.Font.Gotham, TextSize = 10 }, f)
-	local v = new("TextLabel", { Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 0, 13),
+	return new("TextLabel", { Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 0, 13),
 		BackgroundTransparency = 1, Text = "0", TextColor3 = C.text,
 		Font = Enum.Font.GothamBold, TextSize = 14 }, f)
-	return v
 end
+
 local vPicked = cell("PICKED", 1)
 local vBoxes  = cell("BOXES", 2)
 local vRate   = cell("PER / HR", 3)
 local vUp     = cell("UPTIME", 4)
 
-local meta = {}
+-- buttons
+local state = {}
 local function makeButton(text, order, accent, width)
 	local b = new("TextButton", {
 		Size = width or UDim2.new(1, 0, 0, 38), BackgroundColor3 = C.row,
 		BorderSizePixel = 0, AutoButtonColor = false, LayoutOrder = order, Text = "",
 	}, body)
 	new("UICorner", { CornerRadius = UDim.new(0, 9) }, b)
-	b.UIStroke = new("UIStroke", { Color = accent, Thickness = 1, Transparency = 0.6 }, b)
+	local stroke = new("UIStroke", { Color = accent, Thickness = 1, Transparency = 0.6 }, b)
 	sheen(b)
+
 	local bar = new("Frame", { Size = UDim2.fromOffset(3, 18), Position = UDim2.new(0, 9, 0.5, 0),
 		AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = accent, BorderSizePixel = 0 }, b)
 	new("UICorner", { CornerRadius = UDim.new(1, 0) }, bar)
+
 	local lbl = new("TextLabel", { Size = UDim2.new(1, -30, 1, 0), Position = UDim2.new(0, 20, 0, 0),
 		BackgroundTransparency = 1, Text = text, TextColor3 = C.text,
 		Font = Enum.Font.GothamMedium, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left }, b)
 
-	b:SetAttribute("Base", C.row)
-	meta[b] = { bar = bar, accent = accent, label = lbl }
+	state[b] = { base = C.row, bar = bar, stroke = stroke, label = lbl, accent = accent }
 
 	b.MouseEnter:Connect(function()
-		TS:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = lighten(b:GetAttribute("Base"), 0.07) }):Play()
-		TS:Create(b.UIStroke, TweenInfo.new(0.12), { Transparency = 0.15 }):Play()
+		TS:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = lighten(state[b].base, 0.07) }):Play()
+		TS:Create(stroke, TweenInfo.new(0.12), { Transparency = 0.15 }):Play()
 	end)
 	b.MouseLeave:Connect(function()
-		TS:Create(b, TweenInfo.new(0.18), { BackgroundColor3 = b:GetAttribute("Base") }):Play()
-		TS:Create(b.UIStroke, TweenInfo.new(0.18), { Transparency = 0.6 }):Play()
+		TS:Create(b, TweenInfo.new(0.18), { BackgroundColor3 = state[b].base }):Play()
+		TS:Create(stroke, TweenInfo.new(0.18), { Transparency = 0.6 }):Play()
 	end)
 	b.MouseButton1Down:Connect(function()
-		TS:Create(b, TweenInfo.new(0.06), { BackgroundColor3 = lighten(b:GetAttribute("Base"), 0.14) }):Play()
+		TS:Create(b, TweenInfo.new(0.06), { BackgroundColor3 = lighten(state[b].base, 0.14) }):Play()
 	end)
 	return b
 end
 
 local function setState(b, on, text, onColor)
-	local m = meta[b]
-	b:SetAttribute("Base", on and onColor or C.row)
-	b.BackgroundColor3 = b:GetAttribute("Base")
-	m.bar.BackgroundColor3 = on and onColor or m.accent
-	if text then m.label.Text = text end
+	local s = state[b]
+	s.base = on and onColor or C.row
+	b.BackgroundColor3 = s.base
+	s.bar.BackgroundColor3 = on and onColor or s.accent
+	if text then s.label.Text = text end
 end
-
-local function say(s) status.Text = tostring(s) end
 
 local farmBtn = makeButton("Farm Candy", 2, C.green)
 local boxBtn  = makeButton("Open Halloween Box", 3, C.accent)
@@ -235,6 +236,11 @@ status = new("TextLabel", {
 	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
 	Text = "ready",
 }, body)
+
+gui.Parent = pg
+print("[MM2] ui built")
+
+local function say(s) status.Text = tostring(s) end
 
 --==================== DRAG + KEYS ====================
 do
@@ -285,7 +291,8 @@ local function hookChar(ch)
 	noclipChar(ch)
 	ch.DescendantAdded:Connect(function(d)
 		if d:IsA("BasePart") then
-			task.defer(function()
+			task.spawn(function()
+				task.wait(0.05)
 				if d.Parent then d.CanCollide = false; d.Massless = true end
 			end)
 		end
@@ -298,7 +305,6 @@ lp.CharacterAdded:Connect(function(ch)
 	hookChar(ch)
 end)
 
--- keep parts noclipped (humanoid likes to re-enable them) + hover (no falling)
 task.spawn(function()
 	while task.wait(0.2) do
 		local ch = lp.Character
@@ -347,14 +353,12 @@ end
 
 local failed = {}
 
--- pure glide: constant speed, straight line, no parking / no nudge
 local function glideTo(part, hrp)
 	local dist = (part.Position - hrp.Position).Magnitude
-	local dur = math.max(dist / CFG.Tween, 0.02)
+	local dur = dist / CFG.Tween
+	if dur < 0.02 then dur = 0.02 end
 
-	local tw = TS:Create(hrp,
-		TweenInfo.new(dur, Enum.EasingStyle.Linear),
-		{ CFrame = CFrame.new(part.Position) })
+	local tw = TS:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = CFrame.new(part.Position) })
 	tw:Play()
 	tw.Completed:Wait()
 
@@ -373,46 +377,56 @@ local function glideTo(part, hrp)
 	end
 end
 
+local function farmStep()
+	local ch = lp.Character
+	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local now = os.clock()
+	local best, bd
+	for _, c in ipairs(findCandy()) do
+		local f = failed[c]
+		if not (f and f.until > now) then
+			local d = (c.Position - hrp.Position).Magnitude
+			if not bd or d < bd then best, bd = c, d end
+		end
+	end
+
+	if not best then
+		say("no candies - hovering")
+		return
+	end
+
+	local ok, err = pcall(glideTo, best, hrp)
+	if not ok then
+		say("glide error: " .. tostring(err))
+	elseif best.Parent == nil then
+		picked = picked + 1
+		failed[best] = nil
+	else
+		local f = failed[best] or { count = 0, until = 0 }
+		f.count = f.count + 1
+		if f.count >= 3 then f.until = os.clock() + 8; f.count = 0 end
+		failed[best] = f
+	end
+end
+
 task.spawn(function()
 	while task.wait() do
-		if not farmOn then continue end
-
-		local ch = lp.Character
-		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-		if not hrp then task.wait(0.1) continue end
-
-		local now = os.clock()
-		local best, bd
-		for _, c in ipairs(findCandy()) do
-			local f = failed[c]
-			if not (f and f.until > now) then
-				local d = (c.Position - hrp.Position).Magnitude
-				if not bd or d < bd then best, bd = c, d end
-			end
-		end
-
-		if not best then
-			say("no candies - hovering")
-			task.wait(0.15)
-			continue
-		end
-
-		local ok, err = pcall(glideTo, best, hrp)
-		if not ok then
-			say("glide error: " .. tostring(err))
-		elseif best.Parent == nil then
-			picked += 1
-			failed[best] = nil
-		else
-			local f = failed[best] or { count = 0, until = 0 }
-			f.count += 1
-			if f.count >= 3 then f.until = os.clock() + 8; f.count = 0 end
-			failed[best] = f
-		end
+		if farmOn then farmStep() end
 	end
 end)
 
 --==================== BOX ====================
+local openCrateRemote
+local function getOpenCrate()
+	if openCrateRemote and openCrateRemote.Parent then return openCrateRemote end
+	local remotes = RS:FindFirstChild("Remotes")
+	local shop = remotes and remotes:FindFirstChild("Shop")
+	openCrateRemote = shop and shop:FindFirstChild("OpenCrate")
+	return openCrateRemote
+end
+
 local function visibleButtons()
 	local out = {}
 	local p = lp:FindFirstChildOfClass("PlayerGui")
@@ -437,23 +451,26 @@ local function clickKeyword(kws)
 			end
 		end
 	end
+	return nil
 end
 
 local function openBox()
 	if CFG.Mode == "Remote" then
+		local remote = getOpenCrate()
+		if not remote then return "no Remotes.Shop.OpenCrate found" end
 		local ok, result = pcall(function()
-			return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
+			return remote:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
 		end)
 		if not ok then return "invoke errored: " .. tostring(result) end
 		if type(result) == "table" then
-			boxes += 1
+			boxes = boxes + 1
 			lastRarity = tostring(result.Rarity or "?")
 			return "opened - rarity: " .. lastRarity
 		end
 		return "returned " .. tostring(result) .. " (nil = check " .. CFG.Pay .. ")"
 	else
 		local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
-		if b then boxes += 1; return "clicked " .. b.Name end
+		if b then boxes = boxes + 1; return "clicked " .. b.Name end
 		return "no matching button on screen"
 	end
 end
@@ -480,18 +497,24 @@ end)
 
 modeBtn.MouseButton1Click:Connect(function()
 	CFG.Mode = (CFG.Mode == "Remote") and "GUI" or "Remote"
-	meta[modeBtn].label.Text = "Mode: " .. CFG.Mode
+	state[modeBtn].label.Text = "Mode: " .. CFG.Mode
 	say("box mode = " .. CFG.Mode)
 end)
 
 scanBtn.MouseButton1Click:Connect(function()
+	local remotes = RS:FindFirstChild("Remotes")
+	local shop = remotes and remotes:FindFirstChild("Shop")
 	print("===== SHOP REMOTES =====")
-	for _, x in ipairs(Shop:GetChildren()) do print(x.ClassName, x:GetFullName()) end
+	if shop then
+		for _, x in ipairs(shop:GetChildren()) do print(x.ClassName, x:GetFullName()) end
+	else
+		print("no Remotes.Shop")
+	end
 	print("===== VISIBLE GUI BUTTONS =====")
 	local b = visibleButtons()
 	for i, x in ipairs(b) do print(i, x:GetFullName(), x:IsA("TextButton") and x.Text or "") end
 	if #b == 0 then print("none") end
-	say(("shop: %d remote(s), gui: %d button(s) - check console"):format(#Shop:GetChildren(), #b))
+	say("scan done - check console")
 end)
 
 resetBtn.MouseButton1Click:Connect(function()
@@ -499,20 +522,23 @@ resetBtn.MouseButton1Click:Connect(function()
 	say("stats reset")
 end)
 
-local function bumpTween(d)
-	CFG.Tween = math.clamp(CFG.Tween + d, 10, 60)
+speedDown.MouseButton1Click:Connect(function()
+	CFG.Tween = math.max(CFG.Tween - 5, 10)
 	speedLbl.Text = "Tween: " .. CFG.Tween
 	say("tween = " .. CFG.Tween .. " studs/s")
-end
-speedDown.MouseButton1Click:Connect(function() bumpTween(-5) end)
-speedUp.MouseButton1Click:Connect(function() bumpTween(5) end)
+end)
+speedUp.MouseButton1Click:Connect(function()
+	CFG.Tween = math.min(CFG.Tween + 5, 60)
+	speedLbl.Text = "Tween: " .. CFG.Tween
+	say("tween = " .. CFG.Tween .. " studs/s")
+end)
 
 --==================== AUTO BOX LOOP ====================
 task.spawn(function()
 	local t = 0
 	while task.wait(0.25) do
 		if autoBox then
-			t += 0.25
+			t = t + 0.25
 			if t >= CFG.AutoBoxEvery then t = 0; say(openBox()) end
 		else
 			t = 0
@@ -527,7 +553,7 @@ task.spawn(function()
 		vPicked.Text = tostring(picked)
 		vBoxes.Text  = tostring(boxes)
 		vRate.Text   = string.format("%.0f", picked / math.max(run / 3600, 0.0001))
-		vUp.Text     = string.format("%02d:%02d", run // 60, run % 60)
+		vUp.Text     = string.format("%02d:%02d", math.floor(run / 60), math.floor(run % 60))
 	end
 end)
 
@@ -550,4 +576,4 @@ if CFG.AntiAFK then
 	end)
 end
 
-print("[MM2 Halloween] v3 loaded - RightShift UI | F1 farm | F2 box")
+print("[MM2] loaded - RightShift UI | F1 farm | F2 box")
