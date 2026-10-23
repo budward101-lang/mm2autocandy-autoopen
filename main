@@ -18,11 +18,6 @@ local CFG = {
     BoxType = "MysteryBox", -- arg 2
     Pay = "Candies2026", -- arg 3 (currency)
 
-    -- bottom-right counter (where the game shows your candy count)
-    CornerX = 0.55, -- region: fraction of screen width
-    CornerY = 0.55, -- region: fraction of screen height
-    CornerBonus = 40, -- score bonus for anything found in that corner
-
     -- full bag handling
     AutoReset = true, -- reset character when the bag is full
     BagSize = 0, -- 0 = auto. Set to your bag cap (e.g. 50) to force it
@@ -53,6 +48,7 @@ local lastRarity = "-"
 local started = os.clock()
 local status
 
+-- resolved once, hardcoded path (findRemotes() order is not stable)
 local Shop = RS:WaitForChild("Remotes"):WaitForChild("Shop")
 local OpenCrate = Shop:WaitForChild("OpenCrate")
 
@@ -84,7 +80,7 @@ local gui = new("ScreenGui", {
 }, pg)
 
 local win = new("Frame", {
-    Size = UDim2.new(0, 240, 0, 456), Position = UDim2.new(0, 20, 0, 60),
+    Size = UDim2.new(0, 240, 0, 444), Position = UDim2.new(0, 20, 0, 60),
     BackgroundColor3 = Color3.fromRGB(20, 16, 30),
     BorderSizePixel = 0, Active = true,
 }, gui)
@@ -118,7 +114,7 @@ local function btn(text, order, color)
 end
 
 local stats = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 112), LayoutOrder = 0,
+    Size = UDim2.new(1, 0, 0, 100), LayoutOrder = 0,
     BackgroundColor3 = Color3.fromRGB(28, 22, 38), BorderSizePixel = 0,
     TextColor3 = Color3.fromRGB(200, 200, 215), Font = Enum.Font.Code,
     TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
@@ -189,7 +185,7 @@ local roundActive = false
 local lastSeen = 0
 
 local visited = {}
-local firstGrab = true
+local firstGrab = true -- first candy of a round ignores the band
 local resetting, resets, failStreak, pickedAtReset = false, 0, 0, 0
 local resetStart = 0
 local spawnedAt = os.clock() - 10
@@ -236,6 +232,7 @@ local function findCandy()
     return out
 end
 
+-- plain glide. timeout-guarded so a destroyed root part can never hang the loop.
 local function grab(part, hrp)
     if not part or not part.Parent or not hrp or not hrp.Parent then return "gone" end
 
@@ -304,69 +301,10 @@ local learnedMax
 local bagSource = "none"
 local fullStreak = 0
 local lastFullReason = "-"
-local cornerText = "none"
 
 local function isOurs(d) return d:IsDescendantOf(gui) end
 
--- is this label sitting in the bottom-right of the screen?
-local function inCorner(d)
-    local cam = workspace.CurrentCamera
-    if not cam then return false end
-    local vp = cam.ViewportSize
-    if not vp or vp.X <= 0 or vp.Y <= 0 then return false end
-    local pos, size = d.AbsolutePosition, d.AbsoluteSize
-    if not pos or not size then return false end
-    local cx = (pos.X + size.X / 2) / vp.X
-    local cy = (pos.Y + size.Y / 2) / vp.Y
-    return cx >= CFG.CornerX and cy >= CFG.CornerY
-end
-
--- small digit labels in that corner, ordered top-left to bottom-right
-local function cornerLabels()
-    local out = {}
-    local p = lp:FindFirstChildOfClass("PlayerGui")
-    if not p then return out end
-    for _, d in ipairs(p:GetDescendants()) do
-        if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton"))
-        and d.Visible and #d.Text <= 16 and d.Text:find("%d") and inCorner(d) then
-            out[#out + 1] = d
-        end
-    end
-    table.sort(out, function(a, b)
-        local ay, by = a.AbsolutePosition.Y, b.AbsolutePosition.Y
-        if math.abs(ay - by) > 8 then return ay < by end
-        return a.AbsolutePosition.X < b.AbsolutePosition.X
-    end)
-    return out
-end
-
--- read the corner: handles "12/50" in one label, or 12 and 50 in separate labels
-local function cornerRead()
-    local labels = cornerLabels()
-    if #labels == 0 then return nil end
-
-    for _, d in ipairs(labels) do
-        local a, b = d.Text:match("(%d+)%s*/%s*(%d+)")
-        if a and b and tonumber(b) >= CFG.MinCap then
-            return tonumber(a), tonumber(b), "corner:" .. d.Name
-        end
-    end
-
-    local nums = {}
-    for _, d in ipairs(labels) do
-        local n = d.Text:match("%d+")
-        if n then nums[#nums + 1] = tonumber(n) end
-    end
-
-    if #nums >= 2 then
-        local cur, max = nums[1], nums[2]
-        if max < cur then cur, max = max, cur end
-        if max >= CFG.MinCap then return cur, max, "corner-split" end
-    end
-    if #nums == 1 then return nums[1], nil, "corner-num" end
-    return nil
-end
-
+-- score a name so we pick the bag counter over an unrelated number
 local function scoreName(n)
     n = tostring(n):lower()
     local s = 0
@@ -383,11 +321,12 @@ local function scoreName(n)
     return s
 end
 
+-- find an attribute like BagMax / MaxBag / Candies2026Max next to the counter
 local function companionMax(attrs, name)
     local base = tostring(name):lower():gsub("%d+", "")
     if base == "" then return nil end
     for k, v in pairs(attrs) do
-        if type(v) == "number" and v >= CFG.MinCap then
+        if type(v) == "number" and (v >= CFG.MinCap) then
             local kl = k:lower()
             if kl:find("max", 1, true) or kl:find("cap", 1, true) then
                 local kb = kl:gsub("%d+", "")
@@ -399,21 +338,18 @@ local function companionMax(attrs, name)
     end
 end
 
+-- every plausible counter in the game, scored
 local function gatherCandidates()
     local out = {}
-    local function add(cur, max, name, src, bonus)
+    local function add(cur, max, name, src)
         if type(cur) ~= "number" then return end
         if cur < 0 or cur > 1e6 then return end
         if max and (max < CFG.MinCap or max > 1e6) then max = nil end
-        local s = scoreName(name) + (bonus or 0)
+        local s = scoreName(name)
         if max then s = s + 10 end
         if s == 0 then s = 1 end
         out[#out + 1] = { cur = cur, max = max, src = src, score = s, name = tostring(name) }
     end
-
-    -- the bottom-right corner wins outright
-    local ccur, cmax, csrc = cornerRead()
-    if ccur then add(ccur, cmax, csrc, csrc, CFG.CornerBonus) end
 
     local attrs = lp:GetAttributes()
     for k, v in pairs(attrs) do
@@ -442,8 +378,7 @@ local function gatherCandidates()
             and d.Visible and #d.Text < 40 then
                 local a, b = d.Text:match("(%d+)%s*/%s*(%d+)")
                 if a and b then
-                    local bonus = inCorner(d) and CFG.CornerBonus or 0
-                    add(tonumber(a), tonumber(b), d.Name .. " " .. d.Text, "gui:" .. d.Name, bonus)
+                    add(tonumber(a), tonumber(b), d.Name .. " " .. d.Text, "gui:" .. d.Name)
                 end
             end
         end
@@ -453,6 +388,7 @@ local function gatherCandidates()
     return out
 end
 
+-- returns cur, max, source, score
 local function readBag()
     local c = gatherCandidates()[1]
     if not c then return nil end
@@ -489,7 +425,7 @@ local function bagIsFull()
     end
 
     if not reason and CFG.UseBagGui then
-        local cur, max, src = readBag()
+        local cur, max, src, score = readBag()
         if cur then
             if max then
                 learnedMax = max
@@ -645,6 +581,7 @@ local function farmStep()
             failStreak = failStreak + 1
             if failStreak >= CFG.FailLimit
             and (picked - pickedAtReset) >= CFG.MinPicks then
+                -- candies are surviving the pickup: bag is full. learn the cap.
                 if CFG.LearnFromFails then
                     local cur = readBag()
                     if cur and cur > 0 and (not learnedMax or cur > learnedMax) then
@@ -793,6 +730,7 @@ resetBtn.MouseButton1Click:Connect(function()
     doReset("manual")
 end)
 
+-- fill your bag, then press this once. it adopts the current count as the cap.
 learnBtn.MouseButton1Click:Connect(function()
     local cur, max, src = readBag()
     if not cur then
@@ -802,7 +740,7 @@ learnBtn.MouseButton1Click:Connect(function()
     end
     local cap = max or cur
     learnedMax = cap
-    print(("[MM2] learned cap %d from %s"):format(cap, tostring(src)))
+    print(("[MM2] learned cap %d from %s (%s)"):format(cap, tostring(src), max and "x/y label" or "count only"))
     say(("learned cap %d from %s - resets at %d"):format(cap, tostring(src), cap))
     if alive then doReset("learned cap") end
 end)
@@ -813,21 +751,24 @@ scanBtn.MouseButton1Click:Connect(function()
         print(x.ClassName, x:GetFullName())
     end
 
-    print("===== BOTTOM-RIGHT CORNER LABELS =====")
-    local cl = cornerLabels()
-    if #cl == 0 then print("  none detected in corner region") end
-    for _, d in ipairs(cl) do
-        print(("  %s  pos=(%.0f,%.0f) text=%q"):format(
-            d:GetFullName(), d.AbsolutePosition.X, d.AbsolutePosition.Y, d.Text))
-    end
-    print("  cornerRead() ->", cornerRead())
-
     print("===== BAG DIAG =====")
     print("-- player attributes --")
     for k, v in pairs(lp:GetAttributes()) do print("  ", k, typeof(v), tostring(v)) end
     print("-- values parented to player --")
     for _, c in ipairs(lp:GetChildren()) do
         if c:IsA("ValueBase") then print("  ", c.ClassName, c.Name, tostring(c.Value)) end
+    end
+    print("-- candy/bag labels on screen --")
+    local p = lp:FindFirstChildOfClass("PlayerGui")
+    if p then
+        for _, d in ipairs(p:GetDescendants()) do
+            if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
+                local t = d.Text:lower()
+                if t:find("candy", 1, true) or t:find("bag", 1, true) then
+                    print("  ", d:GetFullName(), "=", d.Text)
+                end
+            end
+        end
     end
 
     print("-- all scored candidates (best first) --")
@@ -860,11 +801,6 @@ task.spawn(function()
     while task.wait(0.4) do
         local ok, err = pcall(function()
             local run = os.clock() - started
-
-            local ccur, cmax, csrc = cornerRead()
-            cornerText = ccur and ((cmax and ("%d/%d"):format(ccur, cmax) or tostring(ccur)) .. " " .. tostring(csrc))
-                or "none"
-
             local bagLine = "?"
             local cur, max, src, score = readBag()
             if cur then
@@ -878,11 +814,10 @@ task.spawn(function()
             local tickAge = age < 60 and ("%.1fs ago"):format(age) or ("%.0fm ago"):format(age / 60)
 
             stats.Text = string.format(
-                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\npicked : %d  boxes:%d  resets:%d\ncorner : %s\nbag    : %s\ncap    : %s\nfull   : %d/%d %s\nuptime : %02d:%02d  per/hr:%.0f",
+                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\npicked : %d  boxes:%d  resets:%d\nbag    : %s\ncap    : %s\nfull   : %d/%d %s\nuptime : %02d:%02d  per/hr:%.0f",
                 stateLine(), roundActive and "active" or "none",
                 tickAge, stalls,
                 picked, boxes, resets,
-                cornerText,
                 bagLine,
                 learnedMax and tostring(learnedMax) or (CFG.BagSize > 0 and tostring(CFG.BagSize) or "none"),
                 fullStreak, CFG.FullConfirm, lastFullReason,
