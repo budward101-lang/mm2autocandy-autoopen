@@ -373,11 +373,10 @@ local spawnedAt = os.clock() - 10
 local lastGrabAt = os.clock()
 local ticks, stalls = 0, 0
 
--- internal candy tracking
-local bagWorking = false   -- true once we can read the game's value
-local lastBagVal           -- previous internal reading (delta source)
-local bagSrcLabel = "-"    -- which source we are reading
-local balance = 0          -- raw internal value (display only)
+local bagWorking = false
+local lastBagVal
+local bagSrcLabel = "-"
+local balance = 0
 
 --==================== NOCLIP ====================
 local nocParts = {}
@@ -703,9 +702,6 @@ local function bagIsFull()
     return false
 end
 
--- the internal value: only the RISE is credited as a pickup.
--- baseline on first read, and re-baseline whenever the source changes,
--- so a switch can never be mistaken for collected candies.
 safeLoop("candywatch", function()
     task.wait(0.2)
 
@@ -948,6 +944,54 @@ local function clickKeyword(kws)
     end
 end
 
+-- known rarity words, used to spot a rarity among the returned values
+local RARITY_WORDS = {
+    "common", "uncommon", "rare", "legendary", "godly", "chroma",
+    "vintage", "unique", "ancient", "exclusive", "spooky", "cursed",
+    "halloween", "epic", "mythic", "super", "limited",
+}
+
+local function looksLikeRarity(v)
+    if type(v) ~= "string" then return false end
+    local lv = v:lower()
+    for _, w in ipairs(RARITY_WORDS) do
+        if lv:find(w, 1, true) then return true end
+    end
+    return false
+end
+
+-- pull item + rarity out of whatever the remote handed back
+local function parseOpenReturn(r1, r2, r3)
+    local item, rarity
+
+    if type(r1) == "table" then
+        item   = r1.Name or r1.Item or r1[1]
+        rarity = r1.Rarity or r1.rarity or r1[2]
+    elseif type(r1) == "string" then
+        item = r1
+    end
+
+    -- rarity may arrive in a later slot
+    if not rarity then
+        for _, v in ipairs({ r2, r3 }) do
+            if type(v) == "table" then
+                rarity = v.Rarity or v.rarity
+            elseif looksLikeRarity(v) then
+                rarity = v
+            end
+            if rarity then break end
+        end
+    end
+
+    -- or the single return may itself be a rarity word
+    if not rarity and looksLikeRarity(r1) then
+        rarity = r1
+        if item == r1 then item = nil end
+    end
+
+    return item, rarity
+end
+
 local function openBox()
     if CFG.Mode == "Remote" then
         local ok, r1, r2, r3 = pcall(function()
@@ -962,29 +1006,29 @@ local function openBox()
             return "no return - open failed (check Candies2026 / crate args)"
         end
 
-        boxes = boxes + 1
+        local item, rarity = parseOpenReturn(r1, r2, r3)
 
-        local item, rarity
-        if type(r1) == "table" then
-            item   = r1.Name or r1.Item or r1[1]
-            rarity = r1.Rarity or r1[2]
-        elseif type(r1) == "string" then
-            item   = r1
-            rarity = type(r2) == "string" and r2 or nil
+        -- no rarity = do not count it as an opened box
+        if rarity == nil or tostring(rarity) == "?" then
+            lastRarity = "?"
+            print("[MM2] open not counted (rarity ?):", tostring(item or r1))
+            return ("rarity ? - not counted: %s"):format(tostring(item or r1))
         end
 
-        lastRarity = tostring(rarity or "?")
-        print("[MM2] rolled:", item or "?", rarity or "?")
+        boxes = boxes + 1
+        lastRarity = tostring(rarity)
+        print("[MM2] rolled:", item or "?", rarity)
 
         if item then
-            return ("opened: %s%s"):format(
-                tostring(item),
-                rarity and (" [" .. tostring(rarity) .. "]") or "")
+            return ("opened: %s [%s]"):format(tostring(item), tostring(rarity))
         end
         return "opened - rarity: " .. lastRarity
     else
         local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
-        if b then boxes = boxes + 1; return "clicked " .. b.Name end
+        if b then
+            boxes = boxes + 1
+            return "clicked " .. b.Name
+        end
         return "no matching button on screen"
     end
 end
@@ -1043,11 +1087,9 @@ task.spawn(function()
                 run // 60, run % 60,
                 picked / math.max(run / 3600, 0.0001))
 
-            -- big number = collected since open (starts at 0, counts deltas)
             heroNum.Text = tostring(picked)
             heroBoxes.Text = tostring(boxes)
 
-            -- sub = live balance + round take + source
             local roundTake = picked - pickedAtReset
             if bagWorking then
                 heroSub.Text = ("bal %d  round %d  %s"):format(balance, roundTake, bagSrcLabel)
