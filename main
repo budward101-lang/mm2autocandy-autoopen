@@ -1,7 +1,7 @@
 --============================================================
 -- MM2 HALLOWEEN - Candy Autofarm + Halloween Box Opener
 -- Noclip | TweenSpeed 25 | core APIs only
--- RightShift = hide UI | F1 = farm | F2 = open box
+-- RightShift = hide UI | F1 = farm | F2 = open box | F3 = reset
 --============================================================
 
 local CFG = {
@@ -20,10 +20,11 @@ local CFG = {
 
     -- full bag handling
     AutoReset = true, -- reset character when the bag is full
-    FailLimit = 5, -- consecutive no-pickup grabs = bag full
+    FailLimit = 8, -- consecutive no-pickup grabs = bag full
+    MinPicks = 3, -- must bank this many since last reset before it can trip
     BagSize = 0, -- >0: reset after this many candies since last reset
-    UseBagGui = true, -- also read the candy counter off the game's GUI
-    Settle = 0.6, -- pause after respawn before farming again
+    UseBagGui = false, -- optional: also read the candy counter off the GUI
+    Settle = 0.8, -- pause after respawn before farming again
 }
 
 local P = game:GetService("Players")
@@ -153,8 +154,14 @@ do
     end)
 end
 
+--==================== ALIVE / DEATH STATE ====================
+local alive = true
+local boundHum
+
 --==================== NOCLIP ====================
+-- only while alive, so a corpse keeps its collisions and rests on the map
 RUN.Stepped:Connect(function()
+    if not alive then return end
     local ch = lp.Character
     if not ch then return end
     for _, d in ipairs(ch:GetDescendants()) do
@@ -221,15 +228,52 @@ local function grab(part, hrp)
     end
 end
 
---==================== FULL BAG / RESET ====================
+--==================== ROUND STATE / RESET ====================
 local visited = {}
 local roundActive = false
 local firstGrab = true -- first candy of a round ignores the band
 local lastSeen = os.clock()
-
 local resetting, resets, failStreak, pickedAtReset = false, 0, 0, 0
 
--- look for the game's own candy counter, e.g. "Candies 12/50"
+local function onDied()
+    alive = false
+    visited = {}
+    failStreak = 0
+    roundActive = false
+    firstGrab = true
+    say("dead - idling, no candy runs")
+end
+
+local function onSpawned(ch)
+    task.spawn(function()
+        local hum = ch:FindFirstChildOfClass("Humanoid") or ch:WaitForChild("Humanoid", 6)
+        if not hum then return end
+        if boundHum ~= hum then
+            boundHum = hum
+            hum.Died:Connect(onDied)
+        end
+        if hum.Health <= 0 then onDied() end
+
+        -- wait until actually alive, then let it land before gliding
+        local t0 = os.clock()
+        while hum.Health <= 0 and (os.clock() - t0) < 6 do task.wait(0.1) end
+        task.wait(CFG.Settle)
+        if hum.Health <= 0 then return end
+
+        visited = {}
+        firstGrab = true
+        failStreak = 0
+        pickedAtReset = picked
+        resetting = false
+        alive = true
+        say("alive - farming")
+    end)
+end
+
+if lp.Character then onSpawned(lp.Character) end
+lp.CharacterAdded:Connect(onSpawned)
+
+-- optional GUI counter read, off by default (it false-tripped easily)
 local function readBag()
     local p = lp:FindFirstChildOfClass("PlayerGui")
     if not p then return nil end
@@ -247,41 +291,31 @@ local function readBag()
 end
 
 local function doReset(reason)
-    if resetting then return end
+    if resetting or not alive then return end
     resetting = true
+    alive = false -- stop tweening immediately
     failStreak = 0
     resets = resets + 1
     say("bag full (" .. reason .. ") - resetting")
     print("[MM2] auto reset:", reason)
 
     local old = lp.Character
+    pcall(function()
+        local hum = old and old:FindFirstChildOfClass("Humanoid")
+        if hum then hum.Health = 0
+        elseif old then old:BreakJoints() end
+    end)
+
     task.spawn(function()
-        pcall(function()
-            local hum = old and old:FindFirstChildOfClass("Humanoid")
-            if hum then hum.Health = 0
-            elseif old then old:BreakJoints() end
-        end)
-
-        -- wait for a genuinely new character to replace the old one
-        local t0 = os.clock()
-        while lp.Character == old and (os.clock() - t0) < 6 do task.wait(0.1) end
-
-        -- then wait for it to actually be alive and loaded
-        local t1 = os.clock()
-        while (os.clock() - t1) < 8 do
-            local ch = lp.Character
-            local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-            if hrp and hum and hum.Health > 0 then break end
-            task.wait(0.1)
+        -- kill didn't take? force it
+        task.wait(2)
+        if resetting and lp.Character == old then
+            pcall(function() lp:LoadCharacter() end)
         end
-
-        visited = {}
-        firstGrab = true
-        pickedAtReset = picked
-        task.wait(CFG.Settle)
+        -- never stay stuck
+        local t0 = os.clock()
+        while resetting and (os.clock() - t0) < 15 do task.wait(0.2) end
         resetting = false
-        say("respawned - farming")
     end)
 end
 
@@ -290,7 +324,8 @@ task.spawn(function()
     while task.wait() do
         if not farmOn then
             task.wait(0.2)
-        elseif resetting then
+        elseif resetting or not alive then
+            -- dead or resetting: do not chase anything
             task.wait(0.2)
         else
             local ch = lp.Character
@@ -308,7 +343,7 @@ task.spawn(function()
                     end
                 end
 
-                if not resetting then
+                if not resetting and alive then
                     local list = findCandy()
 
                     if #list == 0 then
@@ -370,7 +405,10 @@ task.spawn(function()
                             elseif ok then
                                 -- landed on it, fired the prompt, candy is still there
                                 failStreak = failStreak + 1
-                                if CFG.AutoReset and failStreak >= CFG.FailLimit then
+                                local sinceReset = picked - pickedAtReset
+                                if CFG.AutoReset
+                                and failStreak >= CFG.FailLimit
+                                and sinceReset >= CFG.MinPicks then
                                     doReset(failStreak .. " dead picks")
                                 end
                             end
@@ -466,6 +504,7 @@ modeBtn.MouseButton1Click:Connect(function()
 end)
 
 resetBtn.MouseButton1Click:Connect(function()
+    if not alive then say("already dead") return end
     doReset("manual")
 end)
 
@@ -488,8 +527,10 @@ task.spawn(function()
     while task.wait(0.4) do
         local run = os.clock() - started
         stats.Text = string.format(
-            "picked : %d\nboxes  : %d\nresets : %d\nrarity : %s\nuptime : %02d:%02d\nper/hr : %.0f",
-            picked, boxes, resets, lastRarity, run // 60, run % 60,
+            "picked : %d\nboxes  : %d\nresets : %d\nstate  : %s\nrarity : %s\nuptime : %02d:%02d\nper/hr : %.0f",
+            picked, boxes, resets,
+            (resetting and "resetting") or (alive and "alive") or "dead",
+            lastRarity, run // 60, run % 60,
             picked / math.max(run / 3600, 0.0001))
     end
 end)
