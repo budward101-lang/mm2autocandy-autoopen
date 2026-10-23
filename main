@@ -84,6 +84,14 @@ local function safeLoop(name, step)
     end)
 end
 
+--==================== CLASS HELPERS ====================
+-- IMPORTANT: only GuiObjects have .Visible. UICorner / UIStroke / UILayout /
+-- ScreenGui do not, and reading a missing member on an Instance ERRORS.
+-- So always class-check BEFORE touching .Visible.
+local function isText(d)
+    return d:IsA("TextLabel") or d:IsA("TextButton")
+end
+
 --==================== THEME + UI HELPERS ====================
 local function new(c, props, parent)
     local o = Instance.new(c)
@@ -518,8 +526,8 @@ local function isCandy(d)
     if d.Transparency >= 0.99 then return false end
     local id = d:GetAttribute("CoinID")
     if id then return id == "Candy" end
-    local n = d.Name
-    if not (n:find("andy", 1, true) or n:find("oin", 1, true)) then return false end
+    local n = d.Name:lower()
+    if not (n:find("candy", 1, true) or n:find("coin", 1, true)) then return false end
     local s = d.Size
     if math.max(s.X, s.Y, s.Z) > CFG.MaxSize then return false end
     local m = d:FindFirstAncestorOfClass("Model")
@@ -555,17 +563,26 @@ local function findCandy(force)
     local flat = true
     for i = 1, #kids do
         local c = kids[i]
-        if c:IsA("Model") or c:IsA("Folder") then flat = false break end
+        if c:IsA("Model") or c:IsA("Folder") then
+            flat = false
+            break
+        end
     end
 
     if flat then
         for i = 1, #kids do
             local d = kids[i]
-            if isCandy(d) then n = n + 1 out[n] = d end
+            if isCandy(d) then
+                n = n + 1
+                out[n] = d
+            end
         end
     else
         for _, d in ipairs(scope:GetDescendants()) do
-            if isCandy(d) then n = n + 1 out[n] = d end
+            if isCandy(d) then
+                n = n + 1
+                out[n] = d
+            end
         end
     end
 
@@ -658,7 +675,6 @@ local verifyFails = 0
 local blacklist = {}
 local dbgAt = 0
 
-local function isOurs(d) return d:IsDescendantOf(gui) end
 local function keyOf(c) return c.kind .. "|" .. c.name end
 local function blocked(n)
     local t = blacklist[n]
@@ -666,8 +682,7 @@ local function blocked(n)
 end
 
 local function candyScore(s)
-    local n = tostring(s)
-    local l = n:lower()
+    local l = tostring(s):lower()
     if l:find("candies2026", 1, true) then return 100 end
     if l:find("candies", 1, true) or l:find("candy", 1, true) then return 90 end
     if l:find("halloween", 1, true) then return 60 end
@@ -693,18 +708,26 @@ local function extractCount(text)
     if type(text) ~= "string" then return nil end
     local t = text:gsub(",", "")
     if #t > 64 then return nil end
-    local n1, n2
+
+    local first, second, last
     for tok in t:gmatch("%d+%.?%d*[KkMmBb]?") do
         local v = parseNum(tok)
         if v then
-            if n1 == nil then n1 = v else n2 = v break end
+            if first == nil then
+                first = v
+            elseif second == nil then
+                second = v
+            end
+            last = v
         end
     end
-    if n1 == nil then return nil end
-    if n2 ~= nil and t:find("/") then
-        return math.floor(n1), math.floor(n2)
+    if first == nil then return nil end
+
+    -- "current / cap" shape
+    if second ~= nil and t:find("/") then
+        return math.floor(first), math.floor(second)
     end
-    return math.floor(n1), nil
+    return math.floor(last), nil
 end
 
 local function scanCands()
@@ -764,7 +787,7 @@ local function scanCands()
 
     -- labels anywhere in PlayerGui that is not ours
     local function consider(d)
-        if d.Visible and (d:IsA("TextLabel") or d:IsA("TextButton")) then
+        if isText(d) and d.Visible then
             local txt = d.Text
             local sc = candyScore(d.Name)
             local ts = candyScore(txt)
@@ -829,16 +852,16 @@ local function readBag()
 end
 
 local function bagBanner()
+    local function chk(d)
+        if isText(d) and d.Visible then
+            local t = d.Text:lower()
+            if #t < 40 and t:find("bag", 1, true) and t:find("full", 1, true) then
+                return d.Text
+            end
+        end
+    end
     for _, root in ipairs(pg:GetChildren()) do
         if root ~= gui then
-            local function chk(d)
-                if d.Visible and (d:IsA("TextLabel") or d:IsA("TextButton")) then
-                    local t = d.Text:lower()
-                    if #t < 40 and t:find("bag", 1, true) and t:find("full", 1, true) then
-                        return d.Text
-                    end
-                end
-            end
             local hit = chk(root)
             if hit then return hit end
             for _, d in ipairs(root:GetDescendants()) do
@@ -921,11 +944,11 @@ safeLoop("candywatch", function()
         for _, c in ipairs(fresh) do
             local p = prev[keyOf(c)]
             if p then
-                c.prev  = p.cur or p.prev
-                c.cur   = p.cur
-                c.probe = p.probe
-                c.txt   = p.txt
-                c.cached= p.cached
+                c.prev   = p.cur or p.prev
+                c.cur    = p.cur
+                c.probe  = p.probe
+                c.txt    = p.txt
+                c.cached = p.cached
             end
         end
         cands = fresh
@@ -1138,8 +1161,11 @@ local function farmStep()
 
     local near, band = {}, {}
     local nn, nb = 0, 0
-    local hx, hy, hz = hrp.Position.X, hrp.Position.Y, hrp.Position.Z
-    local r2, bmin2, bmax2 = CFG.Radius * CFG.Radius, CFG.BandMin * CFG.BandMin, CFG.BandMax * CFG.BandMax
+    local hp = hrp.Position
+    local hx, hy, hz = hp.X, hp.Y, hp.Z
+    local r2 = CFG.Radius * CFG.Radius
+    local bmin2 = CFG.BandMin * CFG.BandMin
+    local bmax2 = CFG.BandMax * CFG.BandMax
 
     for i = 1, count do
         local c = list[i]
@@ -1266,28 +1292,28 @@ end)
 
 --==================== BOX ====================
 local function clickKeyword(kws)
+    local function try(b)
+        if not (b:IsA("TextButton") or b:IsA("ImageButton")) then return nil end
+        if not b.Visible then return nil end
+        local label = b.Name
+        if b:IsA("TextButton") then label = label .. " " .. b.Text end
+        label = label:lower()
+        for _, k in ipairs(kws) do
+            if label:find(k, 1, true) then
+                pcall(function()
+                    if firesignal then
+                        firesignal(b.MouseButton1Click)
+                    else
+                        b:Activate()
+                    end
+                end)
+                return b
+            end
+        end
+    end
+
     for _, root in ipairs(pg:GetChildren()) do
         if root ~= gui then
-            local function try(b)
-                if not b.Visible then return nil end
-                if not (b:IsA("TextButton") or b:IsA("ImageButton")) then return nil end
-                local label = b.Name
-                if b:IsA("TextButton") then label = label .. " " .. b.Text end
-                label = label:lower()
-                for _, k in ipairs(kws) do
-                    if label:find(k, 1, true) then
-                        pcall(function()
-                            if firesignal then
-                                firesignal(b.MouseButton1Click)
-                            else
-                                b:Activate()
-                            end
-                        end)
-                        return b
-                    end
-                end
-            end
-
             local hit = try(root)
             if hit then return hit end
             for _, d in ipairs(root:GetDescendants()) do
