@@ -229,7 +229,7 @@ new("TextLabel", {
 local heroSub = new("TextLabel", {
     Position = UDim2.new(0, 16, 0, 66), Size = UDim2.new(1, -32, 0, 14),
     BackgroundTransparency = 1, Text = "reading game...",
-    Font = Enum.Font.Code, TextSize = 11, TextColor3 = T.muted,
+    Font = Enum.Font.Code, TextSize = 10, TextColor3 = T.muted,
     TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
 }, hero)
 
@@ -373,9 +373,11 @@ local spawnedAt = os.clock() - 10
 local lastGrabAt = os.clock()
 local ticks, stalls = 0, 0
 
-local bagWorking = false
-local lastBagVal
-local bagSrcLabel = "-"
+-- internal candy tracking
+local bagWorking = false   -- true once we can read the game's value
+local lastBagVal           -- previous internal reading (delta source)
+local bagSrcLabel = "-"    -- which source we are reading
+local balance = 0          -- raw internal value (display only)
 
 --==================== NOCLIP ====================
 local nocParts = {}
@@ -550,7 +552,6 @@ local function isOurs(d)
     return d:IsDescendantOf(gui)
 end
 
--- score a name/text so candy beats coins
 local function candyScore(s)
     local n = tostring(s):lower()
     if n:find("candies2026", 1, true) then return 100 end
@@ -570,7 +571,6 @@ local function extractCount(text)
     return nil
 end
 
--- gather every candy-ish candidate, return the highest scored
 local function readBagRaw()
     local best, bestScore, bestInst
 
@@ -581,7 +581,6 @@ local function readBagRaw()
         end
     end
 
-    -- 1) attributes on the player + character
     local holders = { lp }
     if lp.Character then holders[#holders + 1] = lp.Character end
     for _, h in ipairs(holders) do
@@ -593,7 +592,6 @@ local function readBagRaw()
         end
     end
 
-    -- 2) any ValueObject under the player (recursive)
     for _, c in ipairs(lp:GetDescendants()) do
         if c:IsA("ValueBase") then
             local sc = candyScore(c.Name)
@@ -605,7 +603,6 @@ local function readBagRaw()
         end
     end
 
-    -- 3) leaderstats
     local ls = lp:FindFirstChild("leaderstats")
     if ls then
         for _, c in ipairs(ls:GetChildren()) do
@@ -619,7 +616,6 @@ local function readBagRaw()
         end
     end
 
-    -- 4) GUI labels
     for _, d in ipairs(pg:GetDescendants()) do
         if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
             local sc = math.max(candyScore(d.Name), candyScore(d.Text))
@@ -707,18 +703,30 @@ local function bagIsFull()
     return false
 end
 
--- internal value rise = candies collected
+-- the internal value: only the RISE is credited as a pickup.
+-- baseline on first read, and re-baseline whenever the source changes,
+-- so a switch can never be mistaken for collected candies.
 safeLoop("candywatch", function()
     task.wait(0.2)
 
     local cur, max, src = readBag()
     if not cur then return end
 
+    balance = cur
+
     if not bagWorking then
         bagWorking = true
-        lastBagVal = cur
         bagSrcLabel = src or "?"
-        print("[MM2] candy counter source locked:", src, "value:", cur)
+        lastBagVal = cur
+        print("[MM2] candy counter locked:", src, "baseline:", cur)
+        return
+    end
+
+    if src ~= bagSrcLabel then
+        bagSrcLabel = src or "?"
+        lastBagVal = cur
+        print("[MM2] candy source changed ->", src, "rebaseline:", cur)
+        return
     end
 
     if lastBagVal and cur > lastBagVal then
@@ -942,8 +950,6 @@ end
 
 local function openBox()
     if CFG.Mode == "Remote" then
-        -- capture ALL return values: the remote can hand back an item name
-        -- as a plain string, a table, or (item, rarity, ...) in sequence.
         local ok, r1, r2, r3 = pcall(function()
             return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
         end)
@@ -952,7 +958,6 @@ local function openBox()
             return "invoke errored: " .. tostring(r1)
         end
 
-        -- nil on every slot = the open genuinely failed
         if r1 == nil and r2 == nil and r3 == nil then
             return "no return - open failed (check Candies2026 / crate args)"
         end
@@ -1038,9 +1043,18 @@ task.spawn(function()
                 run // 60, run % 60,
                 picked / math.max(run / 3600, 0.0001))
 
-            heroNum.Text = tostring(cur or picked)
+            -- big number = collected since open (starts at 0, counts deltas)
+            heroNum.Text = tostring(picked)
             heroBoxes.Text = tostring(boxes)
-            heroSub.Text = ("session: %d   src: %s"):format(picked, bagWorking and bagSrcLabel or "tally")
+
+            -- sub = live balance + round take + source
+            local roundTake = picked - pickedAtReset
+            if bagWorking then
+                heroSub.Text = ("bal %d  round %d  %s"):format(balance, roundTake, bagSrcLabel)
+            else
+                heroSub.Text = ("round %d  tally (no game value)"):format(roundTake)
+            end
+
             TS:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(frac, 0, 1, 0) }):Play()
 
             dot.BackgroundColor3 = resetting and T.orange
