@@ -32,6 +32,11 @@ local CFG = {
     RoundGrace = 3, -- secs of no candies before a round counts as over
     Stall = 10, -- secs of no grabs = clear targets and retarget
     TweenSlack = 1.5, -- extra secs before a glide is declared stuck
+
+    -- PERF TUNING
+    CandyTTL = 0.12, -- reuse a candy scan this long (secs)
+    BagTTL = 0.20, -- reuse a bag read this long (secs)
+    ContainerRetry = 1.0, -- min secs between CoinContainer re-searches
 }
 
 local P = game:GetService("Players")
@@ -117,7 +122,6 @@ local gui = new("ScreenGui", {
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, pg)
 
--- soft drop shadow (sits behind the window)
 local shadow = new("Frame", {
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 5, 0.5, 7),
     Size = UDim2.new(0, 276, 0, 456),
@@ -126,7 +130,6 @@ local shadow = new("Frame", {
 }, gui)
 corner(shadow, 18)
 
--- centered window
 local win = new("Frame", {
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
     Size = UDim2.new(0, 276, 0, 456),
@@ -136,7 +139,6 @@ corner(win, 18)
 grad(win, T.bg1, T.bg2, 90)
 stroke(win, T.orange, 1.4, 0.35)
 
--- header card
 local head = new("Frame", {
     Position = UDim2.new(0, 10, 0, 10), Size = UDim2.new(1, -20, 0, 56),
     BackgroundColor3 = T.purple, BorderSizePixel = 0, Active = true, ZIndex = 3,
@@ -169,14 +171,12 @@ local hideBtn = new("TextButton", {
 }, head)
 corner(hideBtn, 12)
 
--- body
 local body = new("Frame", {
     Position = UDim2.new(0, 10, 0, 74), Size = UDim2.new(1, -20, 1, -84),
     BackgroundTransparency = 1, ZIndex = 3,
 }, win)
 new("UIListLayout", { Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder }, body)
 
--- stats panel
 local statsPanel = new("Frame", {
     Size = UDim2.new(1, 0, 0, 118), LayoutOrder = 0,
     BackgroundColor3 = T.panel, BorderSizePixel = 0, ZIndex = 4,
@@ -206,7 +206,6 @@ local stats = new("TextLabel", {
     TextYAlignment = Enum.TextYAlignment.Top, Text = "", ZIndex = 5,
 }, statsPanel)
 
--- animated button factory
 local function btn(text, order, color)
     local base = color or T.panelHi
     local b = new("TextButton", {
@@ -305,22 +304,66 @@ local spawnedAt = os.clock() - 10
 local lastGrabAt = os.clock()
 local ticks, stalls = 0, 0
 
---==================== NOCLIP ====================
-RUN.Stepped:Connect(function()
-    if not alive then return end
-    local ch = lp.Character
+--==================== NOCLIP (cached part list) ====================
+-- PERF: was calling ch:GetDescendants() every frame. now we cache the
+-- character's parts once per spawn and just walk a flat array.
+local nocParts = {}
+local nocChar
+
+local function rebuildNoc(ch)
+    nocChar = ch
+    nocParts = {}
     if not ch then return end
     for _, d in ipairs(ch:GetDescendants()) do
-        if d:IsA("BasePart") and d.CanCollide then d.CanCollide = false end
+        if d:IsA("BasePart") then
+            d.CanCollide = false
+            nocParts[#nocParts + 1] = d
+        end
     end
-    local hrp = ch:FindFirstChild("HumanoidRootPart")
+    ch.DescendantAdded:Connect(function(d)
+        if nocChar ~= ch then return end
+        if d:IsA("BasePart") then
+            d.CanCollide = false
+            nocParts[#nocParts + 1] = d
+        end
+    end)
+end
+
+local nocFrame = 0
+RUN.Stepped:Connect(function()
+    if not alive then return end
+
+    -- CanCollide only needs re-checking occasionally, not 60x/sec
+    nocFrame = nocFrame + 1
+    if nocFrame % 3 == 0 then
+        for i = 1, #nocParts do
+            local d = nocParts[i]
+            if d.Parent and d.CanCollide then d.CanCollide = false end
+        end
+    end
+
+    local hrp = nocChar and nocChar:FindFirstChild("HumanoidRootPart")
     if hrp then
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
     end
 end)
 
---==================== CANDY ====================
+--==================== CANDY (cached container + TTL) ====================
+local coinContainer
+local containerNextTry = 0
+
+local function getContainer()
+    if coinContainer and coinContainer.Parent then return coinContainer end
+    local now = os.clock()
+    -- recursive search is expensive: retry at most once per second
+    if now >= containerNextTry then
+        containerNextTry = now + CFG.ContainerRetry
+        coinContainer = workspace:FindFirstChild("CoinContainer", true)
+    end
+    return coinContainer or workspace
+end
+
 local function isCandy(d)
     if not d:IsA("BasePart") then return false end
     if d.Transparency >= 0.99 then return false end
@@ -336,12 +379,24 @@ local function isCandy(d)
     return true
 end
 
-local function findCandy()
-    local scope = workspace:FindFirstChild("CoinContainer", true) or workspace
+local candyCache = {}
+local candyCacheAt = 0
+
+local function findCandy(force)
+    local now = os.clock()
+    -- PERF: several callers (farm loop, round watcher) scan within the same
+    -- fraction of a second. reuse the last result instead of re-walking.
+    if not force and (now - candyCacheAt) < CFG.CandyTTL then
+        return candyCache
+    end
+    candyCacheAt = now
+
+    local scope = getContainer()
     local out = {}
     for _, d in ipairs(scope:GetDescendants()) do
         if isCandy(d) then out[#out + 1] = d end
     end
+    candyCache = out
     return out
 end
 
@@ -391,7 +446,7 @@ end
 
 --==================== ROUND WATCHER ====================
 safeLoop("round", function()
-    task.wait(0.5)
+    task.wait(0.6)
     local live = #findCandy() > 0
     local now = os.clock()
 
@@ -428,7 +483,7 @@ local function labelPair(obj)
     return tonumber(a), tonumber(b)
 end
 
-local function readBag()
+local function readBagRaw()
     for _, k in ipairs({ "Candies", "Candy", "CandyCount", "CandyAmount", "CandyBag", "Bag", "BagCount", "HalloweenCandy" }) do
         local v = lp:GetAttribute(k)
         if type(v) == "number" then return v, nil, "attr:" .. k end
@@ -459,11 +514,9 @@ local function readBag()
         if a then return a, b, "gui:" .. bagPath.Name end
     end
 
-    local p = lp:FindFirstChildOfClass("PlayerGui")
-    if not p then return nil end
-
+    -- full descendant scan only runs until we lock onto a label
     local fallback
-    for _, d in ipairs(p:GetDescendants()) do
+    for _, d in ipairs(pg:GetDescendants()) do
         if not isOurs(d) then
             local a, b = labelPair(d)
             if a then
@@ -485,10 +538,19 @@ local function readBag()
     return nil
 end
 
+-- PERF: readBag is hit every farm iteration + every stats tick. cache it.
+local bagCur, bagMax, bagSrc, bagCacheAt = nil, nil, nil, 0
+local function readBag()
+    local now = os.clock()
+    if (now - bagCacheAt) >= CFG.BagTTL then
+        bagCacheAt = now
+        bagCur, bagMax, bagSrc = readBagRaw()
+    end
+    return bagCur, bagMax, bagSrc
+end
+
 local function bagBanner()
-    local p = lp:FindFirstChildOfClass("PlayerGui")
-    if not p then return nil end
-    for _, d in ipairs(p:GetDescendants()) do
+    for _, d in ipairs(pg:GetDescendants()) do
         if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
             local t = d.Text:lower()
             if #t < 40 and t:find("bag", 1, true) and t:find("full", 1, true) then
@@ -557,6 +619,7 @@ end
 local function onSpawned(ch)
     spawnedAt = os.clock()
     fullStreak = 0
+    rebuildNoc(ch)
     task.spawn(function()
         local hum = ch:FindFirstChildOfClass("Humanoid") or ch:WaitForChild("Humanoid", 6)
         if not hum then return end
@@ -599,13 +662,13 @@ end
 
 --==================== FARM STEP ====================
 local function farmStep()
-    if not farmOn then task.wait(0.2) return end
-    if resetting or not alive then task.wait(0.2) return end
-    if not roundActive then task.wait(0.2) return end
+    if not farmOn then task.wait(0.25) return end
+    if resetting or not alive then task.wait(0.25) return end
+    if not roundActive then task.wait(0.25) return end
 
     local ch = lp.Character
     local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    if not hrp then task.wait(0.2) return end
+    if not hrp then task.wait(0.25) return end
 
     local full, why = bagIsFull()
     if full then doReset(why) return end
@@ -617,7 +680,7 @@ local function farmStep()
     end
 
     local list = findCandy()
-    if #list == 0 then lastGrabAt = now task.wait(0.2) return end
+    if #list == 0 then lastGrabAt = now task.wait(0.25) return end
 
     local near, band = {}, {}
     for _, c in ipairs(list) do
@@ -650,7 +713,7 @@ local function farmStep()
         end
     end
 
-    if not target then lastGrabAt = os.clock() task.wait(0.1) return end
+    if not target then lastGrabAt = os.clock() task.wait(0.15) return end
 
     local ok, res = pcall(grab, target, hrp)
     visited[target] = os.clock()
@@ -729,9 +792,7 @@ end)
 --==================== BOX ====================
 local function visibleButtons()
     local out = {}
-    local p = lp:FindFirstChildOfClass("PlayerGui")
-    if not p then return out end
-    for _, d in ipairs(p:GetDescendants()) do
+    for _, d in ipairs(pg:GetDescendants()) do
         if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
             out[#out + 1] = d
         end
@@ -828,19 +889,16 @@ scanBtn.MouseButton1Click:Connect(function()
         if c:IsA("ValueBase") then print("  ", c.ClassName, c.Name, tostring(c.Value)) end
     end
     print("-- candy/bag labels on screen --")
-    local p = lp:FindFirstChildOfClass("PlayerGui")
-    if p then
-        for _, d in ipairs(p:GetDescendants()) do
-            if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
-                local t = d.Text:lower()
-                if t:find("candy", 1, true) or t:find("bag", 1, true) then
-                    print("  ", d:GetFullName(), "=", d.Text)
-                end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
+            local t = d.Text:lower()
+            if t:find("candy", 1, true) or t:find("bag", 1, true) then
+                print("  ", d:GetFullName(), "=", d.Text)
             end
         end
     end
     print("-- detection result --")
-    print("  ", readBag())
+    print("  ", readBagRaw())
     print("  locked label:", bagPath and bagPath:GetFullName() or "none")
     print("  banner:", bagBanner())
     print("-- gating --")
@@ -848,7 +906,7 @@ scanBtn.MouseButton1Click:Connect(function()
     print("  fullStreak:", fullStreak, "lastReason:", lastFullReason)
     print("  spawnedAgo:", ("%.1fs"):format(os.clock() - spawnedAt))
     print("-- round --")
-    print("  roundActive:", roundActive, "candies in world:", #findCandy())
+    print("  roundActive:", roundActive, "candies in world:", #findCandy(true))
     print("-- loop health --")
     print("  alive:", alive, "resetting:", resetting, "ticks:", ticks, "stalls:", stalls)
     say("bag diag printed - check console")
@@ -864,7 +922,7 @@ local function stateLine()
 end
 
 task.spawn(function()
-    while task.wait(0.4) do
+    while task.wait(0.5) do
         local ok, err = pcall(function()
             local run = os.clock() - started
             local bagLine = "?"
