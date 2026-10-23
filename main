@@ -1,28 +1,20 @@
 --============================================================
+--  MM2 HALLOWEEN  ·  v3
+--  Noclip float farm (constant tween 25) + Box Opener
+--  RightShift = hide UI | F1 = farm | F2 = open box
+--============================================================
 
 local CFG = {
-	Tween         = 25,                 -- studs per second
-	Hold          = 0.10,               -- seconds parked on a candy
-	MaxSize       = 8,                  -- ignore map parts bigger than this
-	AntiAFK       = true,
-	Mode          = "Remote",           -- Remote | GUI
-	Crate         = "Halloween2026Box", -- arg 1 (captured from OpenCrate)
-	BoxType       = "MysteryBox",       -- arg 2
-	Pay           = "Candies2026",      -- arg 3 (currency)
-	-- collection tuning
-	MaxTween      = 1.2,                -- seconds, hard cap on one tween
-	SnapBeyond    = 250,                -- studs; farther than this = teleport instead of tween
-	MaxRise       = 80,                 -- reject parts this far above the candy median (skybox)
-	VoidDrop      = 120,                -- if we fall this far below the candies, snap back
-	ScanRate      = 0.20,               -- seconds between full scans
-	Tween     = 25,                 -- studs per second
-	Hold      = 0.10,               -- seconds parked on a candy
-	MaxSize   = 8,                  -- ignore map parts bigger than this
-	AntiAFK   = true,
-	Mode      = "Remote",           -- Remote | GUI
-	Crate     = "Halloween2026Box", -- arg 1 (captured from OpenCrate)
-	BoxType   = "MysteryBox",       -- arg 2
-	Pay       = "Candies2026",      -- arg 3 (currency)
+	Tween    = 25,     -- CONSTANT glide speed (studs/sec) - no hopping
+	Hold     = 0.03,   -- frames parked on contact point (tiny, not a hop)
+	MaxSize  = 8,
+	AntiAFK  = true,
+
+	Mode     = "Remote",          -- Remote | GUI
+	Crate    = "Halloween2026Box",
+	BoxType  = "MysteryBox",
+	Pay      = "Candies2026",
+	AutoBoxEvery = 2.5,
 }
 
 local P   = game:GetService("Players")
@@ -30,306 +22,532 @@ local RS  = game:GetService("ReplicatedStorage")
 local TS  = game:GetService("TweenService")
 local UIS = game:GetService("UserInputService")
 local RUN = game:GetService("RunService")
-local CS  = game:GetService("CollectionService")
 local VU  = game:GetService("VirtualUser")
 local lp  = P.LocalPlayer
 
-@@ -35,17 +28,10 @@ local lastRarity = "-"
+local farmOn, autoBox, picked, boxes = false, false, 0, 0
+local lastRarity = "-"
 local started = os.clock()
 local status
 
--- resolved once, hardcoded path (findRemotes() order is not stable)
 local Shop      = RS:WaitForChild("Remotes"):WaitForChild("Shop")
 local OpenCrate = Shop:WaitForChild("OpenCrate")
 
-local moving  = false      -- true while a grab owns the CFrame
-local holdCF  = nil        -- CFrame to pin the character to while parked
+--==================== THEME + HELPERS ====================
+local C = {
+	bg      = Color3.fromRGB(15, 11, 23),
+	panel   = Color3.fromRGB(25, 18, 37),
+	panelHi = Color3.fromRGB(35, 25, 51),
+	row     = Color3.fromRGB(33, 24, 48),
+	stroke  = Color3.fromRGB(120, 82, 205),
+	accent  = Color3.fromRGB(255, 150, 60),
+	accent2 = Color3.fromRGB(172, 96, 255),
+	green   = Color3.fromRGB(42, 172, 96),
+	text    = Color3.fromRGB(236, 233, 248),
+	dim     = Color3.fromRGB(158, 150, 184),
+}
 
-local function getHRP()
-	local ch = lp.Character
-	return ch and ch:FindFirstChild("HumanoidRootPart")
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do pcall(function() o[k] = v end) end
+	if parent then o.Parent = parent end
+	return o
 end
 
---==================== BUILD UI ====================
-local function new(c, props, parent)
-local o = Instance.new(c)
-@@ -107,7 +93,7 @@ new("UIPadding", { PaddingTop = UDim.new(0, 5), PaddingLeft = UDim.new(0, 7) },
-local farmBtn = btn("Farm Candy: OFF", 1)
-local boxBtn  = btn("Open Halloween Box", 2, Color3.fromRGB(70, 40, 95))
-local modeBtn = btn("Box Mode: Remote", 3)
-local scanBtn = btn("Scan Candies + Remotes", 4)
-local scanBtn = btn("Scan Remotes + Buttons", 4)
+local function grad(parent, c1, c2, rot)
+	return new("UIGradient", { Color = ColorSequence.new(c1, c2), Rotation = rot or 90 }, parent)
+end
+
+local function sheen(parent)
+	return new("UIGradient", {
+		Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(198, 198, 198)),
+		Rotation = 90,
+	}, parent)
+end
+
+local function lighten(c, amt)
+	return Color3.new(math.min(c.R + amt, 1), math.min(c.G + amt, 1), math.min(c.B + amt, 1))
+end
+
+--==================== BUILD UI (centered) ====================
+local pg = lp:WaitForChild("PlayerGui")
+local gui = new("ScreenGui", {
+	Name = "MM2Halloween", ResetOnSpawn = false,
+	IgnoreGuiInset = true, DisplayOrder = 99,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, pg)
+
+local win = new("Frame", {
+	Size = UDim2.fromOffset(276, 394),
+	Position = UDim2.fromScale(0.5, 0.5),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 14) }, win)
+new("UIStroke", { Color = C.stroke, Thickness = 1.4, Transparency = 0.25 }, win)
+grad(win, Color3.fromRGB(23, 16, 35), Color3.fromRGB(13, 9, 20), 90)
+
+local sc = new("UIScale", { Scale = 0.92 }, win)
+TS:Create(sc, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+
+local head = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 48), BackgroundColor3 = C.panelHi, BorderSizePixel = 0, Active = true,
+}, win)
+new("UICorner", { CornerRadius = UDim.new(0, 14) }, head)
+new("Frame", { Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 1, -16),
+	BackgroundColor3 = C.panelHi, BorderSizePixel = 0 }, head)
+grad(head, Color3.fromRGB(45, 30, 68), Color3.fromRGB(30, 21, 45), 90)
+new("Frame", { Size = UDim2.new(1, -28, 0, 2), Position = UDim2.new(0, 14, 1, -2),
+	BackgroundColor3 = C.accent, BorderSizePixel = 0 }, head)
+
+local dot = new("Frame", {
+	Size = UDim2.fromOffset(9, 9), Position = UDim2.new(0, 16, 0, 20),
+	BackgroundColor3 = C.dim, BorderSizePixel = 0,
+}, head)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
+
+new("TextLabel", { Size = UDim2.new(1, -70, 0, 16), Position = UDim2.new(0, 32, 0, 12),
+	BackgroundTransparency = 1, Text = "MM2 HALLOWEEN", TextColor3 = C.accent,
+	Font = Enum.Font.GothamBold, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left }, head)
+new("TextLabel", { Size = UDim2.new(1, -70, 0, 14), Position = UDim2.new(0, 32, 0, 27),
+	BackgroundTransparency = 1, Text = "noclip float · box opener", TextColor3 = C.dim,
+	Font = Enum.Font.Gotham, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, head)
+
+local hideBtn = new("TextButton", {
+	Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, -32, 0, 12),
+	BackgroundColor3 = C.row, Text = "—", TextColor3 = C.text,
+	Font = Enum.Font.GothamBold, TextSize = 14, BorderSizePixel = 0, AutoButtonColor = false,
+}, head)
+new("UICorner", { CornerRadius = UDim.new(0, 7) }, hideBtn)
+hideBtn.UIStroke = new("UIStroke", { Color = C.stroke, Thickness = 1, Transparency = 0.6 }, hideBtn)
+
+local body = new("Frame", {
+	Size = UDim2.new(1, -24, 1, -68), Position = UDim2.new(0, 12, 0, 56),
+	BackgroundTransparency = 1,
+}, win)
+new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+
+local statsWrap = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 78), BackgroundColor3 = C.panel,
+	BorderSizePixel = 0, LayoutOrder = 1,
+}, body)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, statsWrap)
+new("UIStroke", { Color = C.stroke, Thickness = 1, Transparency = 0.7 }, statsWrap)
+new("UIPadding", { PaddingTop = UDim.new(0, 7), PaddingBottom = UDim.new(0, 7),
+	PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7) }, statsWrap)
+new("UIGridLayout", { CellSize = UDim2.new(0.5, -4, 0, 30), CellPadding = UDim.new(0, 6, 0, 6) }, statsWrap)
+
+local function cell(label, order)
+	local f = new("Frame", { BackgroundColor3 = C.panelHi, BorderSizePixel = 0, LayoutOrder = order }, statsWrap)
+	new("UICorner", { CornerRadius = UDim.new(0, 7) }, f)
+	new("TextLabel", { Size = UDim2.new(1, 0, 0, 13), Position = UDim2.new(0, 0, 0, 2),
+		BackgroundTransparency = 1, Text = label, TextColor3 = C.dim,
+		Font = Enum.Font.Gotham, TextSize = 10 }, f)
+	local v = new("TextLabel", { Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 0, 13),
+		BackgroundTransparency = 1, Text = "0", TextColor3 = C.text,
+		Font = Enum.Font.GothamBold, TextSize = 14 }, f)
+	return v
+end
+local vPicked = cell("PICKED", 1)
+local vBoxes  = cell("BOXES", 2)
+local vRate   = cell("PER / HR", 3)
+local vUp     = cell("UPTIME", 4)
+
+local meta = {}
+local function makeButton(text, order, accent, width)
+	local b = new("TextButton", {
+		Size = width or UDim2.new(1, 0, 0, 38), BackgroundColor3 = C.row,
+		BorderSizePixel = 0, AutoButtonColor = false, LayoutOrder = order, Text = "",
+	}, body)
+	new("UICorner", { CornerRadius = UDim.new(0, 9) }, b)
+	b.UIStroke = new("UIStroke", { Color = accent, Thickness = 1, Transparency = 0.6 }, b)
+	sheen(b)
+	local bar = new("Frame", { Size = UDim2.fromOffset(3, 18), Position = UDim2.new(0, 9, 0.5, 0),
+		AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = accent, BorderSizePixel = 0 }, b)
+	new("UICorner", { CornerRadius = UDim.new(1, 0) }, bar)
+	local lbl = new("TextLabel", { Size = UDim2.new(1, -30, 1, 0), Position = UDim2.new(0, 20, 0, 0),
+		BackgroundTransparency = 1, Text = text, TextColor3 = C.text,
+		Font = Enum.Font.GothamMedium, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left }, b)
+
+	b:SetAttribute("Base", C.row)
+	meta[b] = { bar = bar, accent = accent, label = lbl }
+
+	b.MouseEnter:Connect(function()
+		TS:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = lighten(b:GetAttribute("Base"), 0.07) }):Play()
+		TS:Create(b.UIStroke, TweenInfo.new(0.12), { Transparency = 0.15 }):Play()
+	end)
+	b.MouseLeave:Connect(function()
+		TS:Create(b, TweenInfo.new(0.18), { BackgroundColor3 = b:GetAttribute("Base") }):Play()
+		TS:Create(b.UIStroke, TweenInfo.new(0.18), { Transparency = 0.6 }):Play()
+	end)
+	b.MouseButton1Down:Connect(function()
+		TS:Create(b, TweenInfo.new(0.06), { BackgroundColor3 = lighten(b:GetAttribute("Base"), 0.14) }):Play()
+	end)
+	return b
+end
+
+local function setState(b, on, text, onColor)
+	local m = meta[b]
+	b:SetAttribute("Base", on and onColor or C.row)
+	b.BackgroundColor3 = b:GetAttribute("Base")
+	m.bar.BackgroundColor3 = on and onColor or m.accent
+	if text then m.label.Text = text end
+end
+
+local function say(s) status.Text = tostring(s) end
+
+local farmBtn = makeButton("Farm Candy", 2, C.green)
+local boxBtn  = makeButton("Open Halloween Box", 3, C.accent)
+
+local row1 = new("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, LayoutOrder = 4 }, body)
+new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder }, row1)
+local autoBtn = makeButton("Auto Box", 1, C.accent2, UDim2.new(0.48, 0, 1, 0))
+autoBtn.Parent = row1
+local modeBtn = makeButton("Mode: Remote", 2, C.stroke, UDim2.new(0.48, 0, 1, 0))
+modeBtn.Parent = row1
+
+local row2 = new("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, LayoutOrder = 5 }, body)
+new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder }, row2)
+local scanBtn = makeButton("Scan Remotes", 1, C.accent2, UDim2.new(0.48, 0, 1, 0))
+scanBtn.Parent = row2
+local resetBtn = makeButton("Reset Stats", 2, C.stroke, UDim2.new(0.48, 0, 1, 0))
+resetBtn.Parent = row2
+
+local row3 = new("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1, LayoutOrder = 6 }, body)
+new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center }, row3)
+local speedDown = makeButton("-", 1, C.stroke, UDim2.new(0.18, 0, 1, 0))
+speedDown.Parent = row3
+local speedLbl = new("TextLabel", {
+	Size = UDim2.new(0.58, 0, 1, 0), LayoutOrder = 2, BackgroundColor3 = C.panel,
+	BorderSizePixel = 0, Text = "Tween: " .. CFG.Tween, TextColor3 = C.text,
+	Font = Enum.Font.Code, TextSize = 12,
+}, row3)
+new("UICorner", { CornerRadius = UDim.new(0, 8) }, speedLbl)
+local speedUp = makeButton("+", 3, C.stroke, UDim2.new(0.18, 0, 1, 0))
+speedUp.Parent = row3
 
 status = new("TextLabel", {
-Size = UDim2.new(1, 0, 0, 46), LayoutOrder = 5,
-@@ -162,134 +148,44 @@ RUN.Stepped:Connect(function()
+	Size = UDim2.new(1, 0, 0, 34), LayoutOrder = 7, BackgroundTransparency = 1,
+	TextColor3 = C.dim, Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+	Text = "ready",
+}, body)
+
+--==================== DRAG + KEYS ====================
+do
+	local drag, from, origin
+	head.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1
+		or i.UserInputType == Enum.UserInputType.Touch then
+			drag, from, origin = true, i.Position, win.Position
+		end
+	end)
+	head.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1
+		or i.UserInputType == Enum.UserInputType.Touch then drag = false end
+	end)
+	UIS.InputChanged:Connect(function(i)
+		if drag and (i.UserInputType == Enum.UserInputType.MouseMovement
+		or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - from
+			win.Position = UDim2.new(origin.X.Scale, origin.X.Offset + d.X,
+			                         origin.Y.Scale, origin.Y.Offset + d.Y)
+		end
+	end)
+	UIS.InputBegan:Connect(function(i, gp)
+		if gp then return end
+		if i.KeyCode == Enum.KeyCode.RightShift then
+			win.Visible = not win.Visible
+		elseif i.KeyCode == Enum.KeyCode.F1 then
+			farmBtn.MouseButton1Click:Fire()
+		elseif i.KeyCode == Enum.KeyCode.F2 then
+			boxBtn.MouseButton1Click:Fire()
+		end
+	end)
+end
+
+hideBtn.MouseButton1Click:Connect(function() win.Visible = false end)
+
+--==================== NOCLIP + HOVER ====================
+local function noclipChar(ch)
+	for _, d in ipairs(ch:GetDescendants()) do
+		if d:IsA("BasePart") then
+			if d.CanCollide then d.CanCollide = false end
+			d.Massless = true
+		end
+	end
+end
+
+local function hookChar(ch)
+	noclipChar(ch)
+	ch.DescendantAdded:Connect(function(d)
+		if d:IsA("BasePart") then
+			task.defer(function()
+				if d.Parent then d.CanCollide = false; d.Massless = true end
+			end)
+		end
+	end)
+end
+
+if lp.Character then hookChar(lp.Character) end
+lp.CharacterAdded:Connect(function(ch)
+	task.wait(0.2)
+	hookChar(ch)
+end)
+
+-- keep parts noclipped (humanoid likes to re-enable them) + hover (no falling)
+task.spawn(function()
+	while task.wait(0.2) do
+		local ch = lp.Character
+		if ch then noclipChar(ch) end
+	end
+end)
+
+RUN.Stepped:Connect(function()
+	if not farmOn then return end
+	local ch = lp.Character
+	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+	if hrp then
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end
 end)
 
 --==================== CANDY ====================
--- Candies spawn in place of Coins during rounds; collected by touch.
--- Detection is attribute-first so decorations named "candy"/"coin" don't get targeted.
-
-local function candyAttr(d)
-	local id = d:GetAttribute("CoinID")
-	if id ~= nil then
-		return tostring(id):lower():find("candy", 1, true) ~= nil
-	end
-	return nil
-end
-
-local function tagHasCandy(d)
-	for _, t in ipairs(CS:GetTags(d)) do
-		local tl = t:lower()
-		if tl:find("candy", 1, true) or tl:find("coin", 1, true) then return true end
-	end
-	return false
-end
-
 local function isCandy(d)
-if not d:IsA("BasePart") then return false end
-	local m = d:FindFirstAncestorOfClass("Model")
-	if m and P:GetPlayerFromCharacter(m) then return false end
+	if not d:IsA("BasePart") then return false end
 	local id = d:GetAttribute("CoinID")
 	if id then return id == "Candy" end
 	local n = d.Name:lower()
 	if not (n:find("candy", 1, true) or n:find("coin", 1, true)) then return false end
-local s = d.Size
-if math.max(s.X, s.Y, s.Z) > CFG.MaxSize then return false end
-
-	local attr = candyAttr(d)
-	if attr ~= nil then return attr end       -- authoritative when the game sets it
-	if tagHasCandy(d) then return true end
-	local n = d.Name:lower()
-	return n:find("candy", 1, true) ~= nil or n:find("coin", 1, true) ~= nil
-end
-
--- find the folder/model that actually holds the candies (don't scan all of workspace)
-local scopeCache, scopeAt
-local function candyScope()
-	if scopeCache and scopeCache.Parent and os.clock() - scopeAt < 5 then
-		return scopeCache
-	end
-	local best, bestN
-	for _, d in ipairs(workspace:GetChildren()) do
-		if d:IsA("Folder") or d:IsA("Model") then
-			local n = 0
-			for _, x in ipairs(d:GetDescendants()) do
-				if x:IsA("BasePart") and x:GetAttribute("CoinID") ~= nil then n = n + 1 end
-			end
-			if n > 0 and (not bestN or n > bestN) then best, bestN = d, n end
-		end
-	end
-	scopeCache, scopeAt = best or workspace, os.clock()
-	return scopeCache
+	local s = d.Size
+	if math.max(s.X, s.Y, s.Z) > CFG.MaxSize then return false end
 	local m = d:FindFirstAncestorOfClass("Model")
 	if m and P:GetPlayerFromCharacter(m) then return false end
 	return true
 end
 
-local function scanCandy()
-	local scope = candyScope()
+local scopeCache
+local function candyScope()
+	if scopeCache and scopeCache.Parent then return scopeCache end
+	scopeCache = workspace:FindFirstChild("CoinContainer", true) or workspace
+	return scopeCache
+end
+
 local function findCandy()
-	local scope = workspace:FindFirstChild("CoinContainer", true) or workspace
-local out = {}
-for _, d in ipairs(scope:GetDescendants()) do
-if isCandy(d) then out[#out + 1] = d end
-end
-	if #out < 3 then return out end
-
-	-- reject vertical outliers (skybox / props floating way above the pickups)
-	local ys = {}
-	for i, c in ipairs(out) do ys[i] = c.Position.Y end
-	table.sort(ys)
-	local medY = ys[math.max(1, math.ceil(#ys / 2))]
-	local keep = {}
-	for _, c in ipairs(out) do
-		local dy = c.Position.Y - medY
-		if dy <= CFG.MaxRise and dy >= -CFG.MaxRise then keep[#keep + 1] = c end
+	local out = {}
+	for _, d in ipairs(candyScope():GetDescendants()) do
+		if isCandy(d) then out[#out + 1] = d end
 	end
-	return keep
-end
-
--- throttled scan + drop dead refs
-local list, listAt = {}, 0
-local function candies()
-	if os.clock() - listAt > CFG.ScanRate then
-		list, listAt = scanCandy(), os.clock()
-	end
-	local live = {}
-	for _, c in ipairs(list) do if c.Parent then live[#live + 1] = c end end
-	list = live
-	return live
 	return out
 end
 
---==================== MOVEMENT ====================
--- noclip means nothing supports the character, so we pin it while parked.
+local failed = {}
 
-RUN.RenderStepped:Connect(function()
-	if not farmOn or moving or not holdCF then return end
-	local hrp = getHRP()
-	if not hrp then return end
-	hrp.CFrame = holdCF
-	hrp.AssemblyLinearVelocity  = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
-end)
+-- pure glide: constant speed, straight line, no parking / no nudge
+local function glideTo(part, hrp)
+	local dist = (part.Position - hrp.Position).Magnitude
+	local dur = math.max(dist / CFG.Tween, 0.02)
 
--- tween onto the candy, park, then nudge so the touch always lands
-local function grab(part, hrp)
-	moving = true
-
-local dist = (part.Position - hrp.Position).Magnitude
-	local dest = CFrame.new(part.Position)
-
-	if dist > CFG.SnapBeyond then
-		hrp.CFrame = dest                                  -- too far to tween slowly
-	else
-		local dur = math.clamp(dist / CFG.Tween, 0.05, CFG.MaxTween)
-		local tw = TS:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = dest })
-		tw:Play()
-		local t0 = os.clock()
-		repeat RUN.RenderStepped:Wait() until os.clock() - t0 >= dur
-	end
 	local tw = TS:Create(hrp,
-		TweenInfo.new(math.max(dist / CFG.Tween, 0.04), Enum.EasingStyle.Linear),
+		TweenInfo.new(dur, Enum.EasingStyle.Linear),
 		{ CFrame = CFrame.new(part.Position) })
 	tw:Play()
 	tw.Completed:Wait()
 
-	if not part.Parent then                                -- candy got taken mid-flight
-		holdCF = hrp.CFrame
-		moving = false
-		return false
-	end
-
-	-- nudge to force the Touched, then settle
-	hrp.CFrame = part.CFrame * CFrame.new(0, 0.8, 0)
-	task.wait(0.03)
-	hrp.CFrame = part.CFrame
-	hrp.AssemblyLinearVelocity  = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
-	holdCF = hrp.CFrame
+	if CFG.Hold > 0 then task.wait(CFG.Hold) end
 	if not part.Parent then return end
-task.wait(CFG.Hold)
-	if part.Parent then
-		hrp.CFrame = part.CFrame * CFrame.new(0, 0.8, 0)
-		task.wait(0.03)
-		hrp.CFrame = part.CFrame
+
+	for _, x in ipairs(part:GetDescendants()) do
+		if x:IsA("ProximityPrompt") then
+			pcall(function()
+				if fireproximityprompt then fireproximityprompt(x)
+				else x:InputHoldBegin(); task.wait(x.HoldDuration); x:InputHoldEnd() end
+			end)
+		elseif x:IsA("ClickDetector") and fireclickdetector then
+			pcall(fireclickdetector, x)
+		end
 	end
-
-for _, x in ipairs(part:GetDescendants()) do
-if x:IsA("ProximityPrompt") then
-@@ -304,36 +200,24 @@ local function grab(part, hrp)
-pcall(fireclickdetector, x)
-end
-end
-
-	moving = false
-	return not part.Parent
 end
 
 task.spawn(function()
-	while task.wait(0.05) do
 	while task.wait() do
-if farmOn then
-			local hrp = getHRP()
-			local ch = lp.Character
-			local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-if hrp then
-				local cs = candies()
-				if #cs > 0 then
-					-- void watchdog: if we dropped below the pickups, snap to the nearest
-					local sumY = 0
-					for _, c in ipairs(cs) do sumY = sumY + c.Position.Y end
-					if hrp.Position.Y < (sumY / #cs) - CFG.VoidDrop then
-						holdCF = nil
-						hrp.CFrame = CFrame.new(cs[1].Position)
-					end
+		if not farmOn then continue end
 
-				local list = findCandy()
-				if #list > 0 then
-local best, bd
-					for _, c in ipairs(cs) do
-					for _, c in ipairs(list) do
-local d = (c.Position - hrp.Position).Magnitude
-if not bd or d < bd then best, bd = c, d end
-end
+		local ch = lp.Character
+		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+		if not hrp then task.wait(0.1) continue end
 
-					local ok, got = pcall(grab, best, hrp)
-					if ok and got then picked = picked + 1 end
-					local ok = pcall(grab, best, hrp)
-					if ok and not best.Parent then picked = picked + 1 end
-else
-					holdCF = hrp.CFrame                      -- pin in place, don't drift
-task.wait(0.1)
-end
-else
-@@ -343,9 +227,10 @@ task.spawn(function()
-end
-end)
-
-lp.CharacterAdded:Connect(function() holdCF, moving = nil, false end)
-
---==================== BOX ====================
--- Real opener: ReplicatedStorage.Remotes.Shop.OpenCrate (RemoteFunction)
--- Args captured from the live game: (crate, boxType, currency)
-
-local function visibleButtons()
-local out = {}
-local p = lp:FindFirstChildOfClass("PlayerGui")
-@@ -383,13 +268,19 @@ local function openBox()
-local ok, result = pcall(function()
-return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
-end)
-		if not ok then return "invoke errored: " .. tostring(result) end
-
-		if not ok then
-			return "invoke errored: " .. tostring(result)
+		local now = os.clock()
+		local best, bd
+		for _, c in ipairs(findCandy()) do
+			local f = failed[c]
+			if not (f and f.until > now) then
+				local d = (c.Position - hrp.Position).Magnitude
+				if not bd or d < bd then best, bd = c, d end
+			end
 		end
 
-if type(result) == "table" then
-boxes = boxes + 1
-lastRarity = tostring(result.Rarity or "?")
-print("[MM2] rolled:", result.Rarity, result.Name or result.Item or "?")
-return "opened - rarity: " .. lastRarity
+		if not best then
+			say("no candies - hovering")
+			task.wait(0.15)
+			continue
+		end
+
+		local ok, err = pcall(glideTo, best, hrp)
+		if not ok then
+			say("glide error: " .. tostring(err))
+		elseif best.Parent == nil then
+			picked += 1
+			failed[best] = nil
+		else
+			local f = failed[best] or { count = 0, until = 0 }
+			f.count += 1
+			if f.count >= 3 then f.until = os.clock() + 8; f.count = 0 end
+			failed[best] = f
+		end
+	end
+end)
+
+--==================== BOX ====================
+local function visibleButtons()
+	local out = {}
+	local p = lp:FindFirstChildOfClass("PlayerGui")
+	if not p then return out end
+	for _, d in ipairs(p:GetDescendants()) do
+		if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then out[#out + 1] = d end
+	end
+	return out
 end
 
-		-- nil / non-table return = server refused the roll (usually not enough Candies2026)
-return "returned " .. tostring(result) .. " (nil = open failed, check Candies2026)"
-else
-local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
-@@ -401,7 +292,6 @@ end
+local function clickKeyword(kws)
+	for _, b in ipairs(visibleButtons()) do
+		local label = b.Name .. " "
+		if b:IsA("TextButton") then label = label .. b.Text end
+		label = label:lower()
+		for _, k in ipairs(kws) do
+			if label:find(k, 1, true) then
+				pcall(function()
+					if firesignal then firesignal(b.MouseButton1Click) else b:Activate() end
+				end)
+				return b
+			end
+		end
+	end
+end
+
+local function openBox()
+	if CFG.Mode == "Remote" then
+		local ok, result = pcall(function()
+			return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
+		end)
+		if not ok then return "invoke errored: " .. tostring(result) end
+		if type(result) == "table" then
+			boxes += 1
+			lastRarity = tostring(result.Rarity or "?")
+			return "opened - rarity: " .. lastRarity
+		end
+		return "returned " .. tostring(result) .. " (nil = check " .. CFG.Pay .. ")"
+	else
+		local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
+		if b then boxes += 1; return "clicked " .. b.Name end
+		return "no matching button on screen"
+	end
+end
+
 --==================== BUTTONS ====================
 farmBtn.MouseButton1Click:Connect(function()
-farmOn = not farmOn
-	if not farmOn then holdCF = nil end
-farmBtn.Text = "Farm Candy: " .. (farmOn and "ON" or "OFF")
-farmBtn.BackgroundColor3 = farmOn and Color3.fromRGB(26, 120, 60)
-or Color3.fromRGB(46, 34, 62)
-@@ -421,16 +311,17 @@ modeBtn.MouseButton1Click:Connect(function()
+	farmOn = not farmOn
+	setState(farmBtn, farmOn, farmOn and "Farm Candy: ON" or "Farm Candy", C.green)
+	dot.BackgroundColor3 = farmOn and C.green or C.dim
+	say(farmOn and ("gliding at " .. CFG.Tween .. " studs/s") or "farm stopped")
+end)
+
+boxBtn.MouseButton1Click:Connect(function()
+	local msg = openBox()
+	say(msg)
+	print("[MM2] " .. msg)
+end)
+
+autoBtn.MouseButton1Click:Connect(function()
+	autoBox = not autoBox
+	setState(autoBtn, autoBox, autoBox and "Auto: ON" or "Auto Box", C.accent2)
+	say(autoBox and ("auto-opening every " .. CFG.AutoBoxEvery .. "s") or "auto box off")
+end)
+
+modeBtn.MouseButton1Click:Connect(function()
+	CFG.Mode = (CFG.Mode == "Remote") and "GUI" or "Remote"
+	meta[modeBtn].label.Text = "Mode: " .. CFG.Mode
+	say("box mode = " .. CFG.Mode)
 end)
 
 scanBtn.MouseButton1Click:Connect(function()
-	local cs = scanCandy()
-	print(("===== CANDY CANDIDATES: %d ====="):format(#cs))
-	for i = 1, math.min(#cs, 20) do
-		local c = cs[i]
-		print(i, c:GetFullName(), "CoinID=", tostring(c:GetAttribute("CoinID")), "size=", tostring(c.Size))
-	end
-	print("scope:", candyScope():GetFullName())
-print("===== SHOP REMOTES =====")
+	print("===== SHOP REMOTES =====")
 	for _, x in ipairs(Shop:GetChildren()) do print(x.ClassName, x:GetFullName()) end
-	say(("candies: %d | scope: %s - check console"):format(#cs, candyScope():GetFullName()))
-	for _, x in ipairs(Shop:GetChildren()) do
-		print(x.ClassName, x:GetFullName())
-	end
 	print("===== VISIBLE GUI BUTTONS =====")
 	local b = visibleButtons()
-	for i, x in ipairs(b) do
-		print(i, x:GetFullName(), x:IsA("TextButton") and x.Text or "")
-	end
+	for i, x in ipairs(b) do print(i, x:GetFullName(), x:IsA("TextButton") and x.Text or "") end
 	if #b == 0 then print("none") end
 	say(("shop: %d remote(s), gui: %d button(s) - check console"):format(#Shop:GetChildren(), #b))
 end)
 
+resetBtn.MouseButton1Click:Connect(function()
+	picked, boxes, lastRarity, started = 0, 0, "-", os.clock()
+	say("stats reset")
+end)
+
+local function bumpTween(d)
+	CFG.Tween = math.clamp(CFG.Tween + d, 10, 60)
+	speedLbl.Text = "Tween: " .. CFG.Tween
+	say("tween = " .. CFG.Tween .. " studs/s")
+end
+speedDown.MouseButton1Click:Connect(function() bumpTween(-5) end)
+speedUp.MouseButton1Click:Connect(function() bumpTween(5) end)
+
+--==================== AUTO BOX LOOP ====================
+task.spawn(function()
+	local t = 0
+	while task.wait(0.25) do
+		if autoBox then
+			t += 0.25
+			if t >= CFG.AutoBoxEvery then t = 0; say(openBox()) end
+		else
+			t = 0
+		end
+	end
+end)
+
 --==================== STATS ====================
+task.spawn(function()
+	while task.wait(0.35) do
+		local run = os.clock() - started
+		vPicked.Text = tostring(picked)
+		vBoxes.Text  = tostring(boxes)
+		vRate.Text   = string.format("%.0f", picked / math.max(run / 3600, 0.0001))
+		vUp.Text     = string.format("%02d:%02d", run // 60, run % 60)
+	end
+end)
+
+--==================== ANTI AFK ====================
+if CFG.AntiAFK then
+	pcall(function()
+		local cons = getconnections and getconnections(lp.Idled)
+		if cons and #cons > 0 then
+			for _, c in ipairs(cons) do
+				pcall(function()
+					if c.Disable then c.Disable(c) elseif c.Disconnect then c.Disconnect(c) end
+				end)
+			end
+		else
+			lp.Idled:Connect(function()
+				VU:CaptureController()
+				VU:ClickButton2(Vector2.new())
+			end)
+		end
+	end)
+end
+
+print("[MM2 Halloween] v3 loaded - RightShift UI | F1 farm | F2 box")
