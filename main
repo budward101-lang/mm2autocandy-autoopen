@@ -40,11 +40,17 @@ local CFG = {
     ContainerRetry = 1.0, -- min secs between CoinContainer re-searches
 
     -- SOURCE TRUST
-    Debug      = true, -- dump every candidate + its rate every 10s
-    MaxRate    = 15,   -- reject any "counter" ticking faster than this /s
-    LockTicks  = 4,    -- consecutive good ticks before a source is trusted
-    DriftTol   = 1.6,  -- allowed source/actual ratio before the lock is dropped
-    DriftSlack = 12,   -- ...plus this flat allowance
+    Debug       = true,  -- print a verdict table for every candidate every 10s
+    ForceSource = "",    -- set to a substring of a source name to hard-pin it
+    Observe     = 8,     -- secs a candidate must prove itself before locking
+    VerifyWin   = 10,    -- sliding window for the post-lock re-verify
+    MaxRate     = 12,    -- reject sources ticking faster than this /s
+    JumpMax     = 25,    -- reject sources with single-tick jumps bigger than this
+    MinHits     = 2,     -- must tick at least this many times in the window
+    CorrelLow   = 0.5,   -- source delta must be >= selfDelta * this
+    CorrelHigh  = 3.0,   -- ...and <= selfDelta * this + Slack
+    Slack       = 8,     -- hard headroom over the confirmed pickup count
+    Blacklist   = 30,    -- secs a dropped source is ignored
 }
 
 local P = game:GetService("Players")
@@ -381,15 +387,18 @@ local spawnedAt = os.clock() - 10
 local lastGrabAt = os.clock()
 local ticks, stalls = 0, 0
 
-local selfCount = 0   -- pickups the script itself confirmed
-local attempts  = 0   -- pickups we actually fired a prompt for (upper bound)
+local selfCount = 0   -- pickups the script itself confirmed (ground truth)
+local attempts  = 0   -- pickups we actually fired a prompt for (hard upper bound)
 local srcPicked = 0   -- candies per the trusted source, relative to lock time
 local balance   = 0   -- raw value of the trusted source
 local bagConfirmed = false
 local bagSrcLabel = "none"
 
+-- the source can only ever add a bounded amount on top of real pickups,
+-- so a bad source can never run away with the display again
 local function shownCount()
-    return math.max(selfCount, srcPicked)
+    local cap = math.max(attempts, selfCount) + CFG.Slack
+    return math.max(selfCount, math.min(srcPicked, cap))
 end
 
 local function syncPicked()
@@ -565,7 +574,7 @@ safeLoop("round", function()
     end
 end)
 
---==================== SOURCE TRACKER (v2 - validated) ====================
+--==================== SOURCE TRACKER (v3 - correlation verified) ====================
 local learnedMax
 local fullStreak = 0
 local lastFullReason = "-"
@@ -573,20 +582,19 @@ local lastFullReason = "-"
 local cands = {}
 local candNextScan = 0
 
-local activeSrc            -- the entry we currently trust
-local lockVal = 0          -- source value at lock time
-local lockAnchor = 0       -- max(selfCount, attempts) at lock time
-local lockTicks, badTicks = 0, 0
+local activeSrc
+local lockVal = 0
+local lockAnchor = 0
+local verify = nil
+local verifyFails = 0
+local blacklist = {}   -- name -> clock time until which it is ignored
 local dbgAt = 0
 
-local RATE_WINDOW = 3      -- secs used to measure a source's tick rate
-
-local function isOurs(d)
-    return d:IsDescendantOf(gui)
-end
-
-local function keyOf(c)
-    return c.kind .. "|" .. c.name
+local function isOurs(d) return d:IsDescendantOf(gui) end
+local function keyOf(c) return c.kind .. "|" .. c.name end
+local function blocked(n)
+    local t = blacklist[n]
+    return t ~= nil and os.clock() < t
 end
 
 local function candyScore(s)
@@ -599,15 +607,33 @@ local function candyScore(s)
     return 0
 end
 
+-- handles "1,234", "12 / 50", "1.2K", "Candy: 12"
+local function parseNum(tok)
+    local n, suf = tok:match("^(%d+%.?%d*)([KkMmBb]?)")
+    if not n then return nil end
+    local v = tonumber(n)
+    if not v then return nil end
+    suf = suf:upper()
+    if suf == "K" then v = v * 1e3
+    elseif suf == "M" then v = v * 1e6
+    elseif suf == "B" then v = v * 1e9 end
+    return v
+end
+
 local function extractCount(text)
     if type(text) ~= "string" then return nil end
     local t = text:gsub(",", "")
     if #t > 64 then return nil end
-    local a, b = t:match("(%d+)%s*/%s*(%d+)")
-    if a then return tonumber(a), tonumber(b) end
-    local n = t:match("(%d+)[^%d]*$") -- last number, survives "Candy: 12"
-    if n then return tonumber(n), nil end
-    return nil
+    local nums = {}
+    for tok in t:gmatch("%d+%.?%d*[KkMmBb]?") do
+        local v = parseNum(tok)
+        if v then nums[#nums + 1] = v end
+    end
+    if #nums == 0 then return nil end
+    if #nums >= 2 and t:find("/") then
+        return math.floor(nums[1]), math.floor(nums[2])
+    end
+    return math.floor(nums[#nums]), nil
 end
 
 local function scanCands()
@@ -625,7 +651,6 @@ local function scanCands()
         end
     end
 
-    -- unique names so two holders can never both match one lock
     for _, h in ipairs({ { "me", lp }, { "char", lp.Character } }) do
         local obj = h[2]
         if obj then
@@ -762,6 +787,7 @@ safeLoop("candywatch", function()
     task.wait(0.2)
     local now = os.clock()
 
+    -- rescan the candidate set
     if now >= candNextScan then
         candNextScan = now + CFG.SourceScan
         local prev = {}
@@ -771,80 +797,104 @@ safeLoop("candywatch", function()
             local p = prev[keyOf(c)]
             if p then
                 c.prev  = p.cur or p.prev
-                c.obs   = p.obs
-                c.hitAt = p.hitAt
+                c.cur   = p.cur
+                c.probe = p.probe
             end
         end
         cands = fresh
     end
 
-    -- sample every candidate + maintain a rolling rate window
+    -- sample + advance each candidate's proof window
     for _, c in ipairs(cands) do
         local v = readCand(c)
         c.cur = v
         if v ~= nil then
-            if c.prev ~= nil and v > c.prev then
-                local o = c.obs
-                if not o or (now - o.t0) > RATE_WINDOW then
-                    o = { t0 = now, delta = 0, hits = 0 }
-                    c.obs = o
+            if c.prev == nil then c.prev = v end
+            local p = c.probe
+            if not p or (now - p.t0) >= CFG.Observe then
+                p = { t0 = now, s0 = selfCount, delta = 0, hits = 0, maxJump = 0, done = false }
+                c.probe = p
+            end
+            if not p.done then
+                local d = v - c.prev
+                if d > 0 then
+                    p.delta = p.delta + d
+                    p.hits = p.hits + 1
+                    if d > p.maxJump then p.maxJump = d end
                 end
-                o.delta = o.delta + (v - c.prev)
-                o.hits = o.hits + 1
-                c.hitAt = now
+                if (now - p.t0) >= CFG.Observe then p.done = true end
             end
             c.prev = v
         end
     end
 
-    -- debug dump: shows every candidate and how fast it ticks
+    -- does this candidate behave like a candy counter?
+    local function verdict(c)
+        local p = c.probe
+        if not p then return false, "no probe" end
+        if not p.done then return false, "observing" end
+        local ds = selfCount - p.s0
+        local rate = p.delta / math.max(now - p.t0, 0.5)
+        if p.hits < CFG.MinHits then return false, "quiet" end
+        if ds < 1 then return false, "no picks" end
+        if rate > CFG.MaxRate then return false, ("rate %.1f/s"):format(rate) end
+        if p.maxJump > CFG.JumpMax then return false, ("jump %d"):format(p.maxJump) end
+        if p.delta < ds * CFG.CorrelLow then return false, ("low %d vs %d picks"):format(p.delta, ds) end
+        if p.delta > ds * CFG.CorrelHigh + CFG.Slack then return false, ("high %d vs %d picks"):format(p.delta, ds) end
+        return true, ("tracks %d picks"):format(ds)
+    end
+
     if CFG.Debug and now >= dbgAt then
         dbgAt = now + 10
         local lines = {}
         for _, c in ipairs(cands) do
-            local r = 0
-            if c.obs then r = c.obs.delta / math.max(now - c.obs.t0, 0.5) end
-            lines[#lines + 1] = ("%s  v=%s  %.1f/s  score=%d")
-                :format(c.name, tostring(c.cur), r, c.score)
+            local p = c.probe
+            local rate = p and p.delta / math.max(now - p.t0, 0.5) or 0
+            local ok, why = verdict(c)
+            lines[#lines + 1] = ("%s v=%s rate=%.1f jump=%s delta=%s -> %s%s")
+                :format(c.name, tostring(c.cur), rate,
+                        p and tostring(p.maxJump) or "-",
+                        p and tostring(p.delta) or "-",
+                        ok and "PASS " or "fail ", why)
         end
         if #lines > 0 then
-            print("[MM2] sources:\n  " .. table.concat(lines, "\n  "))
+            print(("[MM2] sources (selfCount=%d):\n  "):format(selfCount)
+                .. table.concat(lines, "\n  "))
         end
     end
 
-    local function liveRate(c)
-        if not c.obs or (now - (c.hitAt or 0)) > 3 then return nil end
-        return c.obs.delta / math.max(now - c.obs.t0, 0.5)
-    end
-
-    -- acquire a source: must be live AND ticking at a plausible rate
+    -- acquire
     if not activeSrc then
-        local best, bs
-        for _, c in ipairs(cands) do
-            if c.cur ~= nil then
-                local r = liveRate(c)
-                if r and r <= CFG.MaxRate then
-                    if c.score > (bs or -1) then best, bs = c, c.score end
+        if CFG.ForceSource ~= "" then
+            for _, c in ipairs(cands) do
+                if c.cur ~= nil and c.name:find(CFG.ForceSource, 1, true) then
+                    activeSrc, lockVal, lockAnchor = c, c.cur, selfCount
+                    bagConfirmed, bagSrcLabel = true, c.name
+                    verify, verifyFails = nil, 0
+                    print("[MM2] forced source: " .. c.name)
+                    break
                 end
             end
         end
-        if best then
-            lockTicks = lockTicks + 1
-            if lockTicks >= CFG.LockTicks then
-                activeSrc = best
-                lockVal = best.cur
-                lockAnchor = math.max(selfCount, attempts)
-                bagConfirmed = true
-                bagSrcLabel = best.name
-                badTicks = 0
-                print(("[MM2] locked source: %s  v=%s"):format(best.name, tostring(best.cur)))
+        if not activeSrc then
+            local best, bs, br
+            for _, c in ipairs(cands) do
+                if c.cur ~= nil and not blocked(c.name) then
+                    local ok, why = verdict(c)
+                    if ok and c.score > (bs or -1) then best, bs, br = c, c.score, why end
+                end
             end
-        else
-            lockTicks = 0
+            if best then
+                activeSrc, lockVal, lockAnchor = best, best.cur, selfCount
+                bagConfirmed, bagSrcLabel = true, best.name
+                verify, verifyFails = nil, 0
+                print(("[MM2] locked source: %s  v=%s  (%s)")
+                    :format(best.name, tostring(best.cur), br))
+            end
         end
     end
 
-    -- hold the lock: anchor to the baseline, drop it on drift
+    -- hold the lock under continuous re-verification
     if activeSrc then
         local v = activeSrc.cur
         local gone = v == nil
@@ -853,24 +903,49 @@ safeLoop("candywatch", function()
             or (activeSrc.kind == "gui" and not (activeSrc.ref and activeSrc.ref.Parent))
 
         if gone then
-            badTicks = badTicks + 1
+            verifyFails = verifyFails + 1
         else
             srcPicked = math.max(0, v - lockVal)
-            local anchor = math.max(selfCount, attempts) - lockAnchor
-            if (srcPicked - anchor) > (anchor * CFG.DriftTol + CFG.DriftSlack) then
-                badTicks = badTicks + 1
-            else
-                badTicks = 0
-            end
             balance = v
+
+            local vp = verify
+            if not vp or (now - vp.t0) >= CFG.VerifyWin then
+                vp = { t0 = now, last = v, s0 = selfCount, delta = 0, maxJump = 0, checked = false }
+                verify = vp
+            else
+                local d = v - vp.last
+                vp.last = v
+                if d > 0 then
+                    vp.delta = vp.delta + d
+                    if d > vp.maxJump then vp.maxJump = d end
+                end
+                local ds = selfCount - vp.s0
+                local elapsed = now - vp.t0
+                if not vp.checked and elapsed >= 3 and ds >= 1 then
+                    vp.checked = true
+                    local rate = vp.delta / elapsed
+                    local bad = rate > CFG.MaxRate
+                        or vp.maxJump > CFG.JumpMax
+                        or vp.delta > ds * CFG.CorrelHigh + CFG.Slack
+                    if bad then
+                        verifyFails = verifyFails + 1
+                        print(("[MM2] source %s misbehaving (rate %.1f jump %d delta %d vs %d picks)")
+                            :format(activeSrc.name, rate, vp.maxJump, vp.delta, ds))
+                    else
+                        verifyFails = math.max(0, verifyFails - 1)
+                    end
+                end
+            end
         end
 
-        if badTicks >= 6 then
-            print(("[MM2] dropping source %s (drift %d vs %d) - re-picking")
-                :format(activeSrc.name, srcPicked, math.max(selfCount, attempts) - lockAnchor))
-            activeSrc, bagConfirmed, lockTicks, badTicks = nil, false, 0, 0
+        if verifyFails >= 8 then
+            print(("[MM2] dropping source %s - ignored for %ds")
+                :format(activeSrc.name, CFG.Blacklist))
+            blacklist[activeSrc.name] = os.clock() + CFG.Blacklist
+            activeSrc, bagConfirmed = nil, false
             bagSrcLabel = "none"
             srcPicked = 0
+            verify, verifyFails = nil, 0
         end
     end
 
@@ -1097,7 +1172,6 @@ local RARITY_WORDS = {
     "halloween", "epic", "mythic", "super", "limited",
 }
 
--- strings that mean "the open did not happen"
 local FAIL_WORDS = {
     "fail", "error", "cooldown", "not enough", "insufficient",
     "no candy", "no money", "locked", "wait",
@@ -1123,7 +1197,6 @@ local function looksLikeFail(v)
     return false
 end
 
--- rarity is cosmetic here: grab it if present, otherwise leave it out
 local function parseOpenReturn(r1, r2, r3)
     local item, rarity
 
@@ -1149,7 +1222,6 @@ local function parseOpenReturn(r1, r2, r3)
         end
     end
 
-    -- the single return may itself be just a rarity word
     if not rarity and looksLikeRarity(r1) then
         rarity = r1
         if item == r1 then item = nil end
@@ -1172,7 +1244,6 @@ local function openBox()
             return "no return - open failed (check Candies2026 / crate args)"
         end
 
-        -- a genuine failure value is the ONLY thing that skips the count
         if looksLikeFail(r1) then
             lastRarity = "-"
             print("[MM2] open failed:", tostring(r1))
@@ -1260,10 +1331,10 @@ task.spawn(function()
             heroBoxes.Text = tostring(boxes)
 
             if bagConfirmed then
-                heroSub.Text = ("locked %s  v=%d  anchor=%d")
-                    :format(bagSrcLabel, balance, math.max(selfCount, attempts))
+                heroSub.Text = ("src %s  raw %d  srcPicked %d  self %d")
+                    :format(bagSrcLabel, balance, srcPicked, selfCount)
             else
-                heroSub.Text = ("est %d  no valid source"):format(selfCount)
+                heroSub.Text = ("self %d  attempts %d  hunting source"):format(selfCount, attempts)
             end
 
             TS:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(frac, 0, 1, 0) }):Play()
