@@ -6,7 +6,7 @@
 
 local CFG = {
 	Tween     = 25,                 -- studs per second
-	Hold      = 0.10,               -- seconds parked on a candy
+	Hold      = 0.05,               -- [FIX] was 0.10, no more nudge to cover
 	MaxSize   = 8,                  -- ignore map parts bigger than this
 	AntiAFK   = true,
 	Mode      = "Remote",           -- Remote | GUI
@@ -145,6 +145,17 @@ RUN.Stepped:Connect(function()
 	for _, d in ipairs(ch:GetDescendants()) do
 		if d:IsA("BasePart") and d.CanCollide then d.CanCollide = false end
 	end
+
+	-- [FIX] noclip = no ground contact = the character free-falls forever.
+	-- That fall velocity is never cleared, so the next tween inherits it and
+	-- the server sees a huge speed spike -> kick. Wipe it every frame.
+	if farmOn then
+		local hrp = ch:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end
+	end
 end)
 
 --==================== CANDY ====================
@@ -170,22 +181,19 @@ local function findCandy()
 	return out
 end
 
--- tween onto the candy, park, then nudge so the touch always lands
+-- [FIX] one clean glide. No park, no 0.8-stud nudge (that was the hopping).
+-- Constant 25 studs/sec straight line, then a short settle for the touch.
 local function grab(part, hrp)
 	local dist = (part.Position - hrp.Position).Magnitude
 	local tw = TS:Create(hrp,
-		TweenInfo.new(math.max(dist / CFG.Tween, 0.04), Enum.EasingStyle.Linear),
+		TweenInfo.new(math.max(dist / CFG.Tween, 0.02), Enum.EasingStyle.Linear),
 		{ CFrame = CFrame.new(part.Position) })
 	tw:Play()
 	tw.Completed:Wait()
 
 	if not part.Parent then return end
-	task.wait(CFG.Hold)
-	if part.Parent then
-		hrp.CFrame = part.CFrame * CFrame.new(0, 0.8, 0)
-		task.wait(0.03)
-		hrp.CFrame = part.CFrame
-	end
+	if CFG.Hold > 0 then task.wait(CFG.Hold) end
+	if not part.Parent then return end
 
 	for _, x in ipairs(part:GetDescendants()) do
 		if x:IsA("ProximityPrompt") then
@@ -202,21 +210,38 @@ local function grab(part, hrp)
 	end
 end
 
+-- [FIX] blacklist so one dead candy can't stall the loop forever
+local failed = {}
+
 task.spawn(function()
 	while task.wait() do
 		if farmOn then
 			local ch = lp.Character
 			local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
 			if hrp then
-				local list = findCandy()
-				if #list > 0 then
-					local best, bd
-					for _, c in ipairs(list) do
+				local now = os.clock()
+				local best, bd
+				for _, c in ipairs(findCandy()) do
+					local f = failed[c]
+					if not (f and f.until > now) then
 						local d = (c.Position - hrp.Position).Magnitude
 						if not bd or d < bd then best, bd = c, d end
 					end
+				end
+
+				if best then
 					local ok = pcall(grab, best, hrp)
-					if ok and not best.Parent then picked = picked + 1 end
+					if ok then
+						if not best.Parent then
+							picked = picked + 1
+							failed[best] = nil
+						else
+							local f = failed[best] or { count = 0, until = 0 }
+							f.count = f.count + 1
+							if f.count >= 3 then f.until = os.clock() + 8; f.count = 0 end
+							failed[best] = f
+						end
+					end
 				else
 					task.wait(0.1)
 				end
