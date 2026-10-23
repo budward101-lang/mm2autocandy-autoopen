@@ -5,7 +5,7 @@
 --============================================================
 
 local CFG = {
-    Tween = 25, -- studs per second (raise toward 25 if you want to go faster)
+    Tween = 25, -- studs per second (raise toward 40-60 if you want to go faster)
     Hold = 0, -- extra settle after landing (0 = none)
     Revisit = 2.5, -- secs before a candy can be picked again
     Radius = 120, -- outer pick range
@@ -17,6 +17,7 @@ local CFG = {
     Crate = "Halloween2026Box", -- arg 1 (captured from OpenCrate)
     BoxType = "MysteryBox", -- arg 2
     Pay = "Candies2026", -- arg 3 (currency)
+    TouchRange = 2.5, -- studs: a candy dying inside this radius counts as yours
 
     -- full bag handling
     AutoReset = true, -- reset character when the bag is full
@@ -422,11 +423,15 @@ local balance   = 0   -- raw value of the trusted source
 local bagConfirmed = false
 local bagSrcLabel = "none"
 
--- the source can only ever add a bounded amount on top of real pickups,
--- so a bad source can never run away with the display again
+-- Once a source has passed verification the game's own counter is the honest
+-- number, so prefer it. selfCount stays as the floor and as the anti-runaway
+-- ceiling (a bad source can never exceed real pickups + Slack).
 local function shownCount()
-    local cap = math.max(attempts, selfCount) + CFG.Slack
-    return math.max(selfCount, math.min(srcPicked, cap))
+    if bagConfirmed and srcPicked > 0 then
+        local cap = math.max(attempts, selfCount) + CFG.Slack
+        return math.max(selfCount, math.min(srcPicked, cap))
+    end
+    return selfCount
 end
 
 local function syncPicked()
@@ -532,8 +537,12 @@ local function findCandy(force)
     return out
 end
 
--- fly to the candy, fire the pickup, and get out. No settle, no confirmation
--- wait: the pickup is resolved later by settlePending.
+-- Fly to the candy, fire the pickup, and get out.
+-- Outcomes:
+--   "gone"   -> it was already dead before we moved   (nobody's pickup)
+--   "stolen" -> it died mid-flight, well outside reach (someone else's)
+--   "hit"    -> it died on our toes                    (ours, counted)
+--   "fired"  -> we fired an input; confirmed by settlePending
 local function grab(part, hrp)
     if not part or not part.Parent or not hrp or not hrp.Parent then return "gone" end
 
@@ -545,20 +554,36 @@ local function grab(part, hrp)
         { CFrame = CFrame.new(part.Position) })
     tw:Play()
 
-    -- one long wait for the glide, then at most 3 frames to be certain we
-    -- are actually on top of it (a tween can step a frame late)
-    task.wait(dur)
-    local guard = 0
-    while guard < 3
-        and hrp.Parent and lp.Character == hrp.Parent
-        and (hrp.Position - part.Position).Magnitude > 1 do
-        guard = guard + 1
-        task.wait()
+    -- glide, bailing the instant the coin vanishes under us
+    local arrive = os.clock() + dur
+    local dead = false
+    while true do
+        if not part.Parent or isDead(part) then dead = true break end
+        local left = arrive - os.clock()
+        if left <= 0 then break end
+        task.wait(left > 0.06 and 0.05 or 0)
     end
+
+    -- not dead yet: make sure we are genuinely on top of it
+    if not dead then
+        local guard = 0
+        while guard < 4 do
+            if not part.Parent or isDead(part) then dead = true break end
+            if (hrp.Position - part.Position).Magnitude <= 1 then break end
+            guard = guard + 1
+            task.wait()
+        end
+    end
+
     pcall(function() tw:Cancel() end)
 
-    -- most coins die from the touch on arrival
-    if not part.Parent or isDead(part) then return "hit" end
+    if dead then
+        -- how close were we when it went? inside reach = our touch did it
+        if (hrp.Position - part.Position).Magnitude <= CFG.TouchRange then
+            return "hit"
+        end
+        return "stolen"
+    end
 
     if CFG.Hold > 0 then
         task.wait(CFG.Hold)
@@ -1139,7 +1164,7 @@ local function farmStep()
     end
 
     if res == "hit" then
-        -- died on arrival: the touch did it
+        -- died in our reach: the touch did it
         selfCount = selfCount + 1
         attempts = attempts + 1
         syncPicked()
@@ -1147,6 +1172,9 @@ local function farmStep()
     elseif res == "fired" then
         -- fired an input; confirm in the background so we can leave now
         pending[#pending + 1] = { part = target, at = os.clock() }
+    elseif res == "gone" or res == "stolen" then
+        -- our cached candy list is stale, rescan before picking again
+        candyCacheAt = 0
     end
 end
 
