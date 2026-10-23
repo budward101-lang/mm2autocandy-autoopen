@@ -5,7 +5,7 @@
 --============================================================
 
 local CFG = {
-    Tween = 25, -- studs per second
+    Tween = 22, -- studs per second
     Hold = 0.05, -- settle on a candy
     Revisit = 2.5, -- secs before a candy can be picked again
     Radius = 120, -- outer pick range
