@@ -5,16 +5,18 @@
 --============================================================
 
 local CFG = {
-Tween = 25, -- studs per second
-Hold = 0.05, -- settle on a candy
-Revisit = 2.5, -- secs before a candy can be picked again
-Radius = 120, -- random pick range
-MaxSize = 8, -- ignore map parts bigger than this
-AntiAFK = true,
-Mode = "Remote", -- Remote | GUI
-Crate = "Halloween2026Box", -- arg 1 (captured from OpenCrate)
-BoxType = "MysteryBox", -- arg 2
-Pay = "Candies2026", -- arg 3 (currency)
+    Tween = 25, -- studs per second
+    Hold = 0.05, -- settle on a candy
+    Revisit = 2.5, -- secs before a candy can be picked again
+    Radius = 120, -- outer pick range
+    BandMin = 20, -- preferred pick band: min studs
+    BandMax = 40, -- preferred pick band: max studs
+    MaxSize = 8, -- ignore map parts bigger than this
+    AntiAFK = true,
+    Mode = "Remote", -- Remote | GUI
+    Crate = "Halloween2026Box", -- arg 1 (captured from OpenCrate)
+    BoxType = "MysteryBox", -- arg 2
+    Pay = "Candies2026", -- arg 3 (currency)
 }
 
 local P = game:GetService("Players")
@@ -36,58 +38,58 @@ local OpenCrate = Shop:WaitForChild("OpenCrate")
 
 --==================== BUILD UI ====================
 local function new(c, props, parent)
-local o = Instance.new(c)
-for k, v in pairs(props) do pcall(function() o[k] = v end) end
-o.Parent = parent
-return o
+    local o = Instance.new(c)
+    for k, v in pairs(props) do pcall(function() o[k] = v end) end
+    o.Parent = parent
+    return o
 end
 
 local pg = lp:WaitForChild("PlayerGui")
 local gui = new("ScreenGui", {
-Name = "MM2Halloween", ResetOnSpawn = false,
-IgnoreGuiInset = true, DisplayOrder = 99,
+    Name = "MM2Halloween", ResetOnSpawn = false,
+    IgnoreGuiInset = true, DisplayOrder = 99,
 }, pg)
 
 local win = new("Frame", {
-Size = UDim2.new(0, 240, 0, 306), Position = UDim2.new(0, 20, 0, 80),
-BackgroundColor3 = Color3.fromRGB(20, 16, 30),
-BorderSizePixel = 0, Active = true,
+    Size = UDim2.new(0, 240, 0, 306), Position = UDim2.new(0, 20, 0, 80),
+    BackgroundColor3 = Color3.fromRGB(20, 16, 30),
+    BorderSizePixel = 0, Active = true,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, win)
 new("UIStroke", { Color = Color3.fromRGB(255, 140, 40), Thickness = 1.5 }, win)
 
 local head = new("TextLabel", {
-Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Color3.fromRGB(34, 24, 46),
-Text = " MM2 HALLOWEEN", TextColor3 = Color3.fromRGB(255, 170, 70),
-Font = Enum.Font.GothamBold, TextSize = 14,
-TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0, Active = true,
+    Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Color3.fromRGB(34, 24, 46),
+    Text = " MM2 HALLOWEEN", TextColor3 = Color3.fromRGB(255, 170, 70),
+    Font = Enum.Font.GothamBold, TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0, Active = true,
 }, win)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, head)
 
 local body = new("Frame", {
-Size = UDim2.new(1, -16, 1, -42), Position = UDim2.new(0, 8, 0, 36),
-BackgroundTransparency = 1,
+    Size = UDim2.new(1, -16, 1, -42), Position = UDim2.new(0, 8, 0, 36),
+    BackgroundTransparency = 1,
 }, win)
 new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, body)
 
 local function btn(text, order, color)
-local b = new("TextButton", {
-Size = UDim2.new(1, 0, 0, 30), LayoutOrder = order,
-BackgroundColor3 = color or Color3.fromRGB(46, 34, 62),
-TextColor3 = Color3.fromRGB(235, 235, 240),
-Font = Enum.Font.GothamMedium, TextSize = 13,
-BorderSizePixel = 0, Text = text,
-}, body)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
-return b
+    local b = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 30), LayoutOrder = order,
+        BackgroundColor3 = color or Color3.fromRGB(46, 34, 62),
+        TextColor3 = Color3.fromRGB(235, 235, 240),
+        Font = Enum.Font.GothamMedium, TextSize = 13,
+        BorderSizePixel = 0, Text = text,
+    }, body)
+    new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+    return b
 end
 
 local stats = new("TextLabel", {
-Size = UDim2.new(1, 0, 0, 56), LayoutOrder = 0,
-BackgroundColor3 = Color3.fromRGB(28, 22, 38), BorderSizePixel = 0,
-TextColor3 = Color3.fromRGB(200, 200, 215), Font = Enum.Font.Code,
-TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
-TextYAlignment = Enum.TextYAlignment.Top,
+    Size = UDim2.new(1, 0, 0, 56), LayoutOrder = 0,
+    BackgroundColor3 = Color3.fromRGB(28, 22, 38), BorderSizePixel = 0,
+    TextColor3 = Color3.fromRGB(200, 200, 215), Font = Enum.Font.Code,
+    TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
 }, body)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, stats)
 new("UIPadding", { PaddingTop = UDim.new(0, 5), PaddingLeft = UDim.new(0, 7) }, stats)
@@ -99,177 +101,190 @@ local modeBtn = btn("Box Mode: Remote", 3)
 local scanBtn = btn("Scan Remotes + Buttons", 4)
 
 status = new("TextLabel", {
-Size = UDim2.new(1, 0, 0, 46), LayoutOrder = 5,
-BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(180, 180, 200),
-Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true,
-TextXAlignment = Enum.TextXAlignment.Left,
-TextYAlignment = Enum.TextYAlignment.Top, Text = "waiting for a round",
+    Size = UDim2.new(1, 0, 0, 46), LayoutOrder = 5,
+    BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(180, 180, 200),
+    Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Text = "waiting for a round",
 }, body)
 
 local function say(s) status.Text = tostring(s) end
 
 --==================== DRAG + KEYS ====================
 do
-local drag, from, origin
-head.InputBegan:Connect(function(i)
-if i.UserInputType == Enum.UserInputType.MouseButton1
-or i.UserInputType == Enum.UserInputType.Touch then
-drag, from, origin = true, i.Position, win.Position
-end
-end)
-head.InputEnded:Connect(function(i)
-if i.UserInputType == Enum.UserInputType.MouseButton1
-or i.UserInputType == Enum.UserInputType.Touch then drag = false end
-end)
-UIS.InputChanged:Connect(function(i)
-if drag and (i.UserInputType == Enum.UserInputType.MouseMovement
-or i.UserInputType == Enum.UserInputType.Touch) then
-local d = i.Position - from
-win.Position = UDim2.new(origin.X.Scale, origin.X.Offset + d.X,
-origin.Y.Scale, origin.Y.Offset + d.Y)
-end
-end)
-UIS.InputBegan:Connect(function(i, gp)
-if gp then return end
-if i.KeyCode == Enum.KeyCode.RightShift then
-win.Visible = not win.Visible
-elseif i.KeyCode == Enum.KeyCode.F1 then
-farmBtn.MouseButton1Click:Fire()
-elseif i.KeyCode == Enum.KeyCode.F2 then
-boxBtn.MouseButton1Click:Fire()
-end
-end)
+    local drag, from, origin
+    head.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            drag, from, origin = true, i.Position, win.Position
+        end
+    end)
+    head.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then drag = false end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if drag and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - from
+            win.Position = UDim2.new(origin.X.Scale, origin.X.Offset + d.X,
+                origin.Y.Scale, origin.Y.Offset + d.Y)
+        end
+    end)
+    UIS.InputBegan:Connect(function(i, gp)
+        if gp then return end
+        if i.KeyCode == Enum.KeyCode.RightShift then
+            win.Visible = not win.Visible
+        elseif i.KeyCode == Enum.KeyCode.F1 then
+            farmBtn.MouseButton1Click:Fire()
+        elseif i.KeyCode == Enum.KeyCode.F2 then
+            boxBtn.MouseButton1Click:Fire()
+        end
+    end)
 end
 
 --==================== NOCLIP ====================
 RUN.Stepped:Connect(function()
-local ch = lp.Character
-if not ch then return end
-for _, d in ipairs(ch:GetDescendants()) do
-if d:IsA("BasePart") and d.CanCollide then d.CanCollide = false end
-end
-local hrp = ch:FindFirstChild("HumanoidRootPart")
-if hrp then
-hrp.AssemblyLinearVelocity = Vector3.zero
-hrp.AssemblyAngularVelocity = Vector3.zero
-end
+    local ch = lp.Character
+    if not ch then return end
+    for _, d in ipairs(ch:GetDescendants()) do
+        if d:IsA("BasePart") and d.CanCollide then d.CanCollide = false end
+    end
+    local hrp = ch:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
 end)
 
 --==================== CANDY ====================
 local function isCandy(d)
-if not d:IsA("BasePart") then return false end
--- collected candy can be left invisible / untouchable: skip it
-if d.Transparency >= 0.99 then return false end
-if d.CanTouch == false then return false end
-local id = d:GetAttribute("CoinID")
-if id then return id == "Candy" end
-local n = d.Name:lower()
-if not (n:find("candy", 1, true) or n:find("coin", 1, true)) then return false end
-local s = d.Size
-if math.max(s.X, s.Y, s.Z) > CFG.MaxSize then return false end
-local m = d:FindFirstAncestorOfClass("Model")
-if m and P:GetPlayerFromCharacter(m) then return false end
-return true
+    if not d:IsA("BasePart") then return false end
+    -- collected candy can be left invisible / untouchable: skip it
+    if d.Transparency >= 0.99 then return false end
+    if d.CanTouch == false then return false end
+    local id = d:GetAttribute("CoinID")
+    if id then return id == "Candy" end
+    local n = d.Name:lower()
+    if not (n:find("candy", 1, true) or n:find("coin", 1, true)) then return false end
+    local s = d.Size
+    if math.max(s.X, s.Y, s.Z) > CFG.MaxSize then return false end
+    local m = d:FindFirstAncestorOfClass("Model")
+    if m and P:GetPlayerFromCharacter(m) then return false end
+    return true
 end
 
 local function findCandy()
-local scope = workspace:FindFirstChild("CoinContainer", true) or workspace
-local out = {}
-for _, d in ipairs(scope:GetDescendants()) do
-if isCandy(d) then out[#out + 1] = d end
-end
-return out
+    local scope = workspace:FindFirstChild("CoinContainer", true) or workspace
+    local out = {}
+    for _, d in ipairs(scope:GetDescendants()) do
+        if isCandy(d) then out[#out + 1] = d end
+    end
+    return out
 end
 
 -- plain glide, no park, no nudge. arrive then move on.
 local function grab(part, hrp)
-local dist = (part.Position - hrp.Position).Magnitude
-local tw = TS:Create(hrp,
-TweenInfo.new(math.max(dist / CFG.Tween, 0.02), Enum.EasingStyle.Linear),
-{ CFrame = CFrame.new(part.Position) })
-tw:Play()
-tw.Completed:Wait()
+    local dist = (part.Position - hrp.Position).Magnitude
+    local tw = TS:Create(hrp,
+        TweenInfo.new(math.max(dist / CFG.Tween, 0.02), Enum.EasingStyle.Linear),
+        { CFrame = CFrame.new(part.Position) })
+    tw:Play()
+    tw.Completed:Wait()
 
-if not part.Parent then return end
-task.wait(CFG.Hold)
-if not part.Parent then return end
+    if not part.Parent then return end
+    task.wait(CFG.Hold)
+    if not part.Parent then return end
 
-for _, x in ipairs(part:GetDescendants()) do
-if x:IsA("ProximityPrompt") then
-pcall(function()
-if fireproximityprompt then
-fireproximityprompt(x)
-else
-x:InputHoldBegin(); task.wait(x.HoldDuration); x:InputHoldEnd()
-end
-end)
-elseif x:IsA("ClickDetector") and fireclickdetector then
-pcall(fireclickdetector, x)
-end
-end
+    for _, x in ipairs(part:GetDescendants()) do
+        if x:IsA("ProximityPrompt") then
+            pcall(function()
+                if fireproximityprompt then
+                    fireproximityprompt(x)
+                else
+                    x:InputHoldBegin(); task.wait(x.HoldDuration); x:InputHoldEnd()
+                end
+            end)
+        elseif x:IsA("ClickDetector") and fireclickdetector then
+            pcall(fireclickdetector, x)
+        end
+    end
 end
 
 -- candy we already landed on cannot be picked again for a few seconds
 local visited = {}
 local roundActive = false
+local firstGrab = true -- first candy of a round ignores the band
 local lastSeen = os.clock()
 
 task.spawn(function()
-while task.wait() do
-if farmOn then
-local ch = lp.Character
-local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-if hrp then
-local list = findCandy()
+    while task.wait() do
+        if farmOn then
+            local ch = lp.Character
+            local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local list = findCandy()
 
-if #list == 0 then
-if roundActive and (os.clock() - lastSeen) > 3 then
-roundActive = false
-say("round over - waiting")
-end
-task.wait(0.2)
-else
-lastSeen = os.clock()
-if not roundActive then
-roundActive = true
-say("round live - farming")
-end
+                if #list == 0 then
+                    if roundActive and (os.clock() - lastSeen) > 3 then
+                        roundActive = false
+                        say("round over - waiting")
+                    end
+                    task.wait(0.2)
+                else
+                    lastSeen = os.clock()
+                    if not roundActive then
+                        roundActive = true
+                        firstGrab = true -- fresh round: free pick on the opener
+                        say("round live - farming")
+                    end
 
-local now = os.clock()
-local near = {}
-for _, c in ipairs(list) do
-local v = visited[c]
-if not (v and (now - v) < CFG.Revisit) then
-local d = (c.Position - hrp.Position).Magnitude
-if d <= CFG.Radius then near[#near + 1] = c end
-end
-end
+                    local now = os.clock()
+                    local near, band = {}, {}
+                    for _, c in ipairs(list) do
+                        local v = visited[c]
+                        if not (v and (now - v) < CFG.Revisit) then
+                            local d = (c.Position - hrp.Position).Magnitude
+                            if d <= CFG.Radius then
+                                near[#near + 1] = c
+                                if d >= CFG.BandMin and d <= CFG.BandMax then
+                                    band[#band + 1] = c
+                                end
+                            end
+                        end
+                    end
 
-local target
-if #near > 0 then
-target = near[math.random(1, #near)]
-else
-local bd
-for _, c in ipairs(list) do
-local v = visited[c]
-if not (v and (now - v) < CFG.Revisit) then
-local d = (c.Position - hrp.Position).Magnitude
-if not bd or d < bd then target, bd = c, d end
-end
-end
-end
+                    local target
+                    if firstGrab and #near > 0 then
+                        -- first candy: anything in range
+                        target = near[math.random(1, #near)]
+                        firstGrab = false
+                    elseif #band > 0 then
+                        -- preferred: random candy 20-40 studs out
+                        target = band[math.random(1, #band)]
+                    else
+                        -- nothing in the band: closest available so we don't stall
+                        local bd
+                        for _, c in ipairs(list) do
+                            local v = visited[c]
+                            if not (v and (now - v) < CFG.Revisit) then
+                                local d = (c.Position - hrp.Position).Magnitude
+                                if not bd or d < bd then target, bd = c, d end
+                            end
+                        end
+                    end
 
-if target then
-local ok = pcall(grab, target, hrp)
-visited[target] = os.clock()
-if ok and not target.Parent then picked = picked + 1 end
-end
-end
-else
-task.wait(0.2)
-end
-end
-end
+                    if target then
+                        local ok = pcall(grab, target, hrp)
+                        visited[target] = os.clock()
+                        if ok and not target.Parent then picked = picked + 1 end
+                    end
+                end
+            end
+        else
+            task.wait(0.2)
+        end
+    end
 end)
 
 --==================== BOX ====================
@@ -277,126 +292,126 @@ end)
 -- Args captured from the live game: (crate, boxType, currency)
 
 local function visibleButtons()
-local out = {}
-local p = lp:FindFirstChildOfClass("PlayerGui")
-if not p then return out end
-for _, d in ipairs(p:GetDescendants()) do
-if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
-out[#out + 1] = d
-end
-end
-return out
+    local out = {}
+    local p = lp:FindFirstChildOfClass("PlayerGui")
+    if not p then return out end
+    for _, d in ipairs(p:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+            out[#out + 1] = d
+        end
+    end
+    return out
 end
 
 local function clickKeyword(kws)
-for _, b in ipairs(visibleButtons()) do
-local label = b.Name .. " "
-if b:IsA("TextButton") then label = label .. b.Text end
-label = label:lower()
-for _, k in ipairs(kws) do
-if label:find(k, 1, true) then
-pcall(function()
-if firesignal then
-firesignal(b.MouseButton1Click)
-else
-b:Activate()
-end
-end)
-return b
-end
-end
-end
+    for _, b in ipairs(visibleButtons()) do
+        local label = b.Name .. " "
+        if b:IsA("TextButton") then label = label .. b.Text end
+        label = label:lower()
+        for _, k in ipairs(kws) do
+            if label:find(k, 1, true) then
+                pcall(function()
+                    if firesignal then
+                        firesignal(b.MouseButton1Click)
+                    else
+                        b:Activate()
+                    end
+                end)
+                return b
+            end
+        end
+    end
 end
 
 local function openBox()
-if CFG.Mode == "Remote" then
-local ok, result = pcall(function()
-return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
-end)
+    if CFG.Mode == "Remote" then
+        local ok, result = pcall(function()
+            return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
+        end)
 
-if not ok then
-return "invoke errored: " .. tostring(result)
-end
+        if not ok then
+            return "invoke errored: " .. tostring(result)
+        end
 
-if type(result) == "table" then
-boxes = boxes + 1
-lastRarity = tostring(result.Rarity or "?")
-print("[MM2] rolled:", result.Rarity, result.Name or result.Item or "?")
-return "opened - rarity: " .. lastRarity
-end
+        if type(result) == "table" then
+            boxes = boxes + 1
+            lastRarity = tostring(result.Rarity or "?")
+            print("[MM2] rolled:", result.Rarity, result.Name or result.Item or "?")
+            return "opened - rarity: " .. lastRarity
+        end
 
--- nil / non-table return = server refused the roll (usually not enough Candies2026)
-return "returned " .. tostring(result) .. " (nil = open failed, check Candies2026)"
-else
-local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
-if b then boxes = boxes + 1; return "clicked " .. b.Name end
-return "no matching button on screen"
-end
+        -- nil / non-table return = server refused the roll (usually not enough Candies2026)
+        return "returned " .. tostring(result) .. " (nil = open failed, check Candies2026)"
+    else
+        local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
+        if b then boxes = boxes + 1; return "clicked " .. b.Name end
+        return "no matching button on screen"
+    end
 end
 
 --==================== BUTTONS ====================
 farmBtn.MouseButton1Click:Connect(function()
-farmOn = not farmOn
-farmBtn.Text = "Farm Candy: " .. (farmOn and "ON" or "OFF")
-farmBtn.BackgroundColor3 = farmOn and Color3.fromRGB(26, 120, 60)
-or Color3.fromRGB(46, 34, 62)
-say(farmOn and "farming candies..." or "farm stopped")
+    farmOn = not farmOn
+    farmBtn.Text = "Farm Candy: " .. (farmOn and "ON" or "OFF")
+    farmBtn.BackgroundColor3 = farmOn and Color3.fromRGB(26, 120, 60)
+        or Color3.fromRGB(46, 34, 62)
+    say(farmOn and "farming candies..." or "farm stopped")
 end)
 
 boxBtn.MouseButton1Click:Connect(function()
-local msg = openBox()
-say(msg)
-print("[MM2] " .. msg)
+    local msg = openBox()
+    say(msg)
+    print("[MM2] " .. msg)
 end)
 
 modeBtn.MouseButton1Click:Connect(function()
-CFG.Mode = (CFG.Mode == "Remote") and "GUI" or "Remote"
-modeBtn.Text = "Box Mode: " .. CFG.Mode
-say("box mode = " .. CFG.Mode)
+    CFG.Mode = (CFG.Mode == "Remote") and "GUI" or "Remote"
+    modeBtn.Text = "Box Mode: " .. CFG.Mode
+    say("box mode = " .. CFG.Mode)
 end)
 
 scanBtn.MouseButton1Click:Connect(function()
-print("===== SHOP REMOTES =====")
-for _, x in ipairs(Shop:GetChildren()) do
-print(x.ClassName, x:GetFullName())
-end
-print("===== VISIBLE GUI BUTTONS =====")
-local b = visibleButtons()
-for i, x in ipairs(b) do
-print(i, x:GetFullName(), x:IsA("TextButton") and x.Text or "")
-end
-if #b == 0 then print("none") end
-say(("shop: %d remote(s), gui: %d button(s) - check console"):format(#Shop:GetChildren(), #b))
+    print("===== SHOP REMOTES =====")
+    for _, x in ipairs(Shop:GetChildren()) do
+        print(x.ClassName, x:GetFullName())
+    end
+    print("===== VISIBLE GUI BUTTONS =====")
+    local b = visibleButtons()
+    for i, x in ipairs(b) do
+        print(i, x:GetFullName(), x:IsA("TextButton") and x.Text or "")
+    end
+    if #b == 0 then print("none") end
+    say(("shop: %d remote(s), gui: %d button(s) - check console"):format(#Shop:GetChildren(), #b))
 end)
 
 --==================== STATS ====================
 task.spawn(function()
-while task.wait(0.4) do
-local run = os.clock() - started
-stats.Text = string.format(
-"picked : %d\nboxes : %d\nrarity : %s\nuptime : %02d:%02d\nper/hr : %.0f",
-picked, boxes, lastRarity, run // 60, run % 60,
-picked / math.max(run / 3600, 0.0001))
-end
+    while task.wait(0.4) do
+        local run = os.clock() - started
+        stats.Text = string.format(
+            "picked : %d\nboxes : %d\nrarity : %s\nuptime : %02d:%02d\nper/hr : %.0f",
+            picked, boxes, lastRarity, run // 60, run % 60,
+            picked / math.max(run / 3600, 0.0001))
+    end
 end)
 
 --==================== ANTI AFK ====================
 if CFG.AntiAFK then
-pcall(function()
-local cons = getconnections and getconnections(lp.Idled)
-if cons and #cons > 0 then
-for _, c in ipairs(cons) do
-pcall(function()
-if c.Disable then c.Disable(c) elseif c.Disconnect then c.Disconnect(c) end
-end)
-end
-else
-lp.Idled:Connect(function()
-VU:CaptureController()
-VU:ClickButton2(Vector2.new())
-end)
-end
-end)
+    pcall(function()
+        local cons = getconnections and getconnections(lp.Idled)
+        if cons and #cons > 0 then
+            for _, c in ipairs(cons) do
+                pcall(function()
+                    if c.Disable then c.Disable(c) elseif c.Disconnect then c.Disconnect(c) end
+                end)
+            end
+        else
+            lp.Idled:Connect(function()
+                VU:CaptureController()
+                VU:ClickButton2(Vector2.new())
+            end)
+        end
+    end)
 end
 
 print("[MM2 Halloween] loaded - RightShift UI | F1 farm | F2 box")
