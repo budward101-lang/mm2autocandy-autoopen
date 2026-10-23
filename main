@@ -52,7 +52,6 @@ local Shop = RS:WaitForChild("Remotes"):WaitForChild("Shop")
 local OpenCrate = Shop:WaitForChild("OpenCrate")
 
 --==================== SAFE LOOP ====================
--- a bare while-loop dies silently on any error. this restarts it.
 local function safeLoop(name, step)
     task.spawn(function()
         while true do
@@ -65,7 +64,7 @@ local function safeLoop(name, step)
     end)
 end
 
---==================== BUILD UI ====================
+--==================== THEME + UI HELPERS ====================
 local function new(c, props, parent)
     local o = Instance.new(c)
     for k, v in pairs(props) do pcall(function() o[k] = v end) end
@@ -73,70 +72,178 @@ local function new(c, props, parent)
     return o
 end
 
+local T = {
+    bg1    = Color3.fromRGB(14, 10, 22),
+    bg2    = Color3.fromRGB(33, 23, 52),
+    panel  = Color3.fromRGB(25, 19, 39),
+    panelHi= Color3.fromRGB(42, 32, 62),
+    stroke = Color3.fromRGB(80, 62, 116),
+    orange = Color3.fromRGB(255, 152, 64),
+    purple = Color3.fromRGB(160, 98, 238),
+    green  = Color3.fromRGB(58, 200, 114),
+    greenD = Color3.fromRGB(30, 122, 68),
+    red    = Color3.fromRGB(234, 98, 98),
+    text   = Color3.fromRGB(238, 238, 250),
+    muted  = Color3.fromRGB(152, 150, 176),
+}
+
+local function corner(o, r)
+    return new("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o)
+end
+local function stroke(o, c, t, trans)
+    return new("UIStroke", {
+        Color = c or T.stroke, Thickness = t or 1,
+        Transparency = trans or 0, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, o)
+end
+local function grad(o, c1, c2, rot)
+    return new("UIGradient", {
+        Color = ColorSequence.new(c1, c2), Rotation = rot or 90,
+    }, o)
+end
+local function lighten(c, a)
+    a = a or 0.1
+    return Color3.new(
+        math.clamp(c.R + a, 0, 1),
+        math.clamp(c.G + a, 0, 1),
+        math.clamp(c.B + a, 0, 1))
+end
+
+--==================== BUILD UI ====================
 local pg = lp:WaitForChild("PlayerGui")
 local gui = new("ScreenGui", {
     Name = "MM2Halloween", ResetOnSpawn = false,
     IgnoreGuiInset = true, DisplayOrder = 99,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, pg)
 
-local win = new("Frame", {
-    Size = UDim2.new(0, 240, 0, 392), Position = UDim2.new(0, 20, 0, 80),
-    BackgroundColor3 = Color3.fromRGB(20, 16, 30),
-    BorderSizePixel = 0, Active = true,
+-- soft drop shadow (sits behind the window)
+local shadow = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 5, 0.5, 7),
+    Size = UDim2.new(0, 276, 0, 456),
+    BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.5,
+    BorderSizePixel = 0, ZIndex = 1,
 }, gui)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, win)
-new("UIStroke", { Color = Color3.fromRGB(255, 140, 40), Thickness = 1.5 }, win)
+corner(shadow, 18)
 
-local head = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Color3.fromRGB(34, 24, 46),
-    Text = " MM2 HALLOWEEN", TextColor3 = Color3.fromRGB(255, 170, 70),
-    Font = Enum.Font.GothamBold, TextSize = 14,
-    TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0, Active = true,
+-- centered window
+local win = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+    Size = UDim2.new(0, 276, 0, 456),
+    BackgroundColor3 = T.bg1, BorderSizePixel = 0, Active = true, ZIndex = 2,
+}, gui)
+corner(win, 18)
+grad(win, T.bg1, T.bg2, 90)
+stroke(win, T.orange, 1.4, 0.35)
+
+-- header card
+local head = new("Frame", {
+    Position = UDim2.new(0, 10, 0, 10), Size = UDim2.new(1, -20, 0, 56),
+    BackgroundColor3 = T.purple, BorderSizePixel = 0, Active = true, ZIndex = 3,
 }, win)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, head)
+corner(head, 13)
+grad(head, T.purple, T.orange, 20)
+stroke(head, Color3.new(1, 1, 1), 1, 0.72)
 
+new("TextLabel", {
+    Position = UDim2.new(0, 14, 0, 9), Size = UDim2.new(1, -48, 0, 22),
+    BackgroundTransparency = 1, Text = "MM2 HALLOWEEN",
+    Font = Enum.Font.GothamBlack, TextSize = 16, TextColor3 = Color3.new(1, 1, 1),
+    TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
+}, head)
+
+new("TextLabel", {
+    Position = UDim2.new(0, 15, 0, 31), Size = UDim2.new(1, -48, 0, 16),
+    BackgroundTransparency = 1, Text = "Candy Autofarm + Box Opener",
+    Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = Color3.fromRGB(255, 240, 222),
+    TextTransparency = 0.12, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
+}, head)
+
+local hideBtn = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 8),
+    Size = UDim2.new(0, 24, 0, 24),
+    BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.78,
+    Text = "-", TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold, TextSize = 17, BorderSizePixel = 0,
+    AutoButtonColor = false, ZIndex = 5,
+}, head)
+corner(hideBtn, 12)
+
+-- body
 local body = new("Frame", {
-    Size = UDim2.new(1, -16, 1, -42), Position = UDim2.new(0, 8, 0, 36),
-    BackgroundTransparency = 1,
+    Position = UDim2.new(0, 10, 0, 74), Size = UDim2.new(1, -20, 1, -84),
+    BackgroundTransparency = 1, ZIndex = 3,
 }, win)
-new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+new("UIListLayout", { Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder }, body)
 
+-- stats panel
+local statsPanel = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 118), LayoutOrder = 0,
+    BackgroundColor3 = T.panel, BorderSizePixel = 0, ZIndex = 4,
+}, body)
+corner(statsPanel, 11)
+stroke(statsPanel, T.stroke, 1, 0.45)
+
+new("TextLabel", {
+    Position = UDim2.new(0, 11, 0, 7), Size = UDim2.new(1, -30, 0, 12),
+    BackgroundTransparency = 1, Text = "LIVE STATS",
+    Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = T.orange,
+    TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
+}, statsPanel)
+
+local dot = new("Frame", {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -11, 0, 8),
+    Size = UDim2.new(0, 9, 0, 9), BackgroundColor3 = T.green,
+    BorderSizePixel = 0, ZIndex = 5,
+}, statsPanel)
+corner(dot, 6)
+stroke(dot, Color3.new(1, 1, 1), 1, 0.55)
+
+local stats = new("TextLabel", {
+    Position = UDim2.new(0, 11, 0, 25), Size = UDim2.new(1, -22, 1, -32),
+    BackgroundTransparency = 1, TextColor3 = T.text, Font = Enum.Font.Code,
+    TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Text = "", ZIndex = 5,
+}, statsPanel)
+
+-- animated button factory
 local function btn(text, order, color)
+    local base = color or T.panelHi
     local b = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 30), LayoutOrder = order,
-        BackgroundColor3 = color or Color3.fromRGB(46, 34, 62),
-        TextColor3 = Color3.fromRGB(235, 235, 240),
-        Font = Enum.Font.GothamMedium, TextSize = 13,
-        BorderSizePixel = 0, Text = text,
+        Size = UDim2.new(1, 0, 0, 31), LayoutOrder = order,
+        BackgroundColor3 = base, TextColor3 = T.text,
+        Font = Enum.Font.GothamMedium, TextSize = 13, BorderSizePixel = 0,
+        Text = text, AutoButtonColor = false, ZIndex = 4,
     }, body)
-    new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+    corner(b, 9)
+    local st = stroke(b, T.stroke, 1, 0.3)
+    b:SetAttribute("base", base)
+    local function tint(c)
+        TS:Create(b, TweenInfo.new(0.14, Enum.EasingStyle.Quad), { BackgroundColor3 = c }):Play()
+    end
+    b.MouseEnter:Connect(function() tint(lighten(base, 0.09)) st.Transparency = 0 end)
+    b.MouseLeave:Connect(function() tint(b:GetAttribute("base")) st.Transparency = 0.3 end)
+    b.MouseButton1Down:Connect(function() tint(lighten(base, -0.06)) end)
+    b.MouseButton1Up:Connect(function() tint(lighten(base, 0.09)) end)
     return b
 end
 
-local stats = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 100), LayoutOrder = 0,
-    BackgroundColor3 = Color3.fromRGB(28, 22, 38), BorderSizePixel = 0,
-    TextColor3 = Color3.fromRGB(200, 200, 215), Font = Enum.Font.Code,
-    TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top,
-}, body)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, stats)
-new("UIPadding", { PaddingTop = UDim.new(0, 5), PaddingLeft = UDim.new(0, 7) }, stats)
-
-local farmBtn = btn("Farm Candy: ON", 1)
-farmBtn.BackgroundColor3 = Color3.fromRGB(26, 120, 60)
-local boxBtn = btn("Open Halloween Box", 2, Color3.fromRGB(70, 40, 95))
+local farmBtn = btn("Farm Candy: ON", 1, T.greenD)
+local boxBtn  = btn("Open Halloween Box", 2, Color3.fromRGB(88, 50, 132))
 local modeBtn = btn("Box Mode: Remote", 3)
-local resetBtn = btn("Bank / Reset Character", 4, Color3.fromRGB(95, 60, 30))
+local resetBtn= btn("Bank / Reset Character", 4, Color3.fromRGB(124, 76, 34))
 local scanBtn = btn("Scan Remotes + Bag", 5)
 
-status = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 46), LayoutOrder = 6,
-    BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(180, 180, 200),
-    Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top, Text = "waiting for a round",
+local status = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 38), LayoutOrder = 6,
+    BackgroundColor3 = T.panel, BorderSizePixel = 0,
+    TextColor3 = T.muted, Font = Enum.Font.Gotham, TextSize = 11,
+    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Center, Text = "waiting for a round", ZIndex = 4,
 }, body)
+corner(status, 9)
+stroke(status, T.stroke, 1, 0.5)
+new("UIPadding", { PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9) }, status)
 
 local function say(s) status.Text = tostring(s) end
 
@@ -159,12 +266,21 @@ do
             local d = i.Position - from
             win.Position = UDim2.new(origin.X.Scale, origin.X.Offset + d.X,
                 origin.Y.Scale, origin.Y.Offset + d.Y)
+            shadow.Position = UDim2.new(origin.X.Scale, origin.X.Offset + d.X + 5,
+                origin.Y.Scale, origin.Y.Offset + d.Y + 7)
         end
     end)
+
+    hideBtn.MouseButton1Click:Connect(function()
+        win.Visible = false
+        shadow.Visible = false
+    end)
+
     UIS.InputBegan:Connect(function(i, gp)
         if gp then return end
         if i.KeyCode == Enum.KeyCode.RightShift then
             win.Visible = not win.Visible
+            shadow.Visible = win.Visible
         elseif i.KeyCode == Enum.KeyCode.F1 then
             farmBtn.MouseButton1Click:Fire()
         elseif i.KeyCode == Enum.KeyCode.F2 then
@@ -182,7 +298,7 @@ local roundActive = false
 local lastSeen = 0
 
 local visited = {}
-local firstGrab = true -- first candy of a round ignores the band
+local firstGrab = true
 local resetting, resets, failStreak, pickedAtReset = false, 0, 0, 0
 local resetStart = 0
 local spawnedAt = os.clock() - 10
@@ -190,7 +306,6 @@ local lastGrabAt = os.clock()
 local ticks, stalls = 0, 0
 
 --==================== NOCLIP ====================
--- only while alive, so a corpse keeps its collisions and rests on the map
 RUN.Stepped:Connect(function()
     if not alive then return end
     local ch = lp.Character
@@ -208,7 +323,6 @@ end)
 --==================== CANDY ====================
 local function isCandy(d)
     if not d:IsA("BasePart") then return false end
-    -- collected candy can be left invisible / untouchable: skip it
     if d.Transparency >= 0.99 then return false end
     if d.CanTouch == false then return false end
     local id = d:GetAttribute("CoinID")
@@ -231,8 +345,6 @@ local function findCandy()
     return out
 end
 
--- plain glide. timeout-guarded so a destroyed root part can never hang the loop.
--- returns "ok" | "gone"
 local function grab(part, hrp)
     if not part or not part.Parent or not hrp or not hrp.Parent then return "gone" end
 
@@ -278,7 +390,6 @@ local function grab(part, hrp)
 end
 
 --==================== ROUND WATCHER ====================
--- runs regardless of alive/dead, so the panel always knows if a round is live
 safeLoop("round", function()
     task.wait(0.5)
     local live = #findCandy() > 0
@@ -288,7 +399,7 @@ safeLoop("round", function()
         lastSeen = now
         if not roundActive then
             roundActive = true
-            firstGrab = true -- free pick on the opener
+            firstGrab = true
             say("round live")
         end
     elseif roundActive and (now - lastSeen) > CFG.RoundGrace then
@@ -300,11 +411,10 @@ end)
 --==================== BAG COUNTER DETECTION ====================
 local learnedMax
 local bagSource = "none"
-local bagPath -- the one GUI instance we trust
+local bagPath
 local fullStreak = 0
 local lastFullReason = "-"
 
--- our own panel must never be read back as game data
 local function isOurs(d)
     return d:IsDescendantOf(gui)
 end
@@ -318,15 +428,12 @@ local function labelPair(obj)
     return tonumber(a), tonumber(b)
 end
 
--- returns cur, max, source
 local function readBag()
-    -- 1) attributes on the player
     for _, k in ipairs({ "Candies", "Candy", "CandyCount", "CandyAmount", "CandyBag", "Bag", "BagCount", "HalloweenCandy" }) do
         local v = lp:GetAttribute(k)
         if type(v) == "number" then return v, nil, "attr:" .. k end
     end
 
-    -- 2) ValueObjects parented directly to the player
     for _, c in ipairs(lp:GetChildren()) do
         if c:IsA("IntValue") or c:IsA("NumberValue") then
             local n = c.Name:lower()
@@ -336,7 +443,6 @@ local function readBag()
         end
     end
 
-    -- 3) leaderstats
     local ls = lp:FindFirstChild("leaderstats")
     if ls then
         for _, c in ipairs(ls:GetChildren()) do
@@ -348,13 +454,11 @@ local function readBag()
         end
     end
 
-    -- 4) the exact label we locked onto last time
     if bagPath and bagPath.Parent then
         local a, b = labelPair(bagPath)
         if a then return a, b, "gui:" .. bagPath.Name end
     end
 
-    -- 5) otherwise scan, preferring a label whose name mentions candy
     local p = lp:FindFirstChildOfClass("PlayerGui")
     if not p then return nil end
 
@@ -394,7 +498,6 @@ local function bagBanner()
     end
 end
 
--- proof-based: needs banked picks, a spawn grace, and repeated confirmation
 local function bagIsFull()
     if not CFG.AutoReset then fullStreak = 0 return false end
     if (os.clock() - spawnedAt) < CFG.BagGrace then fullStreak = 0 return false end
@@ -448,7 +551,6 @@ local function onDied()
     visited = {}
     failStreak = 0
     fullStreak = 0
-    -- keep roundActive: we are dead *inside* the round, not out of it
     say(roundActive and "dead in round - idling" or "dead - idling")
 end
 
@@ -473,7 +575,7 @@ local function doReset(reason)
     if resetting or not alive then return end
     resetting = true
     resetStart = os.clock()
-    alive = false -- stop tweening immediately
+    alive = false
     failStreak = 0
     fullStreak = 0
     resets = resets + 1
@@ -510,7 +612,6 @@ local function farmStep()
 
     local now = os.clock()
 
-    -- drop stale / destroyed entries so the table cannot grow forever
     for k, v in pairs(visited) do
         if not k.Parent or (now - v) > 10 then visited[k] = nil end
     end
@@ -534,14 +635,11 @@ local function farmStep()
 
     local target
     if firstGrab and #near > 0 then
-        -- first candy of the round: anything in range
         target = near[math.random(1, #near)]
         firstGrab = false
     elseif #band > 0 then
-        -- preferred: random candy 20-40 studs out
         target = band[math.random(1, #band)]
     else
-        -- nothing in the band: closest available so we don't stall
         local bd
         for _, c in ipairs(list) do
             local v = visited[c]
@@ -570,7 +668,6 @@ local function farmStep()
             picked = picked + 1
             failStreak = 0
         else
-            -- landed on it, fired the prompt, candy is still there
             failStreak = failStreak + 1
             if failStreak >= CFG.FailLimit
             and (picked - pickedAtReset) >= CFG.MinPicks then
@@ -583,7 +680,6 @@ end
 safeLoop("farm", farmStep)
 
 --==================== WATCHDOG ====================
--- derives alive from the real humanoid, so a missed event self-heals
 safeLoop("watch", function()
     task.wait(0.25)
 
@@ -598,7 +694,6 @@ safeLoop("watch", function()
 
         local h = hum.Health > 0
         if h and not alive and (os.clock() - spawnedAt) >= CFG.Settle then
-            -- respawned without us noticing
             alive = true
             resetting = false
             visited = {}
@@ -616,13 +711,11 @@ safeLoop("watch", function()
         alive = false
     end
 
-    -- resetting must never latch
     if resetting and (os.clock() - resetStart) > 20 then
         resetting = false
         print("[MM2] resetting watchdog released")
     end
 
-    -- nothing grabbed for a while while it should be farming
     if farmOn and alive and roundActive and not resetting
     and (os.clock() - lastGrabAt) > CFG.Stall then
         visited = {}
@@ -634,9 +727,6 @@ safeLoop("watch", function()
 end)
 
 --==================== BOX ====================
--- Real opener: ReplicatedStorage.Remotes.Shop.OpenCrate (RemoteFunction)
--- Args captured from the live game: (crate, boxType, currency)
-
 local function visibleButtons()
     local out = {}
     local p = lp:FindFirstChildOfClass("PlayerGui")
@@ -698,8 +788,10 @@ end
 farmBtn.MouseButton1Click:Connect(function()
     farmOn = not farmOn
     farmBtn.Text = "Farm Candy: " .. (farmOn and "ON" or "OFF")
-    farmBtn.BackgroundColor3 = farmOn and Color3.fromRGB(26, 120, 60)
-        or Color3.fromRGB(46, 34, 62)
+    local c = farmOn and T.greenD or T.panelHi
+    farmBtn:SetAttribute("base", c)
+    farmBtn.BackgroundColor3 = c
+    farmBtn.TextColor3 = farmOn and Color3.new(1, 1, 1) or T.text
     lastGrabAt = os.clock()
     fullStreak = 0
     say(farmOn and "farming candies..." or "farm stopped")
@@ -795,6 +887,9 @@ task.spawn(function()
                 fullStreak, CFG.FullConfirm, lastFullReason,
                 run // 60, run % 60,
                 picked / math.max(run / 3600, 0.0001))
+
+            dot.BackgroundColor3 = resetting and T.orange
+                or (alive and roundActive and T.green or (alive and T.purple or T.red))
         end)
         if not ok then print("[MM2] stats error: " .. tostring(err)) end
     end
