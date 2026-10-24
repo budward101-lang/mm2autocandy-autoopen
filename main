@@ -37,7 +37,6 @@ local CFG = {
     RoundGrace = 3, -- secs of no candies before a round counts as over
     Stall = 10, -- secs of no grabs = clear targets and retarget
     PickupWait = 0.6, -- secs before an unconfirmed pickup counts as a miss
-    ArriveGrace = 0.35, -- secs to sit on an unresponsive candy before moving on
 
     -- PERF TUNING
     CandyTTL = 0.12,
@@ -241,14 +240,14 @@ stroke(hero, T.orange, 1.2, 0.55)
 
 new("TextLabel", {
     Position = UDim2.new(0, 16, 0, 11), Size = UDim2.new(1, -32, 0, 14),
-    BackgroundTransparency = 1, Text = "CANDIES COLLECTED",
+    BackgroundTransparency = 1, Text = "CANDIES COLLECTED (TOTAL)",
     Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = T.orange,
     TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
 }, hero)
 
 local heroNum = new("TextLabel", {
     Position = UDim2.new(0, 14, 0, 22), Size = UDim2.new(1, -30, 0, 46),
-    BackgroundTransparency = 1, Text = "~0",
+    BackgroundTransparency = 1, Text = "0",
     Font = Enum.Font.GothamBlack, TextSize = 42, TextColor3 = Color3.new(1, 1, 1),
     TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
 }, hero)
@@ -421,6 +420,7 @@ local lastGrabAt = os.clock()
 local ticks, stalls = 0, 0
 
 local selfCount = 0
+local totalCandies = 0   -- cumulative across every life, never resets
 local attempts  = 0
 local srcPicked = 0
 local balance   = 0
@@ -435,6 +435,7 @@ local function bump(part)
     if not part or counted[part] then return false end
     counted[part] = true
     selfCount = selfCount + 1
+    totalCandies = totalCandies + 1   -- total never resets
     attempts = attempts + 1
     failStreak = 0
     syncPicked()
@@ -552,80 +553,103 @@ local function findCandy(force)
     return out
 end
 
---==================== MOVEMENT (non-blocking chase) ====================
--- One tween runs in the background. farmStep ticks per frame, so the instant a
--- candy pops the next target launches on the SAME frame - no dead stop.
-local curTarget, curTween, curArriveAt = nil, nil, nil
-
-local function stopTween()
-    if curTween then pcall(function() curTween:Cancel() end) end
-    curTween = nil
-end
+--==================== MOVEMENT (blocking grab, reliable) ====================
+local lastTween
 
 clearTarget = function()
-    stopTween()
-    curTarget, curArriveAt = nil, nil
+    if lastTween then pcall(function() lastTween:Cancel() end) lastTween = nil end
 end
 
-local function firePrompt(part)
+-- Fly onto the candy, confirm the pickup, then leave.
+-- Outcomes:
+--   "gone"   -> already dead before we moved     (nobody's pickup)
+--   "stolen" -> it died mid-flight, outside reach (someone else's)
+--   "hit"    -> it died on our toes               (ours, counted)
+--   "fired"  -> we fired an input; confirmed by settlePending
+local function grab(part, hrp)
+    if not part or not part.Parent or not hrp or not hrp.Parent then return "gone" end
+
+    local dist = (part.Position - hrp.Position).Magnitude
+    local dur = math.max(dist / CFG.Tween, 0.02)
+
+    local tw = TS:Create(hrp,
+        TweenInfo.new(dur, Enum.EasingStyle.Linear),
+        { CFrame = CFrame.new(part.Position) })
+    lastTween = tw
+    tw:Play()
+
+    -- fire the prompt on the way in (no post-arrival stall)
     local prompt = part:FindFirstChildWhichIsA("ProximityPrompt", true)
-    if prompt then
-        pcall(function()
-            if fireproximityprompt then
-                fireproximityprompt(prompt)
-            else
-                prompt:InputHoldBegin()
-                task.wait(prompt.HoldDuration)
-                prompt:InputHoldEnd()
+    local fired = false
+
+    local arrive = os.clock() + dur
+    local dead = false
+    while true do
+        if not part.Parent or isDead(part) then dead = true break end
+
+        if prompt and not fired then
+            local reach = prompt.MaxActivationDistance
+            if reach == nil then reach = 8 end
+            if (hrp.Position - part.Position).Magnitude <= math.max(reach, 1.5) then
+                fired = true
+                pcall(function()
+                    if fireproximityprompt then
+                        fireproximityprompt(prompt)
+                    else
+                        prompt:InputHoldBegin(); prompt:InputHoldEnd()
+                    end
+                end)
             end
-        end)
-        return true
-    end
-    local cd = part:FindFirstChildWhichIsA("ClickDetector", true)
-    if cd and fireclickdetector then
-        pcall(fireclickdetector, cd)
-        return true
-    end
-    return false
-end
+        end
 
--- band-preferred / nearest pick
-local function chooseTarget(hrp, now)
-    local list = findCandy()
-    if #list == 0 then return nil end
+        local left = arrive - os.clock()
+        if left <= 0 then break end
+        task.wait(left > 0.05 and 0.03 or 0)
+    end
 
-    local near, band = {}, {}
-    for _, c in ipairs(list) do
-        local v = visited[c]
-        if not (v and (now - v) < CFG.Revisit) then
-            local d = (c.Position - hrp.Position).Magnitude
-            if d <= CFG.Radius then
-                near[#near + 1] = c
-                if d >= CFG.BandMin and d <= CFG.BandMax then
-                    band[#band + 1] = c
+    -- not dead yet: make sure we are genuinely on top of it
+    if not dead then
+        local guard = 0
+        while guard < 3 do
+            if not part.Parent or isDead(part) then dead = true break end
+            if (hrp.Position - part.Position).Magnitude <= 1 then break end
+            guard = guard + 1
+            task.wait()
+        end
+    end
+
+    pcall(function() tw:Cancel() end)
+
+    if dead then
+        -- how close were we when it went? inside reach = our touch did it
+        if (hrp.Position - part.Position).Magnitude <= CFG.TouchRange then
+            return "hit"
+        end
+        return "stolen"
+    end
+
+    if CFG.Hold > 0 then
+        task.wait(CFG.Hold)
+        if not part.Parent or isDead(part) then return "hit" end
+    end
+
+    -- prompt / click fallback for coins that need an input
+    if not fired then
+        if prompt then
+            pcall(function()
+                if fireproximityprompt then
+                    fireproximityprompt(prompt)
+                else
+                    prompt:InputHoldBegin(); task.wait(prompt.HoldDuration); prompt:InputHoldEnd()
                 end
-            end
+            end)
+        else
+            local cd = part:FindFirstChildWhichIsA("ClickDetector", true)
+            if cd and fireclickdetector then pcall(fireclickdetector, cd) end
         end
     end
 
-    if firstGrab and #near > 0 then
-        firstGrab = false
-        return near[math.random(1, #near)]
-    end
-    if #band > 0 then
-        return band[math.random(1, #band)]
-    end
-
-    local pool = (#near > 0) and near or list
-    local best, bd
-    for _, c in ipairs(pool) do
-        local v = visited[c]
-        if not (v and (now - v) < CFG.Revisit) then
-            local d = (c.Position - hrp.Position).Magnitude
-            if not bd or d < bd then best, bd = c, d end
-        end
-    end
-    return best
+    return "fired"
 end
 
 --==================== PENDING RESOLVER ====================
@@ -674,7 +698,7 @@ safeLoop("round", function()
         roundActive = false
         say("round over - waiting")
 
-        -- NEW: bag is full / round ended -> reset ONCE, then idle for the next round
+        -- bag is full / round ended -> reset ONCE, then idle for the next round
         if CFG.ResetOnRoundOver and not resetting and doReset
         and (selfCount - selfAtReset) >= CFG.MinPicks then
             doReset("round over")
@@ -1254,11 +1278,21 @@ end
 
 --==================== FARM STEP ====================
 local function farmStep()
-    if not farmOn then clearTarget() task.wait(0.1) return end
-    if resetting or not alive then task.wait(0.1) return end
+    if not farmOn then task.wait(0.25) return end
+    if resetting or not alive then task.wait(0.25) return end
 
     settlePending()
-    if resetting or not alive then task.wait(0.1) return end
+    if resetting or not alive then task.wait(0.25) return end
+
+    if not roundActive then task.wait(0.25) return end
+
+    local ch = lp.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then task.wait(0.25) return end
+
+    -- optional legacy bag check (off unless you flip AutoReset back on)
+    local full, why = bagIsFull()
+    if full then clearTarget() doReset(why) return end
 
     local now = os.clock()
 
@@ -1276,74 +1310,64 @@ local function farmStep()
         if not k.Parent or (now - v) > 10 then visited[k] = nil end
     end
 
-    if not roundActive then
-        clearTarget()
-        task.wait(0.1)
-        return
-    end
+    local list = findCandy()
+    if #list == 0 then lastGrabAt = now task.wait(0.25) return end
 
-    local ch = lp.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    if not hrp then clearTarget() task.wait(0.1) return end
-
-    -- optional legacy bag check (off unless you flip AutoReset back on)
-    local full, why = bagIsFull()
-    if full then clearTarget() doReset(why) return end
-
-    -- already chasing something?
-    if curTarget then
-        if not curTarget.Parent or isDead(curTarget) then
-            -- it popped: count it if it died on our toes, then keep rolling
-            if (hrp.Position - curTarget.Position).Magnitude <= CFG.TouchRange then
-                bump(curTarget)
-            end
-            visited[curTarget] = now
-            clearTarget()
-            -- no yield here: next target launches on THIS frame
-        else
-            local d = (hrp.Position - curTarget.Position).Magnitude
-            if d <= CFG.PickRadius and nearWatch[curTarget] == nil then
-                nearWatch[curTarget] = now
-            end
-            if d <= 1.4 then
-                if not curArriveAt then
-                    curArriveAt = now
-                    firePrompt(curTarget)
-                elseif (now - curArriveAt) > CFG.ArriveGrace then
-                    -- sitting on an unresponsive candy: log a miss and move on
-                    visited[curTarget] = now
-                    pending[#pending + 1] = { part = curTarget, at = now }
-                    clearTarget()
+    local near, band = {}, {}
+    for _, c in ipairs(list) do
+        local v = visited[c]
+        if not (v and (now - v) < CFG.Revisit) then
+            local d = (c.Position - hrp.Position).Magnitude
+            if d <= CFG.Radius then
+                near[#near + 1] = c
+                if d >= CFG.BandMin and d <= CFG.BandMax then
+                    band[#band + 1] = c
                 end
             end
-            if curTarget then
-                task.wait()  -- let the tween play, come back next frame
-                return
+            -- remember anything we brush past so its pickup still counts
+            if d <= CFG.PickRadius and nearWatch[c] == nil then
+                nearWatch[c] = now
             end
         end
     end
 
-    -- pick + launch toward the next candy (same frame = no dead stop)
-    local target = chooseTarget(hrp, now)
-    if not target then
-        lastGrabAt = now
-        task.wait(0.1)
+    local target
+    if firstGrab and #near > 0 then
+        target = near[math.random(1, #near)]
+        firstGrab = false
+    elseif #band > 0 then
+        target = band[math.random(1, #band)]
+    else
+        local bd
+        for _, c in ipairs(list) do
+            local v = visited[c]
+            if not (v and (now - v) < CFG.Revisit) then
+                local d = (c.Position - hrp.Position).Magnitude
+                if not bd or d < bd then target, bd = c, d end
+            end
+        end
+    end
+
+    if not target then lastGrabAt = os.clock() task.wait(0.15) return end
+
+    local ok, res = pcall(grab, target, hrp)
+    visited[target] = os.clock()
+    lastGrabAt = os.clock()
+    ticks = ticks + 1
+
+    if not ok then
+        print("[MM2] grab error: " .. tostring(res))
+        task.wait(0.2)
         return
     end
 
-    curTarget = target
-    curArriveAt = nil
-    ticks = ticks + 1
-    lastGrabAt = now
-
-    local dist = (target.Position - hrp.Position).Magnitude
-    if dist <= CFG.PickRadius then nearWatch[target] = now end
-    local dur = math.max(dist / CFG.Tween, 0.02)
-    curTween = TS:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear),
-        { CFrame = CFrame.new(target.Position) })
-    curTween:Play()
-
-    task.wait()
+    if res == "hit" then
+        bump(target)
+    elseif res == "fired" then
+        pending[#pending + 1] = { part = target, at = os.clock() }
+    elseif res == "gone" or res == "stolen" then
+        candyCacheAt = 0
+    end
 end
 
 safeLoop("farm", farmStep)
@@ -1587,13 +1611,14 @@ task.spawn(function()
                 else
                     frac = math.clamp(cur / CFG.BagSize, 0, 1)
                 end
-                heroNum.Text = tostring(cur)
             else
                 bagLine = (cur and ("static %d"):format(cur) or "no live bag label")
                     .. ("  self %d"):format(selfHeld)
-                heroNum.Text = "~" .. tostring(selfHeld)
                 frac = math.clamp(selfHeld / CFG.BagSize, 0, 1)
             end
+
+            -- TOTAL: cumulative across every life, never resets
+            heroNum.Text = tostring(totalCandies)
 
             local age = os.clock() - lastGrabAt
             local tickAge = age < 60 and ("%.1fs ago"):format(age) or ("%.0fm ago"):format(age / 60)
