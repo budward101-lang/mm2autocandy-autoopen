@@ -22,11 +22,9 @@ local CFG = {
     -- full bag handling
     AutoReset = true, -- reset character when the bag is full
     BagSize = 50, -- bag cap. Set to 49 to reset a hair early (avoids the full-bag freeze)
-    BagMinCap = 20, -- a bag cap is never this small; kills "4/4" junk readings
-    PopupMin = 20, -- min pickups before a "Bag Full" popup alone can trip a reset
-    UseBagGui = true, -- read the counter off the bag prompt / attributes / values / GUI
+    UseBagGui = true, -- read the counter off attributes / values / GUI
     UseBanner = true, -- extra "bag full" text check
-    UseLog = true, -- read the cap and the collected total off the game log / output
+    UseLog = true, -- read the cap off the game log / output
     MinCap = 5, -- ignore x/y labels whose capacity is smaller than this
     MinPicks = 3, -- must bank this many this life before a reset can trip
     FullConfirm = 2, -- consecutive full readings needed before resetting
@@ -816,69 +814,7 @@ local function readCand(c)
     end
 end
 
---==================== BAG PROMPT (bottom-right counter) ====================
--- Looks for a GuiObject whose name (or a close ancestor) contains bag/bucket/sack
--- and whose text parses as a counter. This is the authoritative bag reading.
-local bagPrompt, bagPromptAt = nil, 0
-
-local function nameHasBag(n)
-    local s = tostring(n):lower()
-    return s:find("bag", 1, true) ~= nil
-        or s:find("bucket", 1, true) ~= nil
-        or s:find("sack", 1, true) ~= nil
-        or s:find("pumpkin", 1, true) ~= nil
-end
-
-local function findBagPrompt()
-    local now = os.clock()
-    if bagPrompt and bagPrompt.Parent and (now - bagPromptAt) < 0.5 then return bagPrompt end
-    bagPromptAt = now
-
-    local best, bestScore
-    for _, d in ipairs(pg:GetDescendants()) do
-        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
-            local a, b = extractCount(d.Text)
-            if a then
-                local nm = 0
-                if nameHasBag(d.Name) then
-                    nm = 3
-                else
-                    local anc = d.Parent
-                    for _ = 1, 3 do
-                        if not anc or anc == pg then break end
-                        if nameHasBag(anc.Name) then nm = 2 break end
-                        anc = anc.Parent
-                    end
-                end
-                if nm > 0 then
-                    local score = nm * 1000 + (b and 100 or 0)
-                    if b and b >= CFG.BagMinCap then score = score + 500 end
-                    if not bestScore or score > bestScore then
-                        best, bestScore = d, score
-                    end
-                end
-            end
-        end
-    end
-
-    if best and best ~= bagPrompt then
-        print("[MM2] bag prompt: " .. best:GetFullName() .. "  text=" .. tostring(best.Text))
-    end
-    bagPrompt = best
-    return best
-end
-
-local function readBagPrompt()
-    local d = findBagPrompt()
-    if not d or not d.Parent or not d.Visible then return nil end
-    local a, b = extractCount(d.Text)
-    if not a then return nil end
-    return a, b, "prompt:" .. d.Name
-end
-
 local function readBag()
-    local pc, pm, pn = readBagPrompt()
-    if pc then return pc, pm, pn end
     if activeSrc and activeSrc.cur ~= nil then
         return activeSrc.cur, activeSrc.max, activeSrc.name
     end
@@ -890,9 +826,8 @@ local function readBag()
 end
 
 --==================== GAME LOG / OUTPUT WATCHER ====================
--- Two signals: a bag reading ("37/50") and a collected total ("collected 128").
 local logCur, logMax, logAt = nil, nil, 0
-local logTotal, logTotalAt = nil, 0
+local LOG_CAP = CFG.BagSize > 0 and CFG.BagSize or 50
 
 local function noteLog(text)
     if not CFG.UseLog then return end
@@ -901,24 +836,19 @@ local function noteLog(text)
     if #t > 200 then return end
     local low = t:lower()
 
-    -- bag style "37/50"
+    local a, b
     local m1, m2 = t:match("(%d+)%s*/%s*(%d+)")
-    if m1 and m2 then
-        local a, b = tonumber(m1), tonumber(m2)
-        if b and b >= CFG.BagMinCap and a <= b then
-            logCur, logMax, logAt = a, b, os.clock()
-            learnedMax = b
-        end
+    if m1 then a, b = tonumber(m1), tonumber(m2) end
+
+    if not a and (low:find("cand", 1, true) or low:find("bag", 1, true)
+    or low:find("bucket", 1, true) or low:find("full", 1, true)) then
+        local n = low:match("(%d+)")
+        if n then a = tonumber(n) end
     end
 
-    -- collected style: "collected 128", "candies: 128", "you have 128 candies"
-    if low:find("collect", 1, true) or low:find("candies", 1, true)
-    or low:find("candy", 1, true) then
-        local n = low:match("(%d+)")
-        if n then
-            local v = tonumber(n)
-            if v and v < 1e6 then logTotal, logTotalAt = v, os.clock() end
-        end
+    if a then
+        logCur, logMax, logAt = a, b or LOG_CAP, os.clock()
+        if b then learnedMax = b end   -- feed the GUI reader too
     end
 end
 
@@ -926,4 +856,677 @@ pcall(function() game:GetService("LogService").MessageOut:Connect(noteLog) end)
 
 pcall(function()
     local tcs = game:GetService("TextChatService")
-   
+    if tcs then tcs.MessageReceived:Connect(function(m) if m and m.Text then noteLog(m.Text) end end) end
+end)
+
+pcall(function()
+    for _, m in ipairs(game:GetService("LogService").History) do noteLog(m) end
+end)
+
+--==================== BAG FULL DETECTION ====================
+local function fullPopup()
+    for _, d in ipairs(pg:GetDescendants()) do
+        if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
+            local t = d.Text:lower()
+            if #t > 0 and #t < 48 and t:find("full", 1, true) then
+                if t:find("bag", 1, true) or t:find("bucket", 1, true)
+                or t:find("candy", 1, true) or t:find("candies", 1, true)
+                or t:find("treat", 1, true) then
+                    return d.Text
+                end
+            end
+        end
+    end
+end
+local bagBanner = fullPopup   -- keeps the old name working
+
+local function bagIsFull()
+    if not CFG.AutoReset then fullStreak = 0 return false end
+    if (os.clock() - spawnedAt) < CFG.BagGrace then fullStreak = 0 return false end
+
+    local held = picked - pickedAtReset
+    local selfHeld = selfCount - selfAtReset   -- exact confirmed pickups this life
+    if held < CFG.MinPicks then fullStreak = 0 return false end
+
+    local reason
+
+    -- 1) exact: 50 confirmed candies banked this life
+    if CFG.BagSize > 0 and selfHeld >= CFG.BagSize then
+        reason = ("bag %d/%d"):format(selfHeld, CFG.BagSize)
+    end
+
+    -- 2) game log / output said the cap is hit
+    if not reason and logCur and (os.clock() - logAt) < 3
+    and logCur >= (logMax or LOG_CAP) then
+        reason = ("log %d/%d"):format(logCur, logMax or LOG_CAP)
+    end
+
+    -- 3) live counter vs its own cap / a previously learned cap
+    if not reason and CFG.UseBagGui then
+        local cur, max, src = readBag()
+        if cur then
+            if max and max >= CFG.MinCap then
+                learnedMax = max
+                if cur >= max then reason = ("%d/%d via %s"):format(cur, max, src) end
+            elseif learnedMax and cur >= learnedMax then
+                reason = ("%d/%d via %s (learned)"):format(cur, learnedMax, src)
+            end
+        end
+    end
+
+    -- 4) explicit "Bag Full" popup
+    if not reason and CFG.UseBanner then
+        local p = fullPopup()
+        if p then reason = "popup: " .. p end
+    end
+
+    if reason then
+        lastFullReason = reason
+        fullStreak = fullStreak + 1
+        if fullStreak >= CFG.FullConfirm then
+            fullStreak = 0
+            return true, reason
+        end
+    else
+        fullStreak = 0
+        lastFullReason = "-"
+    end
+
+    return false
+end
+
+safeLoop("candywatch", function()
+    task.wait(0.2)
+    local now = os.clock()
+
+    -- rescan the candidate set
+    if now >= candNextScan then
+        candNextScan = now + CFG.SourceScan
+        local prev = {}
+        for _, c in ipairs(cands) do prev[keyOf(c)] = c end
+        local fresh = scanCands()
+        for _, c in ipairs(fresh) do
+            local p = prev[keyOf(c)]
+            if p then
+                c.prev  = p.cur or p.prev
+                c.cur   = p.cur
+                c.probe = p.probe
+            end
+        end
+        cands = fresh
+    end
+
+    -- sample + advance each candidate's proof window
+    for _, c in ipairs(cands) do
+        local v = readCand(c)
+        c.cur = v
+        if v ~= nil then
+            if c.prev == nil then c.prev = v end
+            local p = c.probe
+            if not p or (now - p.t0) >= CFG.Observe then
+                p = { t0 = now, s0 = selfCount, delta = 0, hits = 0, maxJump = 0, done = false }
+                c.probe = p
+            end
+            if not p.done then
+                local d = v - c.prev
+                if d > 0 then
+                    p.delta = p.delta + d
+                    p.hits = p.hits + 1
+                    if d > p.maxJump then p.maxJump = d end
+                end
+                if (now - p.t0) >= CFG.Observe then p.done = true end
+            end
+            c.prev = v
+        end
+    end
+
+    -- does this candidate behave like a candy counter?
+    local function verdict(c)
+        local p = c.probe
+        if not p then return false, "no probe" end
+        if not p.done then return false, "observing" end
+        local ds = selfCount - p.s0
+        local rate = p.delta / math.max(now - p.t0, 0.5)
+        if p.hits < CFG.MinHits then return false, "quiet" end
+        if ds < 1 then return false, "no picks" end
+        if rate > CFG.MaxRate then return false, ("rate %.1f/s"):format(rate) end
+        if p.maxJump > CFG.JumpMax then return false, ("jump %d"):format(p.maxJump) end
+        if p.delta < ds * CFG.CorrelLow then return false, ("low %d vs %d picks"):format(p.delta, ds) end
+        if p.delta > ds * CFG.CorrelHigh + CFG.Slack then return false, ("high %d vs %d picks"):format(p.delta, ds) end
+        return true, ("tracks %d picks"):format(ds)
+    end
+
+    if CFG.Debug and now >= dbgAt then
+        dbgAt = now + 10
+        local lines = {}
+        for _, c in ipairs(cands) do
+            local p = c.probe
+            local rate = p and p.delta / math.max(now - p.t0, 0.5) or 0
+            local ok, why = verdict(c)
+            lines[#lines + 1] = ("%s v=%s rate=%.1f jump=%s delta=%s -> %s%s")
+                :format(c.name, tostring(c.cur), rate,
+                        p and tostring(p.maxJump) or "-",
+                        p and tostring(p.delta) or "-",
+                        ok and "PASS " or "fail ", why)
+        end
+        if #lines > 0 then
+            print(("[MM2] sources (selfCount=%d):\n  "):format(selfCount)
+                .. table.concat(lines, "\n  "))
+        end
+    end
+
+    -- acquire
+    if not activeSrc then
+        if CFG.ForceSource ~= "" then
+            for _, c in ipairs(cands) do
+                if c.cur ~= nil and c.name:find(CFG.ForceSource, 1, true) then
+                    activeSrc, lockVal, lockAnchor = c, c.cur, selfCount
+                    bagConfirmed, bagSrcLabel = true, c.name
+                    verify, verifyFails = nil, 0
+                    print("[MM2] forced source: " .. c.name)
+                    break
+                end
+            end
+        end
+        if not activeSrc then
+            local best, bs, br
+            for _, c in ipairs(cands) do
+                if c.cur ~= nil and not blocked(c.name) then
+                    local ok, why = verdict(c)
+                    if ok and c.score > (bs or -1) then best, bs, br = c, c.score, why end
+                end
+            end
+            if best then
+                activeSrc, lockVal, lockAnchor = best, best.cur, selfCount
+                bagConfirmed, bagSrcLabel = true, best.name
+                verify, verifyFails = nil, 0
+                print(("[MM2] locked source: %s  v=%s  (%s)")
+                    :format(best.name, tostring(best.cur), br))
+            end
+        end
+    end
+
+    -- hold the lock under continuous re-verification
+    if activeSrc then
+        local v = activeSrc.cur
+        local gone = v == nil
+            or (activeSrc.kind == "val" and not (activeSrc.ref and activeSrc.ref.Parent))
+            or (activeSrc.kind == "attr" and not (activeSrc.obj and activeSrc.obj.Parent))
+            or (activeSrc.kind == "gui" and not (activeSrc.ref and activeSrc.ref.Parent))
+
+        if gone then
+            verifyFails = verifyFails + 1
+        else
+            srcPicked = math.max(0, v - lockVal)
+            balance = v
+
+            local vp = verify
+            if not vp or (now - vp.t0) >= CFG.VerifyWin then
+                vp = { t0 = now, last = v, s0 = selfCount, delta = 0, maxJump = 0, checked = false }
+                verify = vp
+            else
+                local d = v - vp.last
+                vp.last = v
+                if d > 0 then
+                    vp.delta = vp.delta + d
+                    if d > vp.maxJump then vp.maxJump = d end
+                end
+                local ds = selfCount - vp.s0
+                local elapsed = now - vp.t0
+                if not vp.checked and elapsed >= 3 and ds >= 1 then
+                    vp.checked = true
+                    local rate = vp.delta / elapsed
+                    local bad = rate > CFG.MaxRate
+                        or vp.maxJump > CFG.JumpMax
+                        or vp.delta > ds * CFG.CorrelHigh + CFG.Slack
+                    if bad then
+                        verifyFails = verifyFails + 1
+                        print(("[MM2] source %s misbehaving (rate %.1f jump %d delta %d vs %d picks)")
+                            :format(activeSrc.name, rate, vp.maxJump, vp.delta, ds))
+                    else
+                        verifyFails = math.max(0, verifyFails - 1)
+                    end
+                end
+            end
+        end
+
+        if verifyFails >= 8 then
+            print(("[MM2] dropping source %s - ignored for %ds")
+                :format(activeSrc.name, CFG.Blacklist))
+            blacklist[activeSrc.name] = os.clock() + CFG.Blacklist
+            activeSrc, bagConfirmed = nil, false
+            bagSrcLabel = "none"
+            srcPicked = 0
+            verify, verifyFails = nil, 0
+        end
+    end
+
+    picked = shownCount()
+end)
+
+--==================== DEATH / SPAWN ====================
+local function onDied()
+    alive = false
+    visited = {}
+    pending = {}
+    failStreak = 0
+    fullStreak = 0
+    say(roundActive and "dead in round - idling" or "dead - idling")
+end
+
+local function onSpawned(ch)
+    spawnedAt = os.clock()
+    fullStreak = 0
+    pending = {}
+    rebuildNoc(ch)
+    task.spawn(function()
+        local hum = ch:FindFirstChildOfClass("Humanoid") or ch:WaitForChild("Humanoid", 6)
+        if not hum then return end
+        if boundHum ~= hum then
+            boundHum = hum
+            pcall(function() hum.Died:Connect(onDied) end)
+        end
+    end)
+end
+
+if lp.Character then onSpawned(lp.Character) end
+lp.CharacterAdded:Connect(onSpawned)
+
+--==================== RESET ====================
+local function doReset(reason)
+    if resetting or not alive then return end
+    resetting = true
+    resetStart = os.clock()
+    alive = false
+    failStreak = 0
+    fullStreak = 0
+    resets = resets + 1
+    say("bag full (" .. reason .. ") - resetting")
+    print("[MM2] auto reset:", reason)
+
+    local old = lp.Character
+    pcall(function()
+        local hum = old and old:FindFirstChildOfClass("Humanoid")
+        if hum then hum.Health = 0
+        elseif old then old:BreakJoints() end
+    end)
+
+    task.spawn(function()
+        task.wait(4)
+        if resetting and lp.Character == old then
+            pcall(function() lp:LoadCharacter() end)
+        end
+    end)
+end
+
+--==================== FARM STEP ====================
+local function farmStep()
+    if not farmOn then task.wait(0.25) return end
+    if resetting or not alive then task.wait(0.25) return end
+
+    settlePending()
+    if resetting or not alive then task.wait(0.25) return end
+
+    if not roundActive then task.wait(0.25) return end
+
+    local ch = lp.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then task.wait(0.25) return end
+
+    local full, why = bagIsFull()
+    if full then doReset(why) return end
+
+    local now = os.clock()
+
+    for k, v in pairs(visited) do
+        if not k.Parent or (now - v) > 10 then visited[k] = nil end
+    end
+
+    local list = findCandy()
+    if #list == 0 then lastGrabAt = now task.wait(0.25) return end
+
+    local near, band = {}, {}
+    for _, c in ipairs(list) do
+        local v = visited[c]
+        if not (v and (now - v) < CFG.Revisit) then
+            local d = (c.Position - hrp.Position).Magnitude
+            if d <= CFG.Radius then
+                near[#near + 1] = c
+                if d >= CFG.BandMin and d <= CFG.BandMax then
+                    band[#band + 1] = c
+                end
+            end
+        end
+    end
+
+    local target
+    if firstGrab and #near > 0 then
+        target = near[math.random(1, #near)]
+        firstGrab = false
+    elseif #band > 0 then
+        target = band[math.random(1, #band)]
+    else
+        local bd
+        for _, c in ipairs(list) do
+            local v = visited[c]
+            if not (v and (now - v) < CFG.Revisit) then
+                local d = (c.Position - hrp.Position).Magnitude
+                if not bd or d < bd then target, bd = c, d end
+            end
+        end
+    end
+
+    if not target then lastGrabAt = os.clock() task.wait(0.15) return end
+
+    local ok, res = pcall(grab, target, hrp)
+    visited[target] = os.clock()
+    lastGrabAt = os.clock()
+    ticks = ticks + 1
+
+    if not ok then
+        print("[MM2] grab error: " .. tostring(res))
+        task.wait(0.2)
+        return
+    end
+
+    if res == "hit" then
+        -- died in our reach: the touch did it
+        selfCount = selfCount + 1
+        attempts = attempts + 1
+        syncPicked()
+        failStreak = 0
+    elseif res == "fired" then
+        -- fired an input; confirm in the background so we can leave now
+        pending[#pending + 1] = { part = target, at = os.clock() }
+    elseif res == "gone" or res == "stolen" then
+        -- our cached candy list is stale, rescan before picking again
+        candyCacheAt = 0
+    end
+end
+
+safeLoop("farm", farmStep)
+
+--==================== WATCHDOG ====================
+safeLoop("watch", function()
+    task.wait(0.25)
+
+    local ch = lp.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+
+    if hum then
+        if boundHum ~= hum then
+            boundHum = hum
+            pcall(function() hum.Died:Connect(onDied) end)
+        end
+
+        local h = hum.Health > 0
+        if h and not alive and (os.clock() - spawnedAt) >= CFG.Settle then
+            alive = true
+            resetting = false
+            visited = {}
+            pending = {}
+            failStreak = 0
+            fullStreak = 0
+            firstGrab = true
+            pickedAtReset = picked
+            selfAtReset = selfCount
+            lastGrabAt = os.clock()
+            say(roundActive and "alive in round - farming" or "alive - waiting for round")
+        elseif not h and alive then
+            alive = false
+            say(roundActive and "dead in round - idling" or "dead - idling")
+        end
+    elseif alive then
+        alive = false
+    end
+
+    if resetting and (os.clock() - resetStart) > 20 then
+        resetting = false
+        print("[MM2] resetting watchdog released")
+    end
+
+    if farmOn and alive and roundActive and not resetting
+    and (os.clock() - lastGrabAt) > CFG.Stall then
+        visited = {}
+        firstGrab = true
+        lastGrabAt = os.clock()
+        stalls = stalls + 1
+        print("[MM2] stall watchdog - cleared targets")
+    end
+end)
+
+--==================== BOX ====================
+local function visibleButtons()
+    local out = {}
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+            out[#out + 1] = d
+        end
+    end
+    return out
+end
+
+local function clickKeyword(kws)
+    for _, b in ipairs(visibleButtons()) do
+        local label = b.Name .. " "
+        if b:IsA("TextButton") then label = label .. b.Text end
+        label = label:lower()
+        for _, k in ipairs(kws) do
+            if label:find(k, 1, true) then
+                pcall(function()
+                    if firesignal then
+                        firesignal(b.MouseButton1Click)
+                    else
+                        b:Activate()
+                    end
+                end)
+                return b
+            end
+        end
+    end
+end
+
+local RARITY_WORDS = {
+    "common", "uncommon", "rare", "legendary", "godly", "chroma",
+    "vintage", "unique", "ancient", "exclusive", "spooky", "cursed",
+    "halloween", "epic", "mythic", "super", "limited",
+}
+
+local FAIL_WORDS = {
+    "fail", "error", "cooldown", "not enough", "insufficient",
+    "no candy", "no money", "locked", "wait",
+}
+
+local function looksLikeRarity(v)
+    if type(v) ~= "string" then return false end
+    local lv = v:lower()
+    for _, w in ipairs(RARITY_WORDS) do
+        if lv:find(w, 1, true) then return true end
+    end
+    return false
+end
+
+local function looksLikeFail(v)
+    if v == false then return true end
+    if type(v) == "string" then
+        local lv = v:lower()
+        for _, w in ipairs(FAIL_WORDS) do
+            if lv:find(w, 1, true) then return true end
+        end
+    end
+    return false
+end
+
+local function parseOpenReturn(r1, r2, r3)
+    local item, rarity
+
+    if type(r1) == "table" then
+        item   = r1.Name or r1.Item or r1[1]
+        rarity = r1.Rarity or r1.rarity or r1[2]
+    elseif type(r1) == "string" then
+        item = r1
+    elseif type(r1) == "number" then
+        item = r1
+    end
+
+    if not rarity then
+        for _, v in ipairs({ r2, r3 }) do
+            if type(v) == "table" then
+                rarity = v.Rarity or v.rarity
+            elseif type(v) == "string" then
+                if looksLikeRarity(v) then rarity = v end
+            elseif type(v) == "number" then
+                rarity = v
+            end
+            if rarity then break end
+        end
+    end
+
+    if not rarity and looksLikeRarity(r1) then
+        rarity = r1
+        if item == r1 then item = nil end
+    end
+
+    return item, rarity
+end
+
+local function openBox()
+    if CFG.Mode == "Remote" then
+        local ok, r1, r2, r3 = pcall(function()
+            return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
+        end)
+
+        if not ok then
+            return "invoke errored: " .. tostring(r1)
+        end
+
+        if r1 == nil and r2 == nil and r3 == nil then
+            return "no return - open failed (check Candies2026 / crate args)"
+        end
+
+        if looksLikeFail(r1) then
+            lastRarity = "-"
+            print("[MM2] open failed:", tostring(r1))
+            return "open failed: " .. tostring(r1)
+        end
+
+        local item, rarity = parseOpenReturn(r1, r2, r3)
+
+        boxes = boxes + 1
+        lastRarity = rarity and tostring(rarity) or "?"
+
+        print("[MM2] rolled:", tostring(item or r1), rarity or "?")
+
+        if item then
+            return ("opened: %s%s"):format(
+                tostring(item),
+                rarity and (" [" .. tostring(rarity) .. "]") or "")
+        end
+        return "opened - rarity: " .. lastRarity
+    else
+        local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
+        if b then
+            boxes = boxes + 1
+            return "clicked " .. b.Name
+        end
+        return "no matching button on screen"
+    end
+end
+
+--==================== BUTTONS ====================
+farmBtn.MouseButton1Click:Connect(function()
+    farmOn = not farmOn
+    farmBtn.Text = "Farm Candy: " .. (farmOn and "ON" or "OFF")
+    local c = farmOn and T.greenD or T.panelHi
+    farmBtn:SetAttribute("base", c)
+    farmBtn.BackgroundColor3 = c
+    farmBtn.TextColor3 = farmOn and Color3.new(1, 1, 1) or T.text
+    lastGrabAt = os.clock()
+    fullStreak = 0
+    say(farmOn and "farming candies..." or "farm stopped")
+end)
+
+boxBtn.MouseButton1Click:Connect(function()
+    local msg = openBox()
+    say(msg)
+    print("[MM2] " .. msg)
+end)
+
+--==================== STATS ====================
+local function stateLine()
+    if resetting then return "RESETTING" end
+    if not roundActive then
+        return alive and "no round - idle" or "no round - dead"
+    end
+    return alive and "IN ROUND - alive" or "IN ROUND - dead"
+end
+
+task.spawn(function()
+    while task.wait(0.4) do
+        local ok, err = pcall(function()
+            local run = os.clock() - started
+            local bagLine, frac = "reading game...", 0
+
+            local cur, max, src = readBag()
+            if cur then
+                bagLine = (max and ("%d/%d"):format(cur, max) or tostring(cur)) .. " " .. tostring(src or "")
+                if max and max > 0 then frac = math.clamp(cur / max, 0, 1) end
+            elseif learnedMax then
+                bagLine = "cap " .. learnedMax
+                frac = math.clamp((selfCount - selfAtReset) / learnedMax, 0, 1)
+            end
+            if logCur and (os.clock() - logAt) < 3 then
+                bagLine = bagLine .. ("  log:%d/%d"):format(logCur, logMax or LOG_CAP)
+            end
+
+            local age = os.clock() - lastGrabAt
+            local tickAge = age < 60 and ("%.1fs ago"):format(age) or ("%.0fm ago"):format(age / 60)
+
+            stats.Text = string.format(
+                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nbag    : %d/%d  resets:%d\nuptime : %02d:%02d  per/hr:%.0f",
+                stateLine(), roundActive and "active" or "none",
+                tickAge, stalls,
+                selfCount - selfAtReset, CFG.BagSize,
+                resets,
+                run // 60, run % 60,
+                picked / math.max(run / 3600, 0.0001))
+
+            heroNum.Text = "~" .. tostring(picked)
+            heroBoxes.Text = tostring(boxes)
+
+            if bagConfirmed then
+                heroSub.Text = ("src %s  raw %d  srcPicked %d  self %d")
+                    :format(bagSrcLabel, balance, srcPicked, selfCount)
+            else
+                heroSub.Text = ("self %d  attempts %d  hunting source"):format(selfCount, attempts)
+            end
+
+            TS:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(frac, 0, 1, 0) }):Play()
+
+            dot.BackgroundColor3 = resetting and T.orange
+                or (alive and roundActive and T.green or (alive and T.purple or T.red))
+        end)
+        if not ok then print("[MM2] stats error: " .. tostring(err)) end
+    end
+end)
+
+--==================== ANTI AFK ====================
+if CFG.AntiAFK then
+    pcall(function()
+        local cons = getconnections and getconnections(lp.Idled)
+        if cons and #cons > 0 then
+            for _, c in ipairs(cons) do
+                pcall(function()
+                    if c.Disable then c.Disable(c) elseif c.Disconnect then c.Disconnect(c) end
+                end)
+            end
+        else
+            lp.Idled:Connect(function()
+                VU:CaptureController()
+                VU:ClickButton2(Vector2.new())
+            end)
+        end
+    end)
+end
+
+print("[MM2 Halloween] loaded - RightShift UI | F1 farm | F2 box")
