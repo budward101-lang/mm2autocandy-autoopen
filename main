@@ -22,9 +22,11 @@ local CFG = {
     -- full bag handling
     AutoReset = true, -- reset character when the bag is full
     BagSize = 50, -- bag cap. Set to 49 to reset a hair early (avoids the full-bag freeze)
-    UseBagGui = true, -- read the counter off attributes / values / GUI
+    BagMinCap = 20, -- a bag cap is never this small; kills "4/4" junk readings
+    PopupMin = 20, -- min pickups before a "Bag Full" popup alone can trip a reset
+    UseBagGui = true, -- read the counter off the bag prompt / attributes / values / GUI
     UseBanner = true, -- extra "bag full" text check
-    UseLog = true, -- read the cap off the game log / output
+    UseLog = true, -- read the cap and the collected total off the game log / output
     MinCap = 5, -- ignore x/y labels whose capacity is smaller than this
     MinPicks = 3, -- must bank this many this life before a reset can trip
     FullConfirm = 2, -- consecutive full readings needed before resetting
@@ -425,6 +427,9 @@ local balance   = 0   -- raw value of the trusted source
 local bagConfirmed = false
 local bagSrcLabel = "none"
 
+-- forward declarations (these are referenced by functions defined earlier)
+local doReset
+
 -- Once a source has passed verification the game's own counter is the honest
 -- number, so prefer it. selfCount stays as the floor and as the anti-runaway
 -- ceiling (a bad source can never exceed real pickups + Slack).
@@ -672,7 +677,6 @@ local candNextScan = 0
 
 local activeSrc
 local lockVal = 0
-local lockAnchor = 0
 local verify = nil
 local verifyFails = 0
 local blacklist = {}   -- name -> clock time until which it is ignored
@@ -814,7 +818,73 @@ local function readCand(c)
     end
 end
 
+--==================== BAG PROMPT (bottom-right counter) ====================
+-- Looks for a GuiObject whose name (or a close ancestor) contains bag/bucket/sack
+-- and whose text parses as a counter. This is the authoritative bag reading.
+local bagPrompt, bagPromptAt = nil, 0
+
+local function nameHasBag(n)
+    local s = tostring(n):lower()
+    if s:find("bag", 1, true) then return true end
+    if s:find("bucket", 1, true) then return true end
+    if s:find("sack", 1, true) then return true end
+    if s:find("pumpkin", 1, true) then return true end
+    return false
+end
+
+local function findBagPrompt()
+    local now = os.clock()
+    if bagPrompt and bagPrompt.Parent and (now - bagPromptAt) < 0.5 then return bagPrompt end
+    bagPromptAt = now
+
+    local best, bestScore
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
+            local a, b = extractCount(d.Text)
+            if a then
+                local nm = 0
+                if nameHasBag(d.Name) then
+                    nm = 3
+                else
+                    local anc = d.Parent
+                    for _i = 1, 3 do
+                        if not anc or anc == pg then break end
+                        if nameHasBag(anc.Name) then
+                            nm = 2
+                            break
+                        end
+                        anc = anc.Parent
+                    end
+                end
+                if nm > 0 then
+                    local score = nm * 1000 + (b and 100 or 0)
+                    if b and b >= CFG.BagMinCap then score = score + 500 end
+                    if not bestScore or score > bestScore then
+                        best, bestScore = d, score
+                    end
+                end
+            end
+        end
+    end
+
+    if best and best ~= bagPrompt then
+        print("[MM2] bag prompt: " .. best:GetFullName() .. "  text=" .. tostring(best.Text))
+    end
+    bagPrompt = best
+    return best
+end
+
+local function readBagPrompt()
+    local d = findBagPrompt()
+    if not d or not d.Parent or not d.Visible then return nil end
+    local a, b = extractCount(d.Text)
+    if not a then return nil end
+    return a, b, "prompt:" .. d.Name
+end
+
 local function readBag()
+    local pc, pm, pn = readBagPrompt()
+    if pc then return pc, pm, pn end
     if activeSrc and activeSrc.cur ~= nil then
         return activeSrc.cur, activeSrc.max, activeSrc.name
     end
@@ -826,8 +896,9 @@ local function readBag()
 end
 
 --==================== GAME LOG / OUTPUT WATCHER ====================
+-- Two signals: a bag reading ("37/50") and a collected total ("collected 128").
 local logCur, logMax, logAt = nil, nil, 0
-local LOG_CAP = CFG.BagSize > 0 and CFG.BagSize or 50
+local logTotal, logTotalAt = nil, 0
 
 local function noteLog(text)
     if not CFG.UseLog then return end
@@ -836,19 +907,24 @@ local function noteLog(text)
     if #t > 200 then return end
     local low = t:lower()
 
-    local a, b
+    -- bag style "37/50"
     local m1, m2 = t:match("(%d+)%s*/%s*(%d+)")
-    if m1 then a, b = tonumber(m1), tonumber(m2) end
-
-    if not a and (low:find("cand", 1, true) or low:find("bag", 1, true)
-    or low:find("bucket", 1, true) or low:find("full", 1, true)) then
-        local n = low:match("(%d+)")
-        if n then a = tonumber(n) end
+    if m1 and m2 then
+        local a, b = tonumber(m1), tonumber(m2)
+        if b and b >= CFG.BagMinCap and a <= b then
+            logCur, logMax, logAt = a, b, os.clock()
+            learnedMax = b
+        end
     end
 
-    if a then
-        logCur, logMax, logAt = a, b or LOG_CAP, os.clock()
-        if b then learnedMax = b end   -- feed the GUI reader too
+    -- collected style: "collected 128", "candies: 128", "you have 128 candies"
+    if low:find("collect", 1, true) or low:find("candies", 1, true)
+    or low:find("candy", 1, true) then
+        local n = low:match("(%d+)")
+        if n then
+            local v = tonumber(n)
+            if v and v < 1e6 then logTotal, logTotalAt = v, os.clock() end
+        end
     end
 end
 
@@ -856,7 +932,11 @@ pcall(function() game:GetService("LogService").MessageOut:Connect(noteLog) end)
 
 pcall(function()
     local tcs = game:GetService("TextChatService")
-    if tcs then tcs.MessageReceived:Connect(function(m) if m and m.Text then noteLog(m.Text) end end) end
+    if tcs then
+        tcs.MessageReceived:Connect(function(m)
+            if m and m.Text then noteLog(m.Text) end
+        end)
+    end
 end)
 
 pcall(function()
@@ -878,46 +958,41 @@ local function fullPopup()
         end
     end
 end
-local bagBanner = fullPopup   -- keeps the old name working
 
 local function bagIsFull()
     if not CFG.AutoReset then fullStreak = 0 return false end
     if (os.clock() - spawnedAt) < CFG.BagGrace then fullStreak = 0 return false end
 
     local held = picked - pickedAtReset
-    local selfHeld = selfCount - selfAtReset   -- exact confirmed pickups this life
-    if held < CFG.MinPicks then fullStreak = 0 return false end
+    local selfHeld = selfCount - selfAtReset
+    if math.max(held, selfHeld) < CFG.MinPicks then fullStreak = 0 return false end
 
     local reason
 
-    -- 1) exact: 50 confirmed candies banked this life
-    if CFG.BagSize > 0 and selfHeld >= CFG.BagSize then
-        reason = ("bag %d/%d"):format(selfHeld, CFG.BagSize)
+    -- 1) authoritative: the bag prompt / live counter vs its own cap
+    local cur, max, src = readBag()
+    if cur and max and max >= CFG.BagMinCap then
+        learnedMax = max
+        if cur >= max then reason = ("%d/%d via %s"):format(cur, max, src) end
+    elseif cur and learnedMax and learnedMax >= CFG.BagMinCap and cur >= learnedMax then
+        reason = ("%d/%d via %s (learned)"):format(cur, learnedMax, src)
     end
 
-    -- 2) game log / output said the cap is hit
+    -- 2) exact confirmed-pickup fallback
+    if not reason and CFG.BagSize > 0 and selfHeld >= CFG.BagSize then
+        reason = ("picks %d/%d"):format(selfHeld, CFG.BagSize)
+    end
+
+    -- 3) game log
     if not reason and logCur and (os.clock() - logAt) < 3
-    and logCur >= (logMax or LOG_CAP) then
-        reason = ("log %d/%d"):format(logCur, logMax or LOG_CAP)
+    and logMax and logMax >= CFG.BagMinCap and logCur >= logMax then
+        reason = ("log %d/%d"):format(logCur, logMax)
     end
 
-    -- 3) live counter vs its own cap / a previously learned cap
-    if not reason and CFG.UseBagGui then
-        local cur, max, src = readBag()
-        if cur then
-            if max and max >= CFG.MinCap then
-                learnedMax = max
-                if cur >= max then reason = ("%d/%d via %s"):format(cur, max, src) end
-            elseif learnedMax and cur >= learnedMax then
-                reason = ("%d/%d via %s (learned)"):format(cur, learnedMax, src)
-            end
-        end
-    end
-
-    -- 4) explicit "Bag Full" popup
+    -- 4) "Bag Full" popup (last resort, needs real progress behind it)
     if not reason and CFG.UseBanner then
         local p = fullPopup()
-        if p then reason = "popup: " .. p end
+        if p and selfHeld >= CFG.PopupMin then reason = "popup: " .. p end
     end
 
     if reason then
@@ -1020,7 +1095,7 @@ safeLoop("candywatch", function()
         if CFG.ForceSource ~= "" then
             for _, c in ipairs(cands) do
                 if c.cur ~= nil and c.name:find(CFG.ForceSource, 1, true) then
-                    activeSrc, lockVal, lockAnchor = c, c.cur, selfCount
+                    activeSrc, lockVal = c, c.cur
                     bagConfirmed, bagSrcLabel = true, c.name
                     verify, verifyFails = nil, 0
                     print("[MM2] forced source: " .. c.name)
@@ -1037,7 +1112,7 @@ safeLoop("candywatch", function()
                 end
             end
             if best then
-                activeSrc, lockVal, lockAnchor = best, best.cur, selfCount
+                activeSrc, lockVal = best, best.cur
                 bagConfirmed, bagSrcLabel = true, best.name
                 verify, verifyFails = nil, 0
                 print(("[MM2] locked source: %s  v=%s  (%s)")
@@ -1133,7 +1208,7 @@ if lp.Character then onSpawned(lp.Character) end
 lp.CharacterAdded:Connect(onSpawned)
 
 --==================== RESET ====================
-local function doReset(reason)
+doReset = function(reason)
     if resetting or not alive then return end
     resetting = true
     resetStart = os.clock()
@@ -1452,6 +1527,14 @@ boxBtn.MouseButton1Click:Connect(function()
     print("[MM2] " .. msg)
 end)
 
+--==================== REAL COLLECTED ====================
+-- real collected total: game log first, then the trusted currency source, then our own tally
+local function realCollected()
+    if logTotal and (os.clock() - logTotalAt) < 5 then return logTotal, "log" end
+    if bagConfirmed and balance > 0 then return balance, "src" end
+    return selfCount, "self"
+end
+
 --==================== STATS ====================
 local function stateLine()
     if resetting then return "RESETTING" end
@@ -1469,29 +1552,28 @@ task.spawn(function()
 
             local cur, max, src = readBag()
             if cur then
-                bagLine = (max and ("%d/%d"):format(cur, max) or tostring(cur)) .. " " .. tostring(src or "")
+                bagLine = (max and ("%d/%d"):format(cur, max) or tostring(cur)) .. "  " .. tostring(src or "")
                 if max and max > 0 then frac = math.clamp(cur / max, 0, 1) end
-            elseif learnedMax then
-                bagLine = "cap " .. learnedMax
-                frac = math.clamp((selfCount - selfAtReset) / learnedMax, 0, 1)
-            end
-            if logCur and (os.clock() - logAt) < 3 then
-                bagLine = bagLine .. ("  log:%d/%d"):format(logCur, logMax or LOG_CAP)
+            else
+                bagLine = "no bag prompt found"
+                if CFG.BagSize > 0 then
+                    frac = math.clamp((selfCount - selfAtReset) / CFG.BagSize, 0, 1)
+                end
             end
 
             local age = os.clock() - lastGrabAt
             local tickAge = age < 60 and ("%.1fs ago"):format(age) or ("%.0fm ago"):format(age / 60)
 
             stats.Text = string.format(
-                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nbag    : %d/%d  resets:%d\nuptime : %02d:%02d  per/hr:%.0f",
+                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nbag    : %s\nresets : %d  uptime:%02d:%02d  /hr:%.0f",
                 stateLine(), roundActive and "active" or "none",
                 tickAge, stalls,
-                selfCount - selfAtReset, CFG.BagSize,
-                resets,
-                run // 60, run % 60,
+                bagLine,
+                resets, run // 60, run % 60,
                 picked / math.max(run / 3600, 0.0001))
 
-            heroNum.Text = "~" .. tostring(picked)
+            local col, colSrc = realCollected()
+            heroNum.Text = (colSrc == "self" and "~" or "") .. tostring(col)
             heroBoxes.Text = tostring(boxes)
 
             if bagConfirmed then
