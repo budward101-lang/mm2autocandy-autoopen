@@ -36,9 +36,14 @@ local CFG = {
     PickupWait = 0.6, -- secs before an unconfirmed pickup counts as a miss
 
     -- PERF TUNING
-    CandyTTL = 0.12, -- reuse a candy scan this long (secs)
-    SourceScan = 1.5, -- how often to re-scan candidate counter sources
+    CandyTTL = 0.2, -- reuse a candy scan this long (secs)
+    SourceScan = 4.0, -- how often to re-scan candidate sources (secs)
+    SourceScanLocked = 10.0, -- ...once a source is locked
     ContainerRetry = 1.0, -- min secs between CoinContainer re-searches
+    StatsTick = 0.5, -- UI refresh interval (secs)
+    NocStride = 3, -- apply noclip every Nth frame
+    NocCompact = 5.0, -- secs between noclip part-list rebuilds
+    TextScoreCap = 64, -- ignore label text longer than this when scoring
 
     -- SOURCE TRUST
     Debug       = true,  -- print a verdict table for every candidate every 10s
@@ -53,6 +58,18 @@ local CFG = {
     Slack       = 8,     -- hard headroom over the confirmed pickup count
     Blacklist   = 30,    -- secs a dropped source is ignored
 }
+
+-- hot config, hoisted out of the inner loops
+local MAX_SIZE     = CFG.MaxSize
+local CANDY_TTL    = CFG.CandyTTL
+local REVISIT      = CFG.Revisit
+local RADIUS       = CFG.Radius
+local BAND_MIN     = CFG.BandMin
+local BAND_MAX     = CFG.BandMax
+local TOUCH_RANGE  = CFG.TouchRange
+local NOC_STRIDE   = CFG.NocStride
+local TEXT_CAP     = CFG.TextScoreCap
+local TWEEN_SPEED  = CFG.Tween
 
 local P = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -352,7 +369,10 @@ corner(status, 9)
 stroke(status, T.stroke, 1, 0.5)
 new("UIPadding", { PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9) }, status)
 
-local function say(s) status.Text = tostring(s) end
+local function say(s)
+    local t = tostring(s)
+    if status.Text ~= t then status.Text = t end
+end
 
 --==================== SHOW / HIDE ====================
 local function setVisible(v)
@@ -440,43 +460,59 @@ end
 
 --==================== NOCLIP ====================
 local nocParts = {}
-local nocChar
+local nocChar, nocHrp, nocConn, nocBound = nil, nil, nil, nil
 
 local function rebuildNoc(ch)
     nocChar = ch
     nocParts = {}
+    nocHrp = nil
     if not ch then return end
+
+    local n = 0
     for _, d in ipairs(ch:GetDescendants()) do
         if d:IsA("BasePart") then
             d.CanCollide = false
-            nocParts[#nocParts + 1] = d
+            n = n + 1
+            nocParts[n] = d
         end
     end
-    ch.DescendantAdded:Connect(function(d)
-        if nocChar ~= ch then return end
-        if d:IsA("BasePart") then
-            d.CanCollide = false
-            nocParts[#nocParts + 1] = d
-        end
-    end)
+    nocHrp = ch:FindFirstChild("HumanoidRootPart")
+
+    if nocBound ~= ch then
+        nocBound = ch
+        if nocConn then pcall(function() nocConn:Disconnect() end) end
+        nocConn = ch.DescendantAdded:Connect(function(d)
+            if nocChar ~= ch then return end
+            if d:IsA("BasePart") then
+                d.CanCollide = false
+                nocParts[#nocParts + 1] = d
+            end
+        end)
+    end
 end
 
 local nocFrame = 0
 RUN.Stepped:Connect(function()
     if not alive then return end
 
-    nocFrame = nocFrame + 1
-    if nocFrame % 3 == 0 then
-        for i = 1, #nocParts do
-            local d = nocParts[i]
-            if d.Parent and d.CanCollide then d.CanCollide = false end
-        end
+    -- the root is cached: no FindFirstChild per frame
+    local hrp = nocHrp
+    if not hrp or not hrp.Parent then
+        hrp = nocChar and nocChar:FindFirstChild("HumanoidRootPart")
+        nocHrp = hrp
+        if not hrp then return end
     end
 
-    local hrp = nocChar and nocChar:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
+    -- the character is the thing that actually has to stay put every frame
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+
+    nocFrame = nocFrame + 1
+    if nocFrame % NOC_STRIDE == 0 then
+        for i = 1, #nocParts do
+            local d = nocParts[i]
+            if d.CanCollide then d.CanCollide = false end
+        end
     end
 end)
 
@@ -496,14 +532,15 @@ end
 
 local function isCandy(d)
     if not d:IsA("BasePart") then return false end
-    if d.Transparency >= 0.99 then return false end
     if d.CanTouch == false then return false end
+    if d.Transparency >= 0.99 then return false end
     local id = d:GetAttribute("CoinID")
     if id then return id == "Candy" end
-    local n = d.Name:lower()
-    if not (n:find("candy", 1, true) or n:find("coin", 1, true)) then return false end
+    local n = d.Name
+    if not (n:find("andy", 1, true) or n:find("ANDY", 1, true)
+         or n:find("oin", 1, true) or n:find("OIN", 1, true)) then return false end
     local s = d.Size
-    if math.max(s.X, s.Y, s.Z) > CFG.MaxSize then return false end
+    if math.max(s.X, s.Y, s.Z) > MAX_SIZE then return false end
     local m = d:FindFirstAncestorOfClass("Model")
     if m and P:GetPlayerFromCharacter(m) then return false end
     return true
@@ -523,16 +560,44 @@ local candyCacheAt = 0
 
 local function findCandy(force)
     local now = os.clock()
-    if not force and (now - candyCacheAt) < CFG.CandyTTL then
+    if not force and (now - candyCacheAt) < CANDY_TTL then
         return candyCache
     end
     candyCacheAt = now
 
     local scope = getContainer()
     local out = {}
-    for _, d in ipairs(scope:GetDescendants()) do
-        if isCandy(d) then out[#out + 1] = d end
+    local n = 0
+
+    -- a flat container is fully covered by GetChildren, which is far cheaper
+    -- than GetDescendants (no table for the whole subtree)
+    local kids = scope:GetChildren()
+    local flat = true
+    for i = 1, #kids do
+        local c = kids[i]
+        if c:IsA("Model") or c:IsA("Folder") then
+            flat = false
+            break
+        end
     end
+
+    if flat then
+        for i = 1, #kids do
+            local d = kids[i]
+            if isCandy(d) then
+                n = n + 1
+                out[n] = d
+            end
+        end
+    else
+        for _, d in ipairs(scope:GetDescendants()) do
+            if isCandy(d) then
+                n = n + 1
+                out[n] = d
+            end
+        end
+    end
+
     candyCache = out
     return out
 end
@@ -547,7 +612,7 @@ local function grab(part, hrp)
     if not part or not part.Parent or not hrp or not hrp.Parent then return "gone" end
 
     local dist = (part.Position - hrp.Position).Magnitude
-    local dur = math.max(dist / CFG.Tween, 0.02)
+    local dur = math.max(dist / TWEEN_SPEED, 0.02)
 
     local tw = TS:Create(hrp,
         TweenInfo.new(dur, Enum.EasingStyle.Linear),
@@ -579,7 +644,7 @@ local function grab(part, hrp)
 
     if dead then
         -- how close were we when it went? inside reach = our touch did it
-        if (hrp.Position - part.Position).Magnitude <= CFG.TouchRange then
+        if (hrp.Position - part.Position).Magnitude <= TOUCH_RANGE then
             return "hit"
         end
         return "stolen"
@@ -673,8 +738,12 @@ local lockVal = 0
 local lockAnchor = 0
 local verify = nil
 local verifyFails = 0
-local blacklist = {}   -- name -> clock time until which it is ignored
+local blacklist = {}
 local dbgAt = 0
+
+-- reused across scans so no per-scan table allocations
+local attrHolders = { { "me", lp }, { "char", nil } }
+local scoreSeen, scoreOut = {}, {}
 
 local function isOurs(d) return d:IsDescendantOf(gui) end
 local function keyOf(c) return c.kind .. "|" .. c.name end
@@ -684,12 +753,12 @@ local function blocked(n)
 end
 
 local function candyScore(s)
-    local n = tostring(s):lower()
-    if n:find("candies2026", 1, true) then return 100 end
-    if n:find("candies", 1, true) or n:find("candy", 1, true) then return 90 end
-    if n:find("halloween", 1, true) then return 60 end
-    if n:find("bag", 1, true) then return 50 end
-    if n:find("coin", 1, true) then return 30 end
+    local l = s:lower()
+    if l:find("candies2026", 1, true) then return 100 end
+    if l:find("candies", 1, true) or l:find("candy", 1, true) then return 90 end
+    if l:find("halloween", 1, true) then return 60 end
+    if l:find("bag", 1, true) then return 50 end
+    if l:find("coin", 1, true) then return 30 end
     return 0
 end
 
@@ -710,18 +779,22 @@ local function extractCount(text)
     if type(text) ~= "string" then return nil end
     local t = text:gsub(",", "")
     if #t > 64 then return nil end
-    local nums = {}
+    local n1, n2, last
     for tok in t:gmatch("%d+%.?%d*[KkMmBb]?") do
         local v = parseNum(tok)
-        if v then nums[#nums + 1] = v end
+        if v then
+            if n1 == nil then n1 = v elseif n2 == nil then n2 = v end
+            last = v
+        end
     end
-    if #nums == 0 then return nil end
-    if #nums >= 2 and t:find("/") then
-        return math.floor(nums[1]), math.floor(nums[2])
+    if n1 == nil then return nil end
+    if n2 ~= nil and t:find("/") then
+        return math.floor(n1), math.floor(n2)
     end
-    return math.floor(nums[#nums]), nil
+    return math.floor(last), nil
 end
 
+-- single reusable push target, reset per scan
 local function scanCands()
     local seen, out = {}, {}
     local function push(c)
@@ -737,45 +810,67 @@ local function scanCands()
         end
     end
 
-    for _, h in ipairs({ { "me", lp }, { "char", lp.Character } }) do
+    -- attributes on the player and the character
+    attrHolders[2][2] = lp.Character
+    for i = 1, 2 do
+        local h = attrHolders[i]
         local obj = h[2]
         if obj then
             for k, v in pairs(obj:GetAttributes()) do
-                if type(v) == "number" and candyScore(k) > 0 then
-                    push({ kind = "attr", ref = k, obj = obj,
-                           name = ("attr(%s):%s"):format(h[1], k),
-                           score = candyScore(k) })
+                if type(v) == "number" then
+                    local sc = candyScore(k)
+                    if sc > 0 then
+                        push({ kind = "attr", ref = k, obj = obj,
+                               name = ("attr(%s):%s"):format(h[1], k), score = sc })
+                    end
                 end
             end
         end
     end
 
-    for _, c in ipairs(lp:GetDescendants()) do
-        if c:IsA("ValueBase") and candyScore(c.Name) > 0 then
-            push({ kind = "val", ref = c, name = "val:" .. c:GetFullName(),
-                   score = candyScore(c.Name) })
-        end
-    end
-
-    local ls = lp:FindFirstChild("leaderstats")
-    if ls then
-        for _, c in ipairs(ls:GetChildren()) do
-            if c:IsA("ValueBase") and candyScore(c.Name) > 0 then
-                push({ kind = "val", ref = c, name = "stats:" .. c.Name,
-                       score = candyScore(c.Name) + 5 })
+    -- ValueBase anywhere on the player, skipping PlayerGui (already walked below)
+    for _, child in ipairs(lp:GetChildren()) do
+        if child ~= pg then
+            if child:IsA("ValueBase") then
+                local sc = candyScore(child.Name)
+                if sc > 0 then
+                    push({ kind = "val", ref = child, name = "val:" .. child.Name, score = sc })
+                end
+            end
+            for _, c in ipairs(child:GetDescendants()) do
+                if c:IsA("ValueBase") then
+                    local sc = candyScore(c.Name)
+                    if sc > 0 then
+                        push({ kind = "val", ref = c, name = "val:" .. c:GetFullName(), score = sc })
+                    end
+                end
             end
         end
     end
 
-    for _, d in ipairs(pg:GetDescendants()) do
-        if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
-            local sc = math.max(candyScore(d.Name), candyScore(d.Text))
-            if sc > 0 then
-                local a, b = extractCount(d.Text)
-                if a and (not b or b >= CFG.MinCap) then
-                    push({ kind = "gui", ref = d, name = "gui:" .. d:GetFullName(),
-                           score = sc, max = b })
-                end
+    -- labels: walk PlayerGui root by root, skipping our own window entirely
+    local function consider(d)
+        if not (d:IsA("TextLabel") or d:IsA("TextButton")) then return end
+        if not d.Visible then return end
+        local txt = d.Text
+        local sc = candyScore(d.Name)
+        if #txt <= TEXT_CAP then
+            local ts = candyScore(txt)
+            if ts > sc then sc = ts end
+        end
+        if sc > 0 then
+            local a, b = extractCount(txt)
+            if a and (not b or b >= CFG.MinCap) then
+                push({ kind = "gui", ref = d, name = "gui:" .. d:GetFullName(), score = sc, max = b })
+            end
+        end
+    end
+
+    for _, root in ipairs(pg:GetChildren()) do
+        if root ~= gui then
+            if not (root:IsA("ScreenGui") and not root.Enabled) then
+                consider(root)
+                for _, d in ipairs(root:GetDescendants()) do consider(d) end
             end
         end
     end
@@ -785,19 +880,27 @@ end
 
 local function readCand(c)
     if c.kind == "attr" then
-        if c.obj and c.obj.Parent then
-            local v = c.obj:GetAttribute(c.ref)
+        local obj = c.obj
+        if obj and obj.Parent then
+            local v = obj:GetAttribute(c.ref)
             if type(v) == "number" then return v end
         end
         return nil
     elseif c.kind == "val" then
-        if c.ref and c.ref.Parent then return tonumber(c.ref.Value) end
+        local r = c.ref
+        if r and r.Parent then return tonumber(r.Value) end
         return nil
     elseif c.kind == "gui" then
-        if c.ref and c.ref.Parent and c.ref.Visible then
-            local a, b = extractCount(c.ref.Text)
-            if b then c.max = b end
-            return a
+        local r = c.ref
+        if r and r.Parent and r.Visible then
+            local txt = r.Text
+            if txt ~= c.txt then
+                c.txt = txt
+                local a, b = extractCount(txt)
+                c.cached = a
+                if b then c.max = b end
+            end
+            return c.cached
         end
         return nil
     end
@@ -815,11 +918,21 @@ local function readBag()
 end
 
 local function bagBanner()
-    for _, d in ipairs(pg:GetDescendants()) do
-        if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
-            local t = d.Text:lower()
-            if #t < 40 and t:find("bag", 1, true) and t:find("full", 1, true) then
-                return d.Text
+    local function chk(d)
+        if not (d:IsA("TextLabel") or d:IsA("TextButton")) then return nil end
+        if not d.Visible then return nil end
+        local t = d.Text:lower()
+        if #t < 40 and t:find("bag", 1, true) and t:find("full", 1, true) then
+            return d.Text
+        end
+    end
+    for _, root in ipairs(pg:GetChildren()) do
+        if root ~= gui then
+            local hit = chk(root)
+            if hit then return hit end
+            for _, d in ipairs(root:GetDescendants()) do
+                local h = chk(d)
+                if h then return h end
             end
         end
     end
@@ -869,13 +982,29 @@ local function bagIsFull()
     return false
 end
 
+-- does this candidate behave like a candy counter?
+local function verdict(c, now)
+    local p = c.probe
+    if not p then return false, "no probe" end
+    if not p.done then return false, "observing" end
+    local ds = selfCount - p.s0
+    local rate = p.delta / math.max(now - p.t0, 0.5)
+    if p.hits < CFG.MinHits then return false, "quiet" end
+    if ds < 1 then return false, "no picks" end
+    if rate > CFG.MaxRate then return false, ("rate %.1f/s"):format(rate) end
+    if p.maxJump > CFG.JumpMax then return false, ("jump %d"):format(p.maxJump) end
+    if p.delta < ds * CFG.CorrelLow then return false, ("low %d vs %d picks"):format(p.delta, ds) end
+    if p.delta > ds * CFG.CorrelHigh + CFG.Slack then return false, ("high %d vs %d picks"):format(p.delta, ds) end
+    return true, ("tracks %d picks"):format(ds)
+end
+
 safeLoop("candywatch", function()
     task.wait(0.2)
     local now = os.clock()
 
-    -- rescan the candidate set
+    -- rescan the candidate set (rarely once a source is locked)
     if now >= candNextScan then
-        candNextScan = now + CFG.SourceScan
+        candNextScan = now + (activeSrc and CFG.SourceScanLocked or CFG.SourceScan)
         local prev = {}
         for _, c in ipairs(cands) do prev[keyOf(c)] = c end
         local fresh = scanCands()
@@ -914,29 +1043,13 @@ safeLoop("candywatch", function()
         end
     end
 
-    -- does this candidate behave like a candy counter?
-    local function verdict(c)
-        local p = c.probe
-        if not p then return false, "no probe" end
-        if not p.done then return false, "observing" end
-        local ds = selfCount - p.s0
-        local rate = p.delta / math.max(now - p.t0, 0.5)
-        if p.hits < CFG.MinHits then return false, "quiet" end
-        if ds < 1 then return false, "no picks" end
-        if rate > CFG.MaxRate then return false, ("rate %.1f/s"):format(rate) end
-        if p.maxJump > CFG.JumpMax then return false, ("jump %d"):format(p.maxJump) end
-        if p.delta < ds * CFG.CorrelLow then return false, ("low %d vs %d picks"):format(p.delta, ds) end
-        if p.delta > ds * CFG.CorrelHigh + CFG.Slack then return false, ("high %d vs %d picks"):format(p.delta, ds) end
-        return true, ("tracks %d picks"):format(ds)
-    end
-
     if CFG.Debug and now >= dbgAt then
         dbgAt = now + 10
         local lines = {}
         for _, c in ipairs(cands) do
             local p = c.probe
             local rate = p and p.delta / math.max(now - p.t0, 0.5) or 0
-            local ok, why = verdict(c)
+            local ok, why = verdict(c, now)
             lines[#lines + 1] = ("%s v=%s rate=%.1f jump=%s delta=%s -> %s%s")
                 :format(c.name, tostring(c.cur), rate,
                         p and tostring(p.maxJump) or "-",
@@ -966,7 +1079,7 @@ safeLoop("candywatch", function()
             local best, bs, br
             for _, c in ipairs(cands) do
                 if c.cur ~= nil and not blocked(c.name) then
-                    local ok, why = verdict(c)
+                    local ok, why = verdict(c, now)
                     if ok and c.score > (bs or -1) then best, bs, br = c, c.score, why end
                 end
             end
@@ -1117,35 +1230,52 @@ local function farmStep()
     end
 
     local list = findCandy()
-    if #list == 0 then lastGrabAt = now task.wait(0.25) return end
+    local count = #list
+    if count == 0 then lastGrabAt = now task.wait(0.25) return end
 
+    -- squared-distance maths, origin hoisted out of the loop
     local near, band = {}, {}
-    for _, c in ipairs(list) do
+    local nn, nb = 0, 0
+    local hp = hrp.Position
+    local hx, hy, hz = hp.X, hp.Y, hp.Z
+    local r2 = RADIUS * RADIUS
+    local bmin2 = BAND_MIN * BAND_MIN
+    local bmax2 = BAND_MAX * BAND_MAX
+
+    for i = 1, count do
+        local c = list[i]
         local v = visited[c]
-        if not (v and (now - v) < CFG.Revisit) then
-            local d = (c.Position - hrp.Position).Magnitude
-            if d <= CFG.Radius then
-                near[#near + 1] = c
-                if d >= CFG.BandMin and d <= CFG.BandMax then
-                    band[#band + 1] = c
+        if not (v and (now - v) < REVISIT) then
+            local p = c.Position
+            local dx, dy, dz = p.X - hx, p.Y - hy, p.Z - hz
+            local d2 = dx * dx + dy * dy + dz * dz
+            if d2 <= r2 then
+                nn = nn + 1
+                near[nn] = c
+                if d2 >= bmin2 and d2 <= bmax2 then
+                    nb = nb + 1
+                    band[nb] = c
                 end
             end
         end
     end
 
     local target
-    if firstGrab and #near > 0 then
-        target = near[math.random(1, #near)]
+    if firstGrab and nn > 0 then
+        target = near[math.random(1, nn)]
         firstGrab = false
-    elseif #band > 0 then
-        target = band[math.random(1, #band)]
+    elseif nb > 0 then
+        target = band[math.random(1, nb)]
     else
-        local bd
-        for _, c in ipairs(list) do
+        local bd2
+        for i = 1, count do
+            local c = list[i]
             local v = visited[c]
-            if not (v and (now - v) < CFG.Revisit) then
-                local d = (c.Position - hrp.Position).Magnitude
-                if not bd or d < bd then target, bd = c, d end
+            if not (v and (now - v) < REVISIT) then
+                local p = c.Position
+                local dx, dy, dz = p.X - hx, p.Y - hy, p.Z - hz
+                local d2 = dx * dx + dy * dy + dz * dz
+                if not bd2 or d2 < bd2 then target, bd2 = c, d2 end
             end
         end
     end
@@ -1181,6 +1311,8 @@ end
 safeLoop("farm", farmStep)
 
 --==================== WATCHDOG ====================
+local nocCompactAt = os.clock() + CFG.NocCompact
+
 safeLoop("watch", function()
     task.wait(0.25)
 
@@ -1226,23 +1358,23 @@ safeLoop("watch", function()
         stalls = stalls + 1
         print("[MM2] stall watchdog - cleared targets")
     end
+
+    -- periodically drop destroyed parts out of the noclip list
+    if alive and os.clock() >= nocCompactAt then
+        nocCompactAt = os.clock() + CFG.NocCompact
+        if lp.Character then rebuildNoc(lp.Character) end
+    end
 end)
 
 --==================== BOX ====================
-local function visibleButtons()
-    local out = {}
-    for _, d in ipairs(pg:GetDescendants()) do
-        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
-            out[#out + 1] = d
-        end
-    end
-    return out
-end
-
+-- scans the game's GUI only (our own buttons live in `gui` and would otherwise
+-- match "open" and swallow the click)
 local function clickKeyword(kws)
-    for _, b in ipairs(visibleButtons()) do
-        local label = b.Name .. " "
-        if b:IsA("TextButton") then label = label .. b.Text end
+    local function try(b)
+        if not (b:IsA("TextButton") or b:IsA("ImageButton")) then return nil end
+        if not b.Visible then return nil end
+        local label = b.Name
+        if b:IsA("TextButton") then label = label .. " " .. b.Text end
         label = label:lower()
         for _, k in ipairs(kws) do
             if label:find(k, 1, true) then
@@ -1254,6 +1386,17 @@ local function clickKeyword(kws)
                     end
                 end)
                 return b
+            end
+        end
+    end
+
+    for _, root in ipairs(pg:GetChildren()) do
+        if root ~= gui then
+            local hit = try(root)
+            if hit then return hit end
+            for _, d in ipairs(root:GetDescendants()) do
+                local h = try(d)
+                if h then return h end
             end
         end
     end
@@ -1395,45 +1538,59 @@ local function stateLine()
 end
 
 task.spawn(function()
-    while task.wait(0.4) do
+    local lastFrac, lastDot, lastHn, lastHb, lastHs = -1, nil, "", "", ""
+
+    while task.wait(CFG.StatsTick) do
         local ok, err = pcall(function()
             local run = os.clock() - started
-            local bagLine, frac = "reading game...", 0
+            local frac = 0
 
-            local cur, max, src = readBag()
+            local cur, max = readBag()
             if cur then
-                bagLine = (max and ("%d/%d"):format(cur, max) or tostring(cur)) .. " " .. tostring(src or "")
                 if max and max > 0 then frac = math.clamp(cur / max, 0, 1) end
             elseif learnedMax then
-                bagLine = "cap " .. learnedMax
                 frac = math.clamp((picked - pickedAtReset) / learnedMax, 0, 1)
             end
 
-            local age = os.clock() - lastGrabAt
-            local tickAge = age < 60 and ("%.1fs ago"):format(age) or ("%.0fm ago"):format(age / 60)
+            -- while the window is hidden, skip every Text write (layout is the
+            -- expensive part, not the string)
+            if win.Visible then
+                local age = os.clock() - lastGrabAt
+                local tickAge = age < 60 and ("%.1fs ago"):format(age) or ("%.0fm ago"):format(age / 60)
 
-            stats.Text = string.format(
-                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nresets : %d  full:%d/%d %s\nuptime : %02d:%02d  per/hr:%.0f",
-                stateLine(), roundActive and "active" or "none",
-                tickAge, stalls,
-                resets, fullStreak, CFG.FullConfirm, lastFullReason,
-                run // 60, run % 60,
-                picked / math.max(run / 3600, 0.0001))
+                stats.Text = string.format(
+                    "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nresets : %d  full:%d/%d %s\nuptime : %02d:%02d  per/hr:%.0f",
+                    stateLine(), roundActive and "active" or "none",
+                    tickAge, stalls,
+                    resets, fullStreak, CFG.FullConfirm, lastFullReason,
+                    run // 60, run % 60,
+                    picked / math.max(run / 3600, 0.0001))
 
-            heroNum.Text = "~" .. tostring(picked)
-            heroBoxes.Text = tostring(boxes)
+                local hn = "~" .. tostring(picked)
+                if hn ~= lastHn then lastHn = hn heroNum.Text = hn end
 
-            if bagConfirmed then
-                heroSub.Text = ("src %s  raw %d  srcPicked %d  self %d")
-                    :format(bagSrcLabel, balance, srcPicked, selfCount)
-            else
-                heroSub.Text = ("self %d  attempts %d  hunting source"):format(selfCount, attempts)
+                local hb = tostring(boxes)
+                if hb ~= lastHb then lastHb = hb heroBoxes.Text = hb end
+
+                local hs
+                if bagConfirmed then
+                    hs = ("src %s  raw %d  srcPicked %d  self %d")
+                        :format(bagSrcLabel, balance, srcPicked, selfCount)
+                else
+                    hs = ("self %d  attempts %d  hunting source"):format(selfCount, attempts)
+                end
+                if hs ~= lastHs then lastHs = hs heroSub.Text = hs end
+
+                local dc = resetting and T.orange
+                    or (alive and roundActive and T.green or (alive and T.purple or T.red))
+                if dc ~= lastDot then lastDot = dc dot.BackgroundColor3 = dc end
             end
 
-            TS:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(frac, 0, 1, 0) }):Play()
-
-            dot.BackgroundColor3 = resetting and T.orange
-                or (alive and roundActive and T.green or (alive and T.purple or T.red))
+            -- only build a Tween when the bar actually moves
+            if math.abs(frac - lastFrac) > 0.005 then
+                lastFrac = frac
+                TS:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(frac, 0, 1, 0) }):Play()
+            end
         end)
         if not ok then print("[MM2] stats error: " .. tostring(err)) end
     end
