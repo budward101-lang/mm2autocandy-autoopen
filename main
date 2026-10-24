@@ -829,10 +829,12 @@ end
 
 --==================== BAG PROMPT (bottom-right counter) ====================
 -- Only a label whose name (or a close ancestor) contains CFG.BagName counts.
--- A label is preferred if its "/cap" matches BagSize and if its value is small
--- (a live 4/50 beats a static 50/50 capacity plate).
+-- A label that never changes (a static plate) is heavily de-prioritised, and a
+-- label whose value tracks our own pickups is preferred.
 local bagPrompt, bagPromptAt = nil, 0
 local lastPromptVal, promptMoved = nil, false
+local promptTrack = setmetatable({}, { __mode = "k" })   -- label -> {last, moved}
+local promptDumpAt = 0
 
 local function nameHasBag(n)
     local s = tostring(n):lower()
@@ -845,10 +847,13 @@ end
 
 local function findBagPrompt()
     local now = os.clock()
-    if bagPrompt and bagPrompt.Parent and (now - bagPromptAt) < 0.5 then return bagPrompt end
+    if bagPrompt and bagPrompt.Parent and (now - bagPromptAt) < 0.2 then return bagPrompt end
     bagPromptAt = now
 
+    local selfHeld = selfCount - selfAtReset
     local best, bestScore
+    local dump
+
     for _, d in ipairs(pg:GetDescendants()) do
         if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
             local a, b = extractCount(d.Text)
@@ -868,16 +873,39 @@ local function findBagPrompt()
                     end
                 end
                 if nm > 0 then
+                    -- track whether this label is actually live
+                    local tr = promptTrack[d]
+                    if not tr then
+                        tr = { last = a, moved = false }
+                        promptTrack[d] = tr
+                    elseif tr.last ~= a then
+                        tr.moved = true
+                        tr.last = a
+                    end
+
                     local score = nm * 10000
+                    if tr.moved then score = score + 5000 end            -- live beats static
                     if b and CFG.BagSize > 0 and b == CFG.BagSize then score = score + 2000 end
                     if b then score = score + 100 end
-                    score = score - math.min(a, 999)   -- live/small reading wins
+                    score = score - math.min(math.abs(a - selfHeld), 400) * 4  -- matches our pickups
+
+                    if CFG.Debug then
+                        dump = dump or {}
+                        dump[#dump + 1] = ("[%s] txt=[%s] moved=%s score=%d")
+                            :format(d:GetFullName(), tostring(d.Text), tostring(tr.moved), score)
+                    end
+
                     if not bestScore or score > bestScore then
                         best, bestScore = d, score
                     end
                 end
             end
         end
+    end
+
+    if CFG.Debug and dump and now >= promptDumpAt then
+        promptDumpAt = now + 10
+        print("[MM2] bag candidates:\n  " .. table.concat(dump, "\n  "))
     end
 
     if best and best ~= bagPrompt then
@@ -1554,16 +1582,23 @@ task.spawn(function()
             local bagLine, frac = "reading game...", 0
 
             local cur, max, src = readBagPrompt()
-            if cur then
+            local tr = bagPrompt and promptTrack[bagPrompt]
+            local live = (tr ~= nil and tr.moved == true)
+            local selfHeld = selfCount - selfAtReset
+
+            if cur and live then
                 bagLine = (max and ("%d/%d"):format(cur, max) or tostring(cur)) .. "  " .. tostring(src or "")
-                if max and max > 0 then frac = math.clamp(cur / max, 0, 1) end
+                if max and max > 0 then
+                    frac = math.clamp(cur / max, 0, 1)
+                else
+                    frac = math.clamp(cur / CFG.BagSize, 0, 1)
+                end
                 heroNum.Text = tostring(cur)
             else
-                bagLine = "no bag prompt found"
-                heroNum.Text = "~" .. tostring(selfCount)
-                if CFG.BagSize > 0 then
-                    frac = math.clamp((selfCount - selfAtReset) / CFG.BagSize, 0, 1)
-                end
+                bagLine = (cur and ("static %d"):format(cur) or "no live bag label")
+                    .. ("  self %d"):format(selfHeld)
+                heroNum.Text = "~" .. tostring(selfHeld)
+                frac = math.clamp(selfHeld / CFG.BagSize, 0, 1)
             end
 
             local age = os.clock() - lastGrabAt
@@ -1579,7 +1614,7 @@ task.spawn(function()
 
             heroBoxes.Text = tostring(boxes)
             heroSub.Text = ("self %d  attempts %d  this life %d")
-                :format(selfCount, attempts, selfCount - selfAtReset)
+                :format(selfCount, attempts, selfHeld)
 
             TS:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(frac, 0, 1, 0) }):Play()
 
