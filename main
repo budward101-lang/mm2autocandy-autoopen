@@ -5,7 +5,7 @@
 --============================================================
 
 local CFG = {
-    Tween = 35, -- studs per second (raise toward 50-60 if you want it even faster)
+    Tween = 25, -- studs per second (raise toward 50-60 if you want it even faster)
     Hold = 0, -- extra settle after landing (0 = none)
     Revisit = 2.5, -- secs before a candy can be picked again
     Radius = 120, -- outer pick range
@@ -19,6 +19,8 @@ local CFG = {
     Pay = "Candies2026", -- arg 3 (currency)
     TouchRange = 2.5, -- studs: a candy dying inside this radius counts as yours
     PickRadius = 4.5, -- studs: register candies this close so passing pickups count
+    FaceYaw = 0, -- degrees: body stays locked facing this way (0 = straight)
+    RigidPose = true, -- freeze the body dead straight (no flailing fall anim)
 
     -- reset behaviour
     AutoReset = false,       -- old "guess the bag hit 50" logic (now OFF)
@@ -454,6 +456,20 @@ local function syncPicked()
     picked = shownCount()
 end
 
+-- keep the body locked dead straight: no auto-turn, no flailing fall anim
+local function stiffen(hum)
+    if not hum then return end
+    pcall(function() hum.AutoRotate = false end)
+    if CFG.RigidPose then
+        pcall(function()
+            hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+            hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+            hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+            hum.PlatformStand = true
+        end)
+    end
+end
+
 --==================== NOCLIP ====================
 local nocParts = {}
 local nocChar
@@ -560,6 +576,11 @@ clearTarget = function()
     if lastTween then pcall(function() lastTween:Cancel() end) lastTween = nil end
 end
 
+-- body stays dead straight the whole time: fixed yaw, zero tilt
+local function faceCFrame(pos)
+    return CFrame.new(pos) * CFrame.Angles(0, math.rad(CFG.FaceYaw), 0)
+end
+
 -- Fly onto the candy, confirm the pickup, then leave.
 -- Outcomes:
 --   "gone"   -> already dead before we moved     (nobody's pickup)
@@ -572,9 +593,12 @@ local function grab(part, hrp)
     local dist = (part.Position - hrp.Position).Magnitude
     local dur = math.max(dist / CFG.Tween, 0.02)
 
+    -- snap the body straight, then tween position only (rotation already fixed)
+    hrp.CFrame = faceCFrame(hrp.Position)
+
     local tw = TS:Create(hrp,
         TweenInfo.new(dur, Enum.EasingStyle.Linear),
-        { CFrame = CFrame.new(part.Position) })
+        { CFrame = faceCFrame(part.Position) })
     lastTween = tw
     tw:Play()
 
@@ -1242,6 +1266,7 @@ local function onSpawned(ch)
             boundHum = hum
             pcall(function() hum.Died:Connect(onDied) end)
         end
+        stiffen(hum)   -- lock the body straight on spawn
     end)
 end
 
@@ -1383,6 +1408,11 @@ safeLoop("watch", function()
         if boundHum ~= hum then
             boundHum = hum
             pcall(function() hum.Died:Connect(onDied) end)
+        end
+
+        -- re-assert the straight lock if the game pokes it back
+        if hum.AutoRotate or (CFG.RigidPose and not hum.PlatformStand) then
+            stiffen(hum)
         end
 
         local h = hum.Health > 0
