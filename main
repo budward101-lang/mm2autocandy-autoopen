@@ -18,14 +18,14 @@ local CFG = {
     BoxType = "MysteryBox", -- arg 2
     Pay = "Candies2026", -- arg 3 (currency)
     TouchRange = 2.5, -- studs: a candy dying inside this radius counts as yours
+    PickRadius = 4.5, -- studs: register candies this close so passing pickups count
 
     -- full bag handling
     AutoReset = true, -- reset character when the bag is full
     BagSize = 50, -- bag cap. Set to 49 to reset a hair early (avoids the full-bag freeze)
+    BagName = "bag", -- substring the bag prompt / its parent must contain (bag, coin_bag, candy_bag...)
     BagMinCap = 20, -- a bag cap is never this small; kills "4/4" junk readings
-    PopupMin = 20, -- min pickups before a "Bag Full" popup alone can trip a reset
     UseBagGui = true, -- read the counter off the bag prompt / attributes / values / GUI
-    UseBanner = true, -- extra "bag full" text check
     UseLog = true, -- read the cap and the collected total off the game log / output
     MinCap = 5, -- ignore x/y labels whose capacity is smaller than this
     MinPicks = 3, -- must bank this many this life before a reset can trip
@@ -35,7 +35,6 @@ local CFG = {
     Settle = 0.8, -- grace after respawn before farming again
     RoundGrace = 3, -- secs of no candies before a round counts as over
     Stall = 10, -- secs of no grabs = clear targets and retarget
-    TweenSlack = 1.5, -- extra secs before a glide is declared stuck
     PickupWait = 0.6, -- secs before an unconfirmed pickup counts as a miss
 
     -- PERF TUNING
@@ -412,6 +411,8 @@ local lastSeen = 0
 
 local visited = {}
 local pending = {}   -- pickups fired, awaiting confirmation
+local nearWatch = {} -- part -> time we got close (for pass-through pickups)
+local counted = setmetatable({}, { __mode = "k" })
 local firstGrab = true
 local resetting, resets, failStreak, pickedAtReset = false, 0, 0, 0
 local selfAtReset = 0  -- selfCount at the last reset (exact per-life pickups)
@@ -427,8 +428,19 @@ local balance   = 0   -- raw value of the trusted source
 local bagConfirmed = false
 local bagSrcLabel = "none"
 
--- forward declarations (these are referenced by functions defined earlier)
+-- forward declarations (referenced by functions defined earlier)
 local doReset
+
+-- count a pickup exactly once, whoever it came from
+local function bump(part)
+    if not part or counted[part] then return false end
+    counted[part] = true
+    selfCount = selfCount + 1
+    attempts = attempts + 1
+    failStreak = 0
+    syncPicked()
+    return true
+end
 
 -- Once a source has passed verification the game's own counter is the honest
 -- number, so prefer it. selfCount stays as the floor and as the anti-runaway
@@ -626,10 +638,7 @@ local function settlePending()
     while i <= n do
         local p = pending[i]
         if isDead(p.part) then
-            selfCount = selfCount + 1
-            attempts = attempts + 1
-            failStreak = 0
-            syncPicked()
+            bump(p.part)
             table.remove(pending, i)
             n = n - 1
         elseif (now - p.at) > CFG.PickupWait then
@@ -819,13 +828,15 @@ local function readCand(c)
 end
 
 --==================== BAG PROMPT (bottom-right counter) ====================
--- Looks for a GuiObject whose name (or a close ancestor) contains bag/bucket/sack
--- and whose text parses as a counter. This is the authoritative bag reading.
+-- Only a label whose name (or a close ancestor) contains CFG.BagName counts.
+-- A label is preferred if its "/cap" matches BagSize and if its value is small
+-- (a live 4/50 beats a static 50/50 capacity plate).
 local bagPrompt, bagPromptAt = nil, 0
+local lastPromptVal, promptMoved = nil, false
 
 local function nameHasBag(n)
     local s = tostring(n):lower()
-    if s:find("bag", 1, true) then return true end
+    if s:find(CFG.BagName:lower(), 1, true) then return true end
     if s:find("bucket", 1, true) then return true end
     if s:find("sack", 1, true) then return true end
     if s:find("pumpkin", 1, true) then return true end
@@ -857,8 +868,10 @@ local function findBagPrompt()
                     end
                 end
                 if nm > 0 then
-                    local score = nm * 1000 + (b and 100 or 0)
-                    if b and b >= CFG.BagMinCap then score = score + 500 end
+                    local score = nm * 10000
+                    if b and CFG.BagSize > 0 and b == CFG.BagSize then score = score + 2000 end
+                    if b then score = score + 100 end
+                    score = score - math.min(a, 999)   -- live/small reading wins
                     if not bestScore or score > bestScore then
                         best, bestScore = d, score
                     end
@@ -879,6 +892,8 @@ local function readBagPrompt()
     if not d or not d.Parent or not d.Visible then return nil end
     local a, b = extractCount(d.Text)
     if not a then return nil end
+    if lastPromptVal ~= nil and a ~= lastPromptVal then promptMoved = true end
+    lastPromptVal = a
     return a, b, "prompt:" .. d.Name
 end
 
@@ -899,6 +914,8 @@ end
 -- Two signals: a bag reading ("37/50") and a collected total ("collected 128").
 local logCur, logMax, logAt = nil, nil, 0
 local logTotal, logTotalAt = nil, 0
+local logMoved = false
+local lastLogVal = nil
 
 local function noteLog(text)
     if not CFG.UseLog then return end
@@ -912,6 +929,8 @@ local function noteLog(text)
     if m1 and m2 then
         local a, b = tonumber(m1), tonumber(m2)
         if b and b >= CFG.BagMinCap and a <= b then
+            if lastLogVal ~= nil and a ~= lastLogVal then logMoved = true end
+            lastLogVal = a
             logCur, logMax, logAt = a, b, os.clock()
             learnedMax = b
         end
@@ -944,21 +963,6 @@ pcall(function()
 end)
 
 --==================== BAG FULL DETECTION ====================
-local function fullPopup()
-    for _, d in ipairs(pg:GetDescendants()) do
-        if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
-            local t = d.Text:lower()
-            if #t > 0 and #t < 48 and t:find("full", 1, true) then
-                if t:find("bag", 1, true) or t:find("bucket", 1, true)
-                or t:find("candy", 1, true) or t:find("candies", 1, true)
-                or t:find("treat", 1, true) then
-                    return d.Text
-                end
-            end
-        end
-    end
-end
-
 local function bagIsFull()
     if not CFG.AutoReset then fullStreak = 0 return false end
     if (os.clock() - spawnedAt) < CFG.BagGrace then fullStreak = 0 return false end
@@ -969,30 +973,23 @@ local function bagIsFull()
 
     local reason
 
-    -- 1) authoritative: the bag prompt / live counter vs its own cap
-    local cur, max, src = readBag()
-    if cur and max and max >= CFG.BagMinCap then
-        learnedMax = max
-        if cur >= max then reason = ("%d/%d via %s"):format(cur, max, src) end
-    elseif cur and learnedMax and learnedMax >= CFG.BagMinCap and cur >= learnedMax then
-        reason = ("%d/%d via %s (learned)"):format(cur, learnedMax, src)
+    -- 1) the bag prompt: must be a live (changing) counter with the right cap
+    if CFG.UseBagGui then
+        local cur, max, src = readBag()
+        if cur and max and max == CFG.BagSize and promptMoved and cur >= max then
+            reason = ("prompt %d/%d"):format(cur, max)
+        end
     end
 
-    -- 2) exact confirmed-pickup fallback
+    -- 2) our own confirmed pickups hit the cap (works with no prompt at all)
     if not reason and CFG.BagSize > 0 and selfHeld >= CFG.BagSize then
         reason = ("picks %d/%d"):format(selfHeld, CFG.BagSize)
     end
 
-    -- 3) game log
-    if not reason and logCur and (os.clock() - logAt) < 3
-    and logMax and logMax >= CFG.BagMinCap and logCur >= logMax then
+    -- 3) game log, same strictness
+    if not reason and logCur and logMax and logMax == CFG.BagSize and logMoved
+    and (os.clock() - logAt) < 3 and logCur >= logMax then
         reason = ("log %d/%d"):format(logCur, logMax)
-    end
-
-    -- 4) "Bag Full" popup (last resort, needs real progress behind it)
-    if not reason and CFG.UseBanner then
-        local p = fullPopup()
-        if p and selfHeld >= CFG.PopupMin then reason = "popup: " .. p end
     end
 
     if reason then
@@ -1000,7 +997,7 @@ local function bagIsFull()
         fullStreak = fullStreak + 1
         if fullStreak >= CFG.FullConfirm then
             fullStreak = 0
-            return true, reason
+            return true, ("%s [self %d]"):format(reason, selfHeld)
         end
     else
         fullStreak = 0
@@ -1184,6 +1181,7 @@ local function onDied()
     alive = false
     visited = {}
     pending = {}
+    nearWatch = {}
     failStreak = 0
     fullStreak = 0
     say(roundActive and "dead in round - idling" or "dead - idling")
@@ -1193,6 +1191,7 @@ local function onSpawned(ch)
     spawnedAt = os.clock()
     fullStreak = 0
     pending = {}
+    nearWatch = {}
     rebuildNoc(ch)
     task.spawn(function()
         local hum = ch:FindFirstChildOfClass("Humanoid") or ch:WaitForChild("Humanoid", 6)
@@ -1253,6 +1252,17 @@ local function farmStep()
 
     local now = os.clock()
 
+    -- PASS-THROUGH PICKUPS: any candy that died shortly after we got close
+    -- counts, whether or not it was the one we were flying at.
+    for part, t in pairs(nearWatch) do
+        if isDead(part) then
+            if (now - t) <= 0.5 then bump(part) end
+            nearWatch[part] = nil
+        elseif (now - t) > 1.0 then
+            nearWatch[part] = nil
+        end
+    end
+
     for k, v in pairs(visited) do
         if not k.Parent or (now - v) > 10 then visited[k] = nil end
     end
@@ -1270,6 +1280,10 @@ local function farmStep()
                 if d >= CFG.BandMin and d <= CFG.BandMax then
                     band[#band + 1] = c
                 end
+            end
+            -- remember anything we brush past so its pickup still counts
+            if d <= CFG.PickRadius and nearWatch[c] == nil then
+                nearWatch[c] = now
             end
         end
     end
@@ -1305,16 +1319,10 @@ local function farmStep()
     end
 
     if res == "hit" then
-        -- died in our reach: the touch did it
-        selfCount = selfCount + 1
-        attempts = attempts + 1
-        syncPicked()
-        failStreak = 0
+        bump(target)
     elseif res == "fired" then
-        -- fired an input; confirm in the background so we can leave now
         pending[#pending + 1] = { part = target, at = os.clock() }
     elseif res == "gone" or res == "stolen" then
-        -- our cached candy list is stale, rescan before picking again
         candyCacheAt = 0
     end
 end
@@ -1340,11 +1348,14 @@ safeLoop("watch", function()
             resetting = false
             visited = {}
             pending = {}
+            nearWatch = {}
             failStreak = 0
             fullStreak = 0
             firstGrab = true
             pickedAtReset = picked
             selfAtReset = selfCount
+            promptMoved = false
+            lastPromptVal = nil
             lastGrabAt = os.clock()
             say(roundActive and "alive in round - farming" or "alive - waiting for round")
         elseif not h and alive then
@@ -1527,14 +1538,6 @@ boxBtn.MouseButton1Click:Connect(function()
     print("[MM2] " .. msg)
 end)
 
---==================== REAL COLLECTED ====================
--- real collected total: game log first, then the trusted currency source, then our own tally
-local function realCollected()
-    if logTotal and (os.clock() - logTotalAt) < 5 then return logTotal, "log" end
-    if bagConfirmed and balance > 0 then return balance, "src" end
-    return selfCount, "self"
-end
-
 --==================== STATS ====================
 local function stateLine()
     if resetting then return "RESETTING" end
@@ -1550,12 +1553,14 @@ task.spawn(function()
             local run = os.clock() - started
             local bagLine, frac = "reading game...", 0
 
-            local cur, max, src = readBag()
+            local cur, max, src = readBagPrompt()
             if cur then
                 bagLine = (max and ("%d/%d"):format(cur, max) or tostring(cur)) .. "  " .. tostring(src or "")
                 if max and max > 0 then frac = math.clamp(cur / max, 0, 1) end
+                heroNum.Text = tostring(cur)
             else
                 bagLine = "no bag prompt found"
+                heroNum.Text = "~" .. tostring(selfCount)
                 if CFG.BagSize > 0 then
                     frac = math.clamp((selfCount - selfAtReset) / CFG.BagSize, 0, 1)
                 end
@@ -1570,18 +1575,11 @@ task.spawn(function()
                 tickAge, stalls,
                 bagLine,
                 resets, run // 60, run % 60,
-                picked / math.max(run / 3600, 0.0001))
+                selfCount / math.max(run / 3600, 0.0001))
 
-            local col, colSrc = realCollected()
-            heroNum.Text = (colSrc == "self" and "~" or "") .. tostring(col)
             heroBoxes.Text = tostring(boxes)
-
-            if bagConfirmed then
-                heroSub.Text = ("src %s  raw %d  srcPicked %d  self %d")
-                    :format(bagSrcLabel, balance, srcPicked, selfCount)
-            else
-                heroSub.Text = ("self %d  attempts %d  hunting source"):format(selfCount, attempts)
-            end
+            heroSub.Text = ("self %d  attempts %d  this life %d")
+                :format(selfCount, attempts, selfCount - selfAtReset)
 
             TS:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(frac, 0, 1, 0) }):Play()
 
