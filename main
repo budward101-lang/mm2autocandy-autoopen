@@ -1,11 +1,11 @@
 --============================================================
 -- MM2 HALLOWEEN - Candy Autofarm + Halloween Box Opener
--- Noclip | TweenSpeed 25 | core APIs only
+-- Noclip | TweenSpeed 22 | core APIs only
 -- RightShift = hide/show UI | F1 = farm | F2 = box
 --============================================================
 
 local CFG = {
-    Tween = 25, -- studs per second (raise toward 40-60 if you want to go faster)
+    Tween = 22, -- studs per second (raise toward 40-60 if you want to go faster)
     Hold = 0, -- extra settle after landing (0 = none)
     Revisit = 2.5, -- secs before a candy can be picked again
     Radius = 120, -- outer pick range
