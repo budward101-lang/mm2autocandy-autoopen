@@ -1,12 +1,13 @@
 --============================================================
 -- MM2 HALLOWEEN - Candy Autofarm + Halloween Box Opener
--- Noclip | TweenSpeed 22 | core APIs only
+-- Noclip | TweenSpeed 23 | core APIs only
 -- UNDER-MAP MODE: hides you BELOW the floor so the murderer can't reach you
--- RightShift = hide/show UI | F1 = farm | F2 = box
+-- FLAT POSE: body lies horizontal (prone) while flying
+-- RightShift = hide/show UI | F1 = farm | F2 = box | F3 = under-map | F4 = flat
 --============================================================
 
 local CFG = {
-    Tween = 22, -- studs per second (raise toward 40-60 if you want to go faster)
+    Tween = 23, -- studs per second (raise toward 40-60 if you want to go faster)
     Hold = 0, -- extra settle after landing (0 = none)
     Revisit = 2.5, -- secs before a candy can be picked again
     Radius = 120, -- outer pick range
@@ -20,6 +21,11 @@ local CFG = {
     Pay = "Candies2026", -- arg 3 (currency)
     TouchRange = 2.5, -- studs: a candy dying inside this radius counts as yours
     PickRadius = 4.5, -- studs: register candies this close so passing pickups count
+
+    -- POSE: lie the character flat (horizontal) like the reference clip
+    Flat = true,       -- lie prone instead of standing upright
+    FlatAngle = -90,   -- pitch in degrees. -90 = face-down superman, +90 = face-up
+    FaceTravel = true, -- yaw the body toward the direction of travel
 
     -- UNDER-MAP MODE: sit below the floor at each candy so the murderer can't touch you
     UnderMap = true,   -- fly UNDER the map instead of floating on the surface
@@ -178,7 +184,7 @@ stroke(reopen, T.orange, 1.4, 0.25)
 
 local shadow = new("Frame", {
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 5, 0.5, 7),
-    Size = UDim2.new(0, 282, 0, 510),
+    Size = UDim2.new(0, 282, 0, 522),
     BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.5,
     BorderSizePixel = 0, ZIndex = 1,
 }, gui)
@@ -186,7 +192,7 @@ corner(shadow, 18)
 
 local win = new("Frame", {
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
-    Size = UDim2.new(0, 282, 0, 510),
+    Size = UDim2.new(0, 282, 0, 522),
     BackgroundColor3 = T.bg1, BorderSizePixel = 0, Active = true, ZIndex = 2,
 }, gui)
 corner(win, 18)
@@ -301,7 +307,7 @@ corner(barFill, 4)
 grad(barFill, T.orange, T.purple, 0)
 
 local statsPanel = new("Frame", {
-    Size = UDim2.new(1, 0, 0, 118), LayoutOrder = 1,
+    Size = UDim2.new(1, 0, 0, 130), LayoutOrder = 1,
     BackgroundColor3 = T.panel, BorderSizePixel = 0, ZIndex = 4,
 }, body)
 corner(statsPanel, 11)
@@ -412,6 +418,9 @@ do
             boxBtn.MouseButton1Click:Fire()
         elseif i.KeyCode == Enum.KeyCode.F3 then
             underBtn.MouseButton1Click:Fire()
+        elseif i.KeyCode == Enum.KeyCode.F4 then
+            CFG.Flat = not CFG.Flat
+            say(CFG.Flat and ("lying flat (%d deg)"):format(CFG.FlatAngle) or "standing upright")
         end
     end)
 end
@@ -458,6 +467,32 @@ end
 local function reachOK(hrp, part)
     local lim = CFG.UnderMap and CFG.UnderReach or CFG.TouchRange
     return flatDist(hrp.Position, part.Position) <= lim
+end
+
+-- build the flying CFrame: prone body, optionally yawed toward the direction of travel
+local function flyCFrame(from, to)
+    if not CFG.Flat then return CFrame.new(to) end
+
+    local yaw = 0
+    if CFG.FaceTravel then
+        local d = to - from
+        local flat = Vector3.new(d.X, 0, d.Z)
+        if flat.Magnitude > 0.05 then
+            yaw = math.atan2(-flat.X, -flat.Z)
+        end
+    end
+    return CFrame.new(to)
+        * CFrame.Angles(0, yaw, 0)
+        * CFrame.Angles(math.rad(CFG.FlatAngle), 0, 0)
+end
+
+-- stop the Humanoid from standing us back up / yaw-fighting the tween
+local function setupHum(hum)
+    if not hum then return end
+    pcall(function()
+        hum.AutoRotate = false
+        hum.PlatformStand = true
+    end)
 end
 
 local function bump(part)
@@ -582,7 +617,7 @@ local function findCandy(force)
     return out
 end
 
--- Fly UNDER the candy, fire the pickup, and get out.
+-- Fly UNDER the candy with the body prone, fire the pickup, and get out.
 -- Outcomes:
 -- "gone" -> it was already dead before we moved (nobody's pickup)
 -- "stolen" -> it died mid-flight, well outside reach (someone else's)
@@ -599,7 +634,7 @@ local function grab(part, hrp)
 
     local tw = TS:Create(hrp,
         TweenInfo.new(dur, Enum.EasingStyle.Linear),
-        { CFrame = CFrame.new(dest) })
+        { CFrame = flyCFrame(hrp.Position, dest) })
     tw:Play()
 
     local arrive = os.clock() + dur
@@ -627,7 +662,6 @@ local function grab(part, hrp)
             if under then
                 underHits = underHits + 1
                 underStreak = underStreak + 1
-                -- occasionally try sitting a touch deeper again
                 if underStreak >= CFG.ProbeEvery and depthNow < CFG.UnderDepth then
                     underStreak = 0
                     depthNow = math.min(CFG.UnderDepth, depthNow + CFG.DepthStep)
@@ -643,7 +677,7 @@ local function grab(part, hrp)
     if under then
         underMisses = underMisses + 1
         local up = TS:Create(hrp, TweenInfo.new(0.12, Enum.EasingStyle.Linear),
-            { CFrame = CFrame.new(part.Position) })
+            { CFrame = flyCFrame(hrp.Position, part.Position) })
         up:Play()
         local t2 = os.clock() + CFG.LiftWait
         while os.clock() < t2 do
@@ -1282,6 +1316,7 @@ local function onSpawned(ch)
     task.spawn(function()
         local hum = ch:FindFirstChildOfClass("Humanoid") or ch:WaitForChild("Humanoid", 6)
         if not hum then return end
+        setupHum(hum)
         if boundHum ~= hum then
             boundHum = hum
             pcall(function() hum.Died:Connect(onDied) end)
@@ -1425,6 +1460,7 @@ safeLoop("watch", function()
             boundHum = hum
             pcall(function() hum.Died:Connect(onDied) end)
         end
+        setupHum(hum)
 
         local h = hum.Health > 0
         if h and not alive and (os.clock() - spawnedAt) >= CFG.Settle then
@@ -1674,15 +1710,17 @@ task.spawn(function()
             local age = os.clock() - lastGrabAt
             local tickAge = age < 60 and ("%.1fs ago"):format(age) or ("%.0fm ago"):format(age / 60)
 
+            local poseLine = CFG.Flat and ("flat %d (prone)"):format(CFG.FlatAngle) or "upright"
             local modeLine = CFG.UnderMap
                 and ("under %.1f  h%d/m%d"):format(depthNow, underHits, underMisses)
                 or "surface"
 
             stats.Text = string.format(
-                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nbag    : %s\nmode   : %s\nresets : %d  up %02d:%02d  /hr:%.0f",
+                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nbag    : %s\npose   : %s\nmode   : %s\nresets : %d  up %02d:%02d  /hr:%.0f",
                 stateLine(), roundActive and "active" or "none",
                 tickAge, stalls,
                 bagLine,
+                poseLine,
                 modeLine,
                 resets, run // 60, run % 60,
                 selfCount / math.max(run / 3600, 0.0001))
@@ -1719,4 +1757,4 @@ if CFG.AntiAFK then
     end)
 end
 
-print("[MM2 Halloween] loaded - RightShift UI | F1 farm | F2 box | F3 under-map")
+print("[MM2 Halloween] loaded - RightShift UI | F1 farm | F2 box | F3 under-map | F4 flat")
