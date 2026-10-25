@@ -1386,4 +1386,269 @@ safeLoop("watch", function()
             nearWatch = {}
             failStreak = 0
             fullStreak = 0
-            firstGrab... (9 KB left)
+            firstGrab = true
+            pickedAtReset = picked
+            selfAtReset = selfCount
+            promptMoved = false
+            lastPromptVal = nil
+            lastGrabAt = os.clock()
+            say(roundActive and "alive in round - farming" or "alive - waiting for round")
+        elseif not h and alive then
+            alive = false
+            say(roundActive and "dead in round - idling" or "dead - idling")
+        end
+    elseif alive then
+        alive = false
+    end
+
+    if resetting and (os.clock() - resetStart) > 20 then
+        resetting = false
+        print("[MM2] resetting watchdog released")
+    end
+
+    if farmOn and alive and roundActive and not resetting
+    and (os.clock() - lastGrabAt) > CFG.Stall then
+        visited = {}
+        firstGrab = true
+        lastGrabAt = os.clock()
+        stalls = stalls + 1
+        print("[MM2] stall watchdog - cleared targets")
+    end
+end)
+
+--==================== BOX ====================
+local function visibleButtons()
+    local out = {}
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+            out[#out + 1] = d
+        end
+    end
+    return out
+end
+
+local function clickKeyword(kws)
+    for _, b in ipairs(visibleButtons()) do
+        local label = b.Name .. " "
+        if b:IsA("TextButton") then label = label .. b.Text end
+        label = label:lower()
+        for _, k in ipairs(kws) do
+            if label:find(k, 1, true) then
+                pcall(function()
+                    if firesignal then
+                        firesignal(b.MouseButton1Click)
+                    else
+                        b:Activate()
+                    end
+                end)
+                return b
+            end
+        end
+    end
+end
+
+local RARITY_WORDS = {
+    "common", "uncommon", "rare", "legendary", "godly", "chroma",
+    "vintage", "unique", "ancient", "exclusive", "spooky", "cursed",
+    "halloween", "epic", "mythic", "super", "limited",
+}
+
+local FAIL_WORDS = {
+    "fail", "error", "cooldown", "not enough", "insufficient",
+    "no candy", "no money", "locked", "wait",
+}
+
+local function looksLikeRarity(v)
+    if type(v) ~= "string" then return false end
+    local lv = v:lower()
+    for _, w in ipairs(RARITY_WORDS) do
+        if lv:find(w, 1, true) then return true end
+    end
+    return false
+end
+
+local function looksLikeFail(v)
+    if v == false then return true end
+    if type(v) == "string" then
+        local lv = v:lower()
+        for _, w in ipairs(FAIL_WORDS) do
+            if lv:find(w, 1, true) then return true end
+        end
+    end
+    return false
+end
+
+local function parseOpenReturn(r1, r2, r3)
+    local item, rarity
+
+    if type(r1) == "table" then
+        item   = r1.Name or r1.Item or r1[1]
+        rarity = r1.Rarity or r1.rarity or r1[2]
+    elseif type(r1) == "string" then
+        item = r1
+    elseif type(r1) == "number" then
+        item = r1
+    end
+
+    if not rarity then
+        for _, v in ipairs({ r2, r3 }) do
+            if type(v) == "table" then
+                rarity = v.Rarity or v.rarity
+            elseif type(v) == "string" then
+                if looksLikeRarity(v) then rarity = v end
+            elseif type(v) == "number" then
+                rarity = v
+            end
+            if rarity then break end
+        end
+    end
+
+    if not rarity and looksLikeRarity(r1) then
+        rarity = r1
+        if item == r1 then item = nil end
+    end
+
+    return item, rarity
+end
+
+local function openBox()
+    if CFG.Mode == "Remote" then
+        local ok, r1, r2, r3 = pcall(function()
+            return OpenCrate:InvokeServer(CFG.Crate, CFG.BoxType, CFG.Pay)
+        end)
+
+        if not ok then
+            return "invoke errored: " .. tostring(r1)
+        end
+
+        if r1 == nil and r2 == nil and r3 == nil then
+            return "no return - open failed (check Candies2026 / crate args)"
+        end
+
+        if looksLikeFail(r1) then
+            lastRarity = "-"
+            print("[MM2] open failed:", tostring(r1))
+            return "open failed: " .. tostring(r1)
+        end
+
+        local item, rarity = parseOpenReturn(r1, r2, r3)
+
+        boxes = boxes + 1
+        lastRarity = rarity and tostring(rarity) or "?"
+
+        print("[MM2] rolled:", tostring(item or r1), rarity or "?")
+
+        if item then
+            return ("opened: %s%s"):format(
+                tostring(item),
+                rarity and (" [" .. tostring(rarity) .. "]") or "")
+        end
+        return "opened - rarity: " .. lastRarity
+    else
+        local b = clickKeyword({ "open", "unbox", "box", "crate", "halloween" })
+        if b then
+            boxes = boxes + 1
+            return "clicked " .. b.Name
+        end
+        return "no matching button on screen"
+    end
+end
+
+--==================== BUTTONS ====================
+farmBtn.MouseButton1Click:Connect(function()
+    farmOn = not farmOn
+    farmBtn.Text = "Farm Candy: " .. (farmOn and "ON" or "OFF")
+    local c = farmOn and T.greenD or T.panelHi
+    farmBtn:SetAttribute("base", c)
+    farmBtn.BackgroundColor3 = c
+    farmBtn.TextColor3 = farmOn and Color3.new(1, 1, 1) or T.text
+    lastGrabAt = os.clock()
+    fullStreak = 0
+    say(farmOn and "farming candies..." or "farm stopped")
+end)
+
+boxBtn.MouseButton1Click:Connect(function()
+    local msg = openBox()
+    say(msg)
+    print("[MM2] " .. msg)
+end)
+
+--==================== STATS ====================
+local function stateLine()
+    if resetting then return "RESETTING" end
+    if not roundActive then
+        return alive and "no round - idle" or "no round - dead"
+    end
+    return alive and "IN ROUND - alive" or "IN ROUND - dead"
+end
+
+task.spawn(function()
+    while task.wait(0.4) do
+        local ok, err = pcall(function()
+            local run = os.clock() - started
+            local bagLine, frac = "reading game...", 0
+
+            local cur, max, src = readBagPrompt()
+            local tr = bagPrompt and promptTrack[bagPrompt]
+            local live = (tr ~= nil and tr.moved == true)
+            local selfHeld = selfCount - selfAtReset
+
+            if cur and live then
+                bagLine = (max and ("%d/%d"):format(cur, max) or tostring(cur)) .. "  " .. tostring(src or "")
+                if max and max > 0 then
+                    frac = math.clamp(cur / max, 0, 1)
+                else
+                    frac = math.clamp(cur / CFG.BagSize, 0, 1)
+                end
+                heroNum.Text = tostring(cur)
+            else
+                bagLine = (cur and ("static %d"):format(cur) or "no live bag label")
+                    .. ("  self %d"):format(selfHeld)
+                heroNum.Text = "~" .. tostring(selfHeld)
+                frac = math.clamp(selfHeld / CFG.BagSize, 0, 1)
+            end
+
+            local age = os.clock() - lastGrabAt
+            local tickAge = age < 60 and ("%.1fs ago"):format(age) or ("%.0fm ago"):format(age / 60)
+
+            stats.Text = string.format(
+                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nbag    : %s\nresets : %d  uptime:%02d:%02d  /hr:%.0f",
+                stateLine(), roundActive and "active" or "none",
+                tickAge, stalls,
+                bagLine,
+                resets, run // 60, run % 60,
+                selfCount / math.max(run / 3600, 0.0001))
+
+            heroBoxes.Text = tostring(boxes)
+            heroSub.Text = ("self %d  attempts %d  this life %d")
+                :format(selfCount, attempts, selfHeld)
+
+            TS:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(frac, 0, 1, 0) }):Play()
+
+            dot.BackgroundColor3 = resetting and T.orange
+                or (alive and roundActive and T.green or (alive and T.purple or T.red))
+        end)
+        if not ok then print("[MM2] stats error: " .. tostring(err)) end
+    end
+end)
+
+--==================== ANTI AFK ====================
+if CFG.AntiAFK then
+    pcall(function()
+        local cons = getconnections and getconnections(lp.Idled)
+        if cons and #cons > 0 then
+            for _, c in ipairs(cons) do
+                pcall(function()
+                    if c.Disable then c.Disable(c) elseif c.Disconnect then c.Disconnect(c) end
+                end)
+            end
+        else
+            lp.Idled:Connect(function()
+                VU:CaptureController()
+                VU:ClickButton2(Vector2.new())
+            end)
+        end
+    end)
+end
+
+print("[MM2 Halloween] loaded - RightShift UI | F1 farm | F2 box")
