@@ -1,6 +1,7 @@
 --============================================================
 -- MM2 HALLOWEEN - Candy Autofarm + Halloween Box Opener
 -- Noclip | TweenSpeed 22 | core APIs only
+-- UNDER-MAP MODE: hides you BELOW the floor so the murderer can't reach you
 -- RightShift = hide/show UI | F1 = farm | F2 = box
 --============================================================
 
@@ -19,6 +20,15 @@ local CFG = {
     Pay = "Candies2026", -- arg 3 (currency)
     TouchRange = 2.5, -- studs: a candy dying inside this radius counts as yours
     PickRadius = 4.5, -- studs: register candies this close so passing pickups count
+
+    -- UNDER-MAP MODE: sit below the floor at each candy so the murderer can't touch you
+    UnderMap = true,   -- fly UNDER the map instead of floating on the surface
+    UnderDepth = 3.5,  -- studs below a candy we sit (auto-shrinks if pickups start missing)
+    MinDepth = 1.2,    -- never sit shallower than this
+    DepthStep = 0.6,   -- how much the depth shrinks per missed pickup
+    ProbeEvery = 20,   -- confirmed pickups between attempts to sit deeper again
+    UnderReach = 5,    -- flat (XZ) radius that still counts as "our" pickup
+    LiftWait = 0.5,    -- secs to wait after rising onto a candy that missed
 
     -- reset behaviour
     AutoReset = false,       -- old "guess the bag hit 50" logic (now OFF)
@@ -104,6 +114,8 @@ local T = {
     purple = Color3.fromRGB(160, 98, 238),
     green  = Color3.fromRGB(58, 200, 114),
     greenD = Color3.fromRGB(30, 122, 68),
+    blue   = Color3.fromRGB(78, 140, 220),
+    blueD  = Color3.fromRGB(36, 82, 138),
     red    = Color3.fromRGB(234, 98, 98),
     text   = Color3.fromRGB(238, 238, 250),
     muted  = Color3.fromRGB(152, 150, 176),
@@ -131,7 +143,6 @@ local function lighten(c, a)
         math.clamp(c.B + a, 0, 1))
 end
 
--- real italic face, with fallbacks if the font API is unavailable
 local ITALIC = (function()
     local tries = {
         function() return Font.fromName("GothamSSm", Enum.FontWeight.Medium, Enum.FontStyle.Italic) end,
@@ -167,7 +178,7 @@ stroke(reopen, T.orange, 1.4, 0.25)
 
 local shadow = new("Frame", {
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 5, 0.5, 7),
-    Size = UDim2.new(0, 282, 0, 446),
+    Size = UDim2.new(0, 282, 0, 510),
     BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.5,
     BorderSizePixel = 0, ZIndex = 1,
 }, gui)
@@ -175,7 +186,7 @@ corner(shadow, 18)
 
 local win = new("Frame", {
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
-    Size = UDim2.new(0, 282, 0, 446),
+    Size = UDim2.new(0, 282, 0, 510),
     BackgroundColor3 = T.bg1, BorderSizePixel = 0, Active = true, ZIndex = 2,
 }, gui)
 corner(win, 18)
@@ -204,7 +215,6 @@ new("TextLabel", {
     TextTransparency = 0.12, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
 }, head)
 
--- credit: small + italic, bottom-right of the logo area
 local credit = new("TextLabel", {
     AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 33),
     Size = UDim2.new(0, 120, 0, 13),
@@ -247,7 +257,6 @@ new("TextLabel", {
     TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
 }, hero)
 
--- "~" marks the value as approximate
 local heroNum = new("TextLabel", {
     Position = UDim2.new(0, 14, 0, 22), Size = UDim2.new(1, -30, 0, 46),
     BackgroundTransparency = 1, Text = "~0",
@@ -292,7 +301,7 @@ corner(barFill, 4)
 grad(barFill, T.orange, T.purple, 0)
 
 local statsPanel = new("Frame", {
-    Size = UDim2.new(1, 0, 0, 102), LayoutOrder = 1,
+    Size = UDim2.new(1, 0, 0, 118), LayoutOrder = 1,
     BackgroundColor3 = T.panel, BorderSizePixel = 0, ZIndex = 4,
 }, body)
 corner(statsPanel, 11)
@@ -343,9 +352,10 @@ end
 
 local farmBtn = btn("Farm Candy: ON", 2, T.greenD)
 local boxBtn  = btn("Open Halloween Box", 3, Color3.fromRGB(88, 50, 132))
+local underBtn = btn("Under Map: ON", 4, T.blueD)
 
 local status = new("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 40), LayoutOrder = 4,
+    Size = UDim2.new(1, 0, 0, 40), LayoutOrder = 5,
     BackgroundColor3 = T.panel, BorderSizePixel = 0,
     TextColor3 = T.muted, Font = Enum.Font.Gotham, TextSize = 11,
     TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
@@ -400,6 +410,8 @@ do
             farmBtn.MouseButton1Click:Fire()
         elseif i.KeyCode == Enum.KeyCode.F2 then
             boxBtn.MouseButton1Click:Fire()
+        elseif i.KeyCode == Enum.KeyCode.F3 then
+            underBtn.MouseButton1Click:Fire()
         end
     end)
 end
@@ -411,28 +423,43 @@ local roundActive = false
 local lastSeen = 0
 
 local visited = {}
-local pending = {} -- pickups fired, awaiting confirmation
-local nearWatch = {} -- part -> time we got close (for pass-through pickups)
+local pending = {}
+local nearWatch = {}
 local counted = setmetatable({}, { __mode = "k" })
 local firstGrab = true
 local resetting, resets, failStreak, pickedAtReset = false, 0, 0, 0
-local selfAtReset = 0 -- selfCount at the last reset (exact per-life pickups)
+local selfAtReset = 0
 local resetStart = 0
 local spawnedAt = os.clock() - 10
 local lastGrabAt = os.clock()
 local ticks, stalls = 0, 0
 
-local selfCount = 0 -- pickups the script itself confirmed (ground truth)
-local attempts = 0 -- pickups we actually fired a prompt for (hard upper bound)
-local srcPicked = 0 -- candies per the trusted source, relative to lock time
-local balance = 0 -- raw value of the trusted source
+local selfCount = 0
+local attempts = 0
+local srcPicked = 0
+local balance = 0
 local bagConfirmed = false
 local bagSrcLabel = "none"
 
--- forward declarations (referenced by functions defined earlier)
+-- under-map runtime state (persists across lives so it stays tuned)
+local depthNow = CFG.UnderMap and CFG.UnderDepth or 0
+local underHits, underMisses, underStreak = 0, 0, 0
+
 local doReset
 
--- count a pickup exactly once, whoever it came from
+-- flat distance: horizontal only while under the map (vertical offset is intended)
+local function flatDist(a, b)
+    local d = a - b
+    if CFG.UnderMap then return Vector2.new(d.X, d.Z).Magnitude end
+    return d.Magnitude
+end
+
+-- did a death happen close enough to be ours?
+local function reachOK(hrp, part)
+    local lim = CFG.UnderMap and CFG.UnderReach or CFG.TouchRange
+    return flatDist(hrp.Position, part.Position) <= lim
+end
+
 local function bump(part)
     if not part or counted[part] then return false end
     counted[part] = true
@@ -443,9 +470,6 @@ local function bump(part)
     return true
 end
 
--- Once a source has passed verification the game's own counter is the honest
--- number, so prefer it. selfCount stays as the floor and as the anti-runaway
--- ceiling (a bad source can never exceed real pickups + Slack).
 local function shownCount()
     if bagConfirmed and srcPicked > 0 then
         local cap = math.max(attempts, selfCount) + CFG.Slack
@@ -484,19 +508,20 @@ end
 local nocFrame = 0
 RUN.Stepped:Connect(function()
     if not alive then return end
-
     nocFrame = nocFrame + 1
+
+    -- kill gravity every frame so we hover cleanly under the map
+    local hrp = nocChar and nocChar:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+
     if nocFrame % 3 == 0 then
         for i = 1, #nocParts do
             local d = nocParts[i]
             if d.Parent and d.CanCollide then d.CanCollide = false end
         end
-    end
-
-    local hrp = nocChar and nocChar:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
     end
 end)
 
@@ -557,7 +582,7 @@ local function findCandy(force)
     return out
 end
 
--- Fly to the candy, fire the pickup, and get out.
+-- Fly UNDER the candy, fire the pickup, and get out.
 -- Outcomes:
 -- "gone" -> it was already dead before we moved (nobody's pickup)
 -- "stolen" -> it died mid-flight, well outside reach (someone else's)
@@ -566,15 +591,17 @@ end
 local function grab(part, hrp)
     if not part or not part.Parent or not hrp or not hrp.Parent then return "gone" end
 
-    local dist = (part.Position - hrp.Position).Magnitude
+    local under = CFG.UnderMap and depthNow > 0
+    local dest = under and (part.Position - Vector3.new(0, depthNow, 0)) or part.Position
+
+    local dist = (dest - hrp.Position).Magnitude
     local dur = math.max(dist / CFG.Tween, 0.02)
 
     local tw = TS:Create(hrp,
         TweenInfo.new(dur, Enum.EasingStyle.Linear),
-        { CFrame = CFrame.new(part.Position) })
+        { CFrame = CFrame.new(dest) })
     tw:Play()
 
-    -- glide, bailing the instant the coin vanishes under us
     local arrive = os.clock() + dur
     local dead = false
     while true do
@@ -582,6 +609,55 @@ local function grab(part, hrp)
         local left = arrive - os.clock()
         if left <= 0 then break end
         task.wait(left > 0.06 and 0.05 or 0)
+    end
+
+    -- UNDER MAP: give the game a beat to register the pickup from below
+    if not dead and under then
+        local t1 = os.clock() + CFG.PickupWait
+        while os.clock() < t1 do
+            if not part.Parent or isDead(part) then dead = true break end
+            task.wait(0.04)
+        end
+    end
+
+    pcall(function() tw:Cancel() end)
+
+    if dead then
+        if reachOK(hrp, part) then
+            if under then
+                underHits = underHits + 1
+                underStreak = underStreak + 1
+                -- occasionally try sitting a touch deeper again
+                if underStreak >= CFG.ProbeEvery and depthNow < CFG.UnderDepth then
+                    underStreak = 0
+                    depthNow = math.min(CFG.UnderDepth, depthNow + CFG.DepthStep)
+                    print(("[MM2] under depth -> %.1f"):format(depthNow))
+                end
+            end
+            return "hit"
+        end
+        return "stolen"
+    end
+
+    -- under too deep -> rise onto the candy, then remember the shallower depth
+    if under then
+        underMisses = underMisses + 1
+        local up = TS:Create(hrp, TweenInfo.new(0.12, Enum.EasingStyle.Linear),
+            { CFrame = CFrame.new(part.Position) })
+        up:Play()
+        local t2 = os.clock() + CFG.LiftWait
+        while os.clock() < t2 do
+            if not part.Parent or isDead(part) then dead = true break end
+            task.wait(0.04)
+        end
+        pcall(function() up:Cancel() end)
+
+        if dead then
+            depthNow = math.max(CFG.MinDepth, depthNow - CFG.DepthStep)
+            underStreak = 0
+            print(("[MM2] under depth -> %.1f (was too deep)"):format(depthNow))
+            return "hit"
+        end
     end
 
     -- not dead yet: make sure we are genuinely on top of it
@@ -595,13 +671,8 @@ local function grab(part, hrp)
         end
     end
 
-    pcall(function() tw:Cancel() end)
-
     if dead then
-        -- how close were we when it went? inside reach = our touch did it
-        if (hrp.Position - part.Position).Magnitude <= CFG.TouchRange then
-            return "hit"
-        end
+        if reachOK(hrp, part) then return "hit" end
         return "stolen"
     end
 
@@ -629,7 +700,6 @@ local function grab(part, hrp)
 end
 
 --==================== PENDING RESOLVER ====================
--- non-blocking: confirms fired pickups, times out the ones that never landed
 local function settlePending()
     local n = #pending
     if n == 0 then return end
@@ -675,7 +745,6 @@ safeLoop("round", function()
         roundActive = false
         say("round over - waiting")
 
-        -- NEW: bag is full / round ended -> reset ONCE, then idle for the next round
         if CFG.ResetOnRoundOver and not resetting and doReset
         and (selfCount - selfAtReset) >= CFG.MinPicks then
             doReset("round over")
@@ -695,7 +764,7 @@ local activeSrc
 local lockVal = 0
 local verify = nil
 local verifyFails = 0
-local blacklist = {} -- name -> clock time until which it is ignored
+local blacklist = {}
 local dbgAt = 0
 
 local function isOurs(d) return d:IsDescendantOf(gui) end
@@ -705,7 +774,6 @@ local function blocked(n)
     return t ~= nil and os.clock() < t
 end
 
--- broadened: recognises bag / bucket / treat style counters too
 local KEY_SCORES = {
     candies2026 = 100, candies = 92, candy = 90,
     halloween = 72, bucket = 64, sack = 62, pumpkin = 60,
@@ -722,7 +790,6 @@ local function candyScore(s)
     return best
 end
 
--- handles "1,234", "12 / 50", "1.2K", "Candy: 12"
 local function parseNum(tok)
     local n, suf = tok:match("^(%d+%.?%d*)([KkMmBb]?)")
     if not n then return nil end
@@ -796,7 +863,6 @@ local function scanCands()
         end
     end
 
-    -- GUI: keyword match OR a bare "12 / 50" style counter with no keywords
     for _, d in ipairs(pg:GetDescendants()) do
         if not isOurs(d) and (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
             local a, b = extractCount(d.Text)
@@ -835,12 +901,9 @@ local function readCand(c)
 end
 
 --==================== BAG PROMPT (bottom-right counter) ====================
--- Only a label whose name (or a close ancestor) contains CFG.BagName counts.
--- A label that never changes (a static plate) is heavily de-prioritised, and a
--- label whose value tracks our own pickups is preferred.
 local bagPrompt, bagPromptAt = nil, 0
 local lastPromptVal, promptMoved = nil, false
-local promptTrack = setmetatable({}, { __mode = "k" }) -- label -> {last, moved}
+local promptTrack = setmetatable({}, { __mode = "k" })
 local promptDumpAt = 0
 
 local function nameHasBag(n)
@@ -880,7 +943,6 @@ local function findBagPrompt()
                     end
                 end
                 if nm > 0 then
-                    -- track whether this label is actually live
                     local tr = promptTrack[d]
                     if not tr then
                         tr = { last = a, moved = false }
@@ -891,10 +953,10 @@ local function findBagPrompt()
                     end
 
                     local score = nm * 10000
-                    if tr.moved then score = score + 5000 end            -- live beats static
+                    if tr.moved then score = score + 5000 end
                     if b and CFG.BagSize > 0 and b == CFG.BagSize then score = score + 2000 end
                     if b then score = score + 100 end
-                    score = score - math.min(math.abs(a - selfHeld), 400) * 4  -- matches our pickups
+                    score = score - math.min(math.abs(a - selfHeld), 400) * 4
 
                     if CFG.Debug then
                         dump = dump or {}
@@ -946,7 +1008,6 @@ local function readBag()
 end
 
 --==================== GAME LOG / OUTPUT WATCHER ====================
--- Two signals: a bag reading ("37/50") and a collected total ("collected 128").
 local logCur, logMax, logAt = nil, nil, 0
 local logTotal, logTotalAt = nil, 0
 local logMoved = false
@@ -959,7 +1020,6 @@ local function noteLog(text)
     if #t > 200 then return end
     local low = t:lower()
 
-    -- bag style "37/50"
     local m1, m2 = t:match("(%d+)%s*/%s*(%d+)")
     if m1 and m2 then
         local a, b = tonumber(m1), tonumber(m2)
@@ -971,7 +1031,6 @@ local function noteLog(text)
         end
     end
 
-    -- collected style: "collected 128", "candies: 128", "you have 128 candies"
     if low:find("collect", 1, true) or low:find("candies", 1, true)
     or low:find("candy", 1, true) then
         local n = low:match("(%d+)")
@@ -1008,7 +1067,6 @@ local function bagIsFull()
 
     local reason
 
-    -- 1) the bag prompt: must be a live (changing) counter with the right cap
     if CFG.UseBagGui then
         local cur, max, src = readBag()
         if cur and max and max == CFG.BagSize and promptMoved and cur >= max then
@@ -1016,12 +1074,10 @@ local function bagIsFull()
         end
     end
 
-    -- 2) our own confirmed pickups hit the cap (works with no prompt at all)
     if not reason and CFG.BagSize > 0 and selfHeld >= CFG.BagSize then
         reason = ("picks %d/%d"):format(selfHeld, CFG.BagSize)
     end
 
-    -- 3) game log, same strictness
     if not reason and logCur and logMax and logMax == CFG.BagSize and logMoved
     and (os.clock() - logAt) < 3 and logCur >= logMax then
         reason = ("log %d/%d"):format(logCur, logMax)
@@ -1046,7 +1102,6 @@ safeLoop("candywatch", function()
     task.wait(0.2)
     local now = os.clock()
 
-    -- rescan the candidate set
     if now >= candNextScan then
         candNextScan = now + CFG.SourceScan
         local prev = {}
@@ -1063,7 +1118,6 @@ safeLoop("candywatch", function()
         cands = fresh
     end
 
-    -- sample + advance each candidate's proof window
     for _, c in ipairs(cands) do
         local v = readCand(c)
         c.cur = v
@@ -1087,7 +1141,6 @@ safeLoop("candywatch", function()
         end
     end
 
-    -- does this candidate behave like a candy counter?
     local function verdict(c)
         local p = c.probe
         if not p then return false, "no probe" end
@@ -1122,7 +1175,6 @@ safeLoop("candywatch", function()
         end
     end
 
-    -- acquire
     if not activeSrc then
         if CFG.ForceSource ~= "" then
             for _, c in ipairs(cands) do
@@ -1153,7 +1205,6 @@ safeLoop("candywatch", function()
         end
     end
 
-    -- hold the lock under continuous re-verification
     if activeSrc then
         local v = activeSrc.cur
         local gone = v == nil
@@ -1249,6 +1300,7 @@ doReset = function(reason)
     alive = false
     failStreak = 0
     fullStreak = 0
+    underStreak = 0
     resets = resets + 1
     say("bag full (" .. reason .. ") - resetting")
     print("[MM2] auto reset:", reason)
@@ -1287,8 +1339,6 @@ local function farmStep()
 
     local now = os.clock()
 
-    -- PASS-THROUGH PICKUPS: any candy that died shortly after we got close
-    -- counts, whether or not it was the one we were flying at.
     for part, t in pairs(nearWatch) do
         if isDead(part) then
             if (now - t) <= 0.5 then bump(part) end
@@ -1309,14 +1359,13 @@ local function farmStep()
     for _, c in ipairs(list) do
         local v = visited[c]
         if not (v and (now - v) < CFG.Revisit) then
-            local d = (c.Position - hrp.Position).Magnitude
+            local d = flatDist(c.Position, hrp.Position)
             if d <= CFG.Radius then
                 near[#near + 1] = c
                 if d >= CFG.BandMin and d <= CFG.BandMax then
                     band[#band + 1] = c
                 end
             end
-            -- remember anything we brush past so its pickup still counts
             if d <= CFG.PickRadius and nearWatch[c] == nil then
                 nearWatch[c] = now
             end
@@ -1334,7 +1383,7 @@ local function farmStep()
         for _, c in ipairs(list) do
             local v = visited[c]
             if not (v and (now - v) < CFG.Revisit) then
-                local d = (c.Position - hrp.Position).Magnitude
+                local d = flatDist(c.Position, hrp.Position)
                 if not bd or d < bd then target, bd = c, d end
             end
         end
@@ -1573,6 +1622,20 @@ boxBtn.MouseButton1Click:Connect(function()
     print("[MM2] " .. msg)
 end)
 
+underBtn.MouseButton1Click:Connect(function()
+    CFG.UnderMap = not CFG.UnderMap
+    depthNow = CFG.UnderMap and CFG.UnderDepth or 0
+    underStreak = 0
+    underBtn.Text = "Under Map: " .. (CFG.UnderMap and "ON" or "OFF")
+    local c = CFG.UnderMap and T.blueD or T.panelHi
+    underBtn:SetAttribute("base", c)
+    underBtn.BackgroundColor3 = c
+    underBtn.TextColor3 = CFG.UnderMap and Color3.new(1, 1, 1) or T.text
+    say(CFG.UnderMap
+        and ("hiding under the map (depth %.1f)"):format(depthNow)
+        or "flying on the surface")
+end)
+
 --==================== STATS ====================
 local function stateLine()
     if resetting then return "RESETTING" end
@@ -1611,11 +1674,16 @@ task.spawn(function()
             local age = os.clock() - lastGrabAt
             local tickAge = age < 60 and ("%.1fs ago"):format(age) or ("%.0fm ago"):format(age / 60)
 
+            local modeLine = CFG.UnderMap
+                and ("under %.1f  h%d/m%d"):format(depthNow, underHits, underMisses)
+                or "surface"
+
             stats.Text = string.format(
-                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nbag    : %s\nresets : %d  uptime:%02d:%02d  /hr:%.0f",
+                "state  : %s\nround  : %s\ntick   : %s  stalls:%d\nbag    : %s\nmode   : %s\nresets : %d  up %02d:%02d  /hr:%.0f",
                 stateLine(), roundActive and "active" or "none",
                 tickAge, stalls,
                 bagLine,
+                modeLine,
                 resets, run // 60, run % 60,
                 selfCount / math.max(run / 3600, 0.0001))
 
@@ -1651,4 +1719,4 @@ if CFG.AntiAFK then
     end)
 end
 
-print("[MM2 Halloween] loaded - RightShift UI | F1 farm | F2 box")
+print("[MM2 Halloween] loaded - RightShift UI | F1 farm | F2 box | F3 under-map")
