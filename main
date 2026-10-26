@@ -43,6 +43,10 @@ local CFG = {
     SourceScan = 1.5, -- how often to re-scan candidate counter sources
     ContainerRetry = 1.0, -- min secs between CoinContainer re-searches
 
+    -- BAG LABEL SANITY (stops the count latching onto a bogus 900)
+    LiveWindow = 5, -- secs a label must have changed within to count as live
+    SanityCap  = 4, -- reject "x/y" labels whose cap is bigger than BagSize * this
+
     -- SOURCE TRUST
     Debug       = true,  -- print a verdict table for every candidate every 10s
     ForceSource = "",    -- set to a substring of a source name to hard-pin it
@@ -448,7 +452,13 @@ end
 -- ceiling (a bad source can never exceed real pickups + Slack).
 local function shownCount()
     if bagConfirmed and srcPicked > 0 then
-        local cap = math.max(attempts, selfCount) + CFG.Slack
+        local hard = math.max(attempts, selfCount)
+        -- a source that outruns what we could physically have picked by more than
+        -- a whole bag is a lifetime total, not a per-life counter: don't trust it
+        if srcPicked > hard + CFG.BagSize + CFG.Slack then
+            return selfCount
+        end
+        local cap = hard + CFG.Slack
         return math.max(selfCount, math.min(srcPicked, cap))
     end
     return selfCount
@@ -840,7 +850,8 @@ end
 -- label whose value tracks our own pickups is preferred.
 local bagPrompt, bagPromptAt = nil, 0
 local lastPromptVal, promptMoved = nil, false
-local promptTrack = setmetatable({}, { __mode = "k" }) -- label -> {last, moved}
+local promptMovedAt = 0
+local promptTrack = setmetatable({}, { __mode = "k" }) -- label -> {last, changedAt}
 local promptDumpAt = 0
 
 local function nameHasBag(n)
@@ -880,26 +891,38 @@ local function findBagPrompt()
                     end
                 end
                 if nm > 0 then
-                    -- track whether this label is actually live
+                    -- liveness = it changed RECENTLY, not "it changed once, ever"
                     local tr = promptTrack[d]
                     if not tr then
-                        tr = { last = a, moved = false }
+                        tr = { last = a, changedAt = 0 }
                         promptTrack[d] = tr
                     elseif tr.last ~= a then
-                        tr.moved = true
+                        tr.changedAt = now
                         tr.last = a
+                    end
+                    local live = (now - tr.changedAt) <= CFG.LiveWindow
+
+                    -- sanity: a bag counter is small and its cap is ~BagSize.
+                    -- a lifetime total ("900", "900/1000") must not hijack the display.
+                    local sane = true
+                    if b then
+                        if b < CFG.BagMinCap or b > CFG.BagSize * CFG.SanityCap then sane = false end
+                        if a > b then sane = false end
+                    elseif a > CFG.BagSize then
+                        sane = false
                     end
 
                     local score = nm * 10000
-                    if tr.moved then score = score + 5000 end            -- live beats static
+                    if live then score = score + 5000 end
                     if b and CFG.BagSize > 0 and b == CFG.BagSize then score = score + 2000 end
                     if b then score = score + 100 end
-                    score = score - math.min(math.abs(a - selfHeld), 400) * 4  -- matches our pickups
+                    score = score - math.min(math.abs(a - selfHeld), 400) * 4
+                    if not sane then score = score - 100000 end
 
                     if CFG.Debug then
                         dump = dump or {}
-                        dump[#dump + 1] = ("[%s] txt=[%s] moved=%s score=%d")
-                            :format(d:GetFullName(), tostring(d.Text), tostring(tr.moved), score)
+                        dump[#dump + 1] = ("[%s] txt=[%s] live=%s sane=%s score=%d")
+                            :format(d:GetFullName(), tostring(d.Text), tostring(live), tostring(sane), score)
                     end
 
                     if not bestScore or score > bestScore then
@@ -927,7 +950,19 @@ local function readBagPrompt()
     if not d or not d.Parent or not d.Visible then return nil end
     local a, b = extractCount(d.Text)
     if not a then return nil end
-    if lastPromptVal ~= nil and a ~= lastPromptVal then promptMoved = true end
+
+    -- hard gate: a live bag counter can never read 900
+    if b then
+        if b < CFG.BagMinCap or b > CFG.BagSize * CFG.SanityCap then return nil end
+        if a > b then return nil end
+    elseif a > CFG.BagSize then
+        return nil
+    end
+
+    if lastPromptVal ~= nil and a ~= lastPromptVal then
+        promptMoved = true
+        promptMovedAt = os.clock()
+    end
     lastPromptVal = a
     return a, b, "prompt:" .. d.Name
 end
@@ -1011,7 +1046,8 @@ local function bagIsFull()
     -- 1) the bag prompt: must be a live (changing) counter with the right cap
     if CFG.UseBagGui then
         local cur, max, src = readBag()
-        if cur and max and max == CFG.BagSize and promptMoved and cur >= max then
+        if cur and max and max == CFG.BagSize and cur >= max
+        and (os.clock() - promptMovedAt) < CFG.LiveWindow then
             reason = ("prompt %d/%d"):format(cur, max)
         end
     end
@@ -1164,6 +1200,10 @@ safeLoop("candywatch", function()
         if gone then
             verifyFails = verifyFails + 1
         else
+            if v < lockVal then          -- source cycled (new life / new round): re-baseline
+                lockVal = v
+                srcPicked = 0
+            end
             srcPicked = math.max(0, v - lockVal)
             balance = v
 
@@ -1390,6 +1430,7 @@ safeLoop("watch", function()
             pickedAtReset = picked
             selfAtReset = selfCount
             promptMoved = false
+            promptMovedAt = 0
             lastPromptVal = nil
             lastGrabAt = os.clock()
             say(roundActive and "alive in round - farming" or "alive - waiting for round")
@@ -1590,7 +1631,7 @@ task.spawn(function()
 
             local cur, max, src = readBagPrompt()
             local tr = bagPrompt and promptTrack[bagPrompt]
-            local live = (tr ~= nil and tr.moved == true)
+            local live = (tr ~= nil and (os.clock() - tr.changedAt) <= CFG.LiveWindow)
             local selfHeld = selfCount - selfAtReset
 
             if cur and live then
