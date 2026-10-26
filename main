@@ -8,9 +8,9 @@ local CFG = {
     Tween = 22, -- studs per second (raise toward 40-60 if you want to go faster)
     Hold = 0, -- extra settle after landing (0 = none)
     Revisit = 2.5, -- secs before a candy can be picked again
-    Radius = 120, -- outer pick range
-    BandMin = 20, -- preferred pick band: min studs
-    BandMax = 25, -- preferred pick band: max studs
+    Radius = 120, -- outer pick range (now unused for targeting)
+    BandMin = 20, -- preferred pick band: min studs (now unused for targeting)
+    BandMax = 25, -- preferred pick band: max studs (now unused for targeting)
     MaxSize = 8, -- ignore map parts bigger than this
     AntiAFK = true,
     Mode = "Remote", -- Remote | GUI
@@ -1305,39 +1305,26 @@ local function farmStep()
     local list = findCandy()
     if #list == 0 then lastGrabAt = now task.wait(0.25) return end
 
-    local near, band = {}, {}
+    -- FULL-MAP POOL: every candy that isn't on revisit cooldown, no distance filter
+    local pool = {}
     for _, c in ipairs(list) do
         local v = visited[c]
         if not (v and (now - v) < CFG.Revisit) then
+            pool[#pool + 1] = c
+            -- still remember anything we brush past so its pickup counts
             local d = (c.Position - hrp.Position).Magnitude
-            if d <= CFG.Radius then
-                near[#near + 1] = c
-                if d >= CFG.BandMin and d <= CFG.BandMax then
-                    band[#band + 1] = c
-                end
-            end
-            -- remember anything we brush past so its pickup still counts
             if d <= CFG.PickRadius and nearWatch[c] == nil then
                 nearWatch[c] = now
             end
         end
     end
 
+    -- random candy anywhere on the map; if everything is on cooldown, grab any at all
     local target
-    if firstGrab and #near > 0 then
-        target = near[math.random(1, #near)]
-        firstGrab = false
-    elseif #band > 0 then
-        target = band[math.random(1, #band)]
+    if #pool > 0 then
+        target = pool[math.random(1, #pool)]
     else
-        local bd
-        for _, c in ipairs(list) do
-            local v = visited[c]
-            if not (v and (now - v) < CFG.Revisit) then
-                local d = (c.Position - hrp.Position).Magnitude
-                if not bd or d < bd then target, bd = c, d end
-            end
-        end
+        target = list[math.random(1, #list)]
     end
 
     if not target then lastGrabAt = os.clock() task.wait(0.15) return end
